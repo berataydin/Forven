@@ -93,3 +93,19 @@ hl_account_breaker = CircuitBreaker(
     recovery_timeout=25.0,
     half_open_max_calls=1,
 )
+
+# Propr.xyz prop-firm API breakers (trade = order placement/cancel, account =
+# positions/attempts/balance reads). Prices are NOT a Propr concern — the
+# adapter reads mids from Hyperliquid (Propr executes on HL markets).
+propr_trade_breaker = CircuitBreaker(
+    name="propr_trade",
+    failure_threshold=3,
+    recovery_timeout=30.0,
+    half_open_max_calls=1,
+)
+propr_account_breaker = CircuitBreaker(
+    name="propr_account",
+    failure_threshold=4,
+    recovery_timeout=25.0,
+    half_open_max_calls=1,
+)

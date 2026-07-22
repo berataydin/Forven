@@ -69,6 +69,7 @@ from forven.routers.gauntlet import router as gauntlet_router
 from forven.routers.lab_regime import router as lab_regime_router
 from forven.routers.bot_factory import router as bot_factory_router
 from forven.routers.wallets import router as wallets_router
+from forven.routers.propr import router as propr_router
 from forven.routers.brain import router as brain_router
 from forven.routers.strategy_guard import router as strategy_guard_router
 from forven.routers.skills import router as skills_router
@@ -792,6 +793,7 @@ if regime_lab_enabled():
     app.include_router(lab_regime_router)
 app.include_router(bot_factory_router)
 app.include_router(wallets_router)
+app.include_router(propr_router)
 app.include_router(brain_router)
 app.include_router(strategy_guard_router)
 app.include_router(skills_router)

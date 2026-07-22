@@ -223,6 +223,68 @@ def set_execution_mode(mode: str):
     save_config(cfg)
 
 
+def propr_enabled() -> bool:
+    """Hidden Propr.xyz prop-firm integration switch (PROPR-1).
+
+    Deliberately NOT in the settings manifest or the Settings UI — like the
+    FORVEN_ALLOW_MAINNET guard, an operator must already know this exists to
+    turn it on: set FORVEN_PROPR_ENABLED=1 in the environment, or hand-write
+    "propr_enabled": true into config.json. The flag controls VISIBILITY only
+    (the Propr nav page + /api/propr routes); actually placing a Propr order
+    additionally requires FORVEN_ALLOW_PROPR_LIVE=1 (see forven.exchange.propr —
+    Propr has no testnet, every order is real challenge-account money).
+
+    Beta builds are unconditionally OFF, same reasoning as the paper lock in
+    get_execution_mode: a packaged-build tester must not be able to reach a
+    real-money venue no matter what got written to config.
+    """
+    if is_beta_build():
+        return False
+    env = os.environ.get("FORVEN_PROPR_ENABLED")
+    if env is not None and str(env).strip():
+        return _parse_bool(env)
+    try:
+        return _parse_bool(load_config().get("propr_enabled"))
+    except Exception:
+        return False
+
+
+def get_live_venue() -> str:
+    """Which venue live execution dispatches to: 'hyperliquid' or 'propr'.
+
+    Resolution order: FORVEN_LIVE_VENUE env, then config.json "live_venue",
+    defaulting to hyperliquid. 'propr' only takes effect while propr_enabled()
+    is true — turning the hidden flag off instantly reverts live dispatch to
+    Hyperliquid, so a stale config value can never route orders to a disabled
+    integration.
+    """
+    venue = str(os.environ.get("FORVEN_LIVE_VENUE", "") or "").strip().lower()
+    if not venue:
+        try:
+            venue = str(load_config().get("live_venue", "") or "").strip().lower()
+        except Exception:
+            venue = ""
+    if venue == "propr" and propr_enabled():
+        return "propr"
+    return "hyperliquid"
+
+
+def set_live_venue(venue: str):
+    """Persist the live execution venue. Refuses unknown venues, and refuses
+    'propr' while the hidden integration flag is off — the flag is the outer
+    gate and config must not be able to pre-arm a disabled venue."""
+    cleaned = str(venue or "").strip().lower()
+    if cleaned not in ("hyperliquid", "propr"):
+        raise ValueError(f"Unsupported live venue: {venue!r} (hyperliquid | propr)")
+    if cleaned == "propr" and not propr_enabled():
+        raise ValueError(
+            "Propr integration is not enabled — set FORVEN_PROPR_ENABLED=1 first"
+        )
+    cfg = load_config()
+    cfg["live_venue"] = cleaned
+    save_config(cfg)
+
+
 def _parse_float(value, default: float) -> float:
     """Parse float-like values with fallback."""
     if isinstance(value, (int, float)):

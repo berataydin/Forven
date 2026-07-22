@@ -60,6 +60,11 @@
 			icon: 'M12 2L4 5v5c0 4.63 3.2 8.94 8 10 4.8-1.06 8-5.37 8-10V5l-8-3zm-1 11l-2.5-2.5 1.41-1.41L11 10.17l3.09-3.08 1.41 1.41L11 13z'
 		},
 		{
+			label: 'Propr',
+			href: '/propr',
+			icon: 'M20 6h-4V4c0-1.11-.89-2-2-2h-4c-1.11 0-2 .89-2 2v2H4c-1.11 0-2 .89-2 2v11c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V8c0-1.11-.89-2-2-2zm-6 0h-4V4h4v2z'
+		},
+		{
 			label: 'Portfolio',
 			href: '/portfolio',
 			icon: 'M11 2v20c-5.07-.5-9-4.79-9-10s3.93-9.5 9-10zm2.03 0v8.99H22c-.47-4.74-4.24-8.52-8.97-8.99zm0 11.01V22c4.74-.47 8.5-4.25 8.97-8.99h-8.97z'
@@ -74,6 +79,10 @@
 	// PORT-GATE-1: the Portfolio entry exists only when the layer's master
 	// switch is on (Settings -> System -> Experimental features).
 	let portfolioLayerEnabled = false;
+	// PROPR-1: the Propr entry exists only when the hidden integration flag is
+	// on. The flag is env/config-only (FORVEN_PROPR_ENABLED) and deliberately
+	// has NO Settings-page control — an operator must know it exists.
+	let proprEnabled = false;
 	onMount(async () => {
 		try {
 			const { getPortfolioLayerEnabled } = await import('$lib/api/portfolio');
@@ -81,10 +90,18 @@
 		} catch {
 			portfolioLayerEnabled = false;
 		}
+		try {
+			const { getProprEnabled } = await import('$lib/api/propr');
+			proprEnabled = await getProprEnabled();
+		} catch {
+			proprEnabled = false;
+		}
 	});
-	$: visiblePrimaryLinks = portfolioLayerEnabled
-		? primaryLinks
-		: primaryLinks.filter((l) => l.href !== '/portfolio');
+	$: visiblePrimaryLinks = primaryLinks.filter(
+		(l) =>
+			(portfolioLayerEnabled || l.href !== '/portfolio') &&
+			(proprEnabled || l.href !== '/propr')
+	);
 
 	const managementLinks: NavLink[] = [
 		{
