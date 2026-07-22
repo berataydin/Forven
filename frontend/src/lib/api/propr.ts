@@ -9,15 +9,44 @@ export interface ProprStatus {
 	allow_live?: boolean;
 	api_key_configured?: boolean;
 	base_url?: string;
-	live_venue?: string;
 	connected?: boolean;
 	connection_error?: string;
 	user_id?: string;
 	account_id?: string;
 	attempt_id?: string;
 	attempt_status?: string;
+	account_type?: string | null;
+	orders_allowed?: boolean;
 	account_value?: number | null;
 	account_error?: string;
+}
+
+export interface ProprMirrorCandidate {
+	id: string;
+	name: string;
+	stage: string;
+	timeframe?: string | null;
+}
+
+export interface ProprMirrorTradeState {
+	status: string;
+	reason?: string | null;
+	strategy?: string;
+	asset?: string;
+	direction?: string;
+	quantity?: number;
+	entry_price?: number | null;
+	exit_price?: number | null;
+	opened_at?: string;
+	closed_at?: string;
+	source_execution_type?: string;
+}
+
+export interface ProprMirror {
+	enabled: boolean;
+	strategies: Record<string, string>;
+	candidates: ProprMirrorCandidate[];
+	state: Record<string, ProprMirrorTradeState>;
 }
 
 export interface ProprOverview {
@@ -66,13 +95,22 @@ export async function clearProprApiKey(): Promise<{ ok: boolean }> {
 	return fetchApi('/api/propr/api-key', { method: 'DELETE' });
 }
 
-export async function setProprLiveVenue(
-	venue: 'hyperliquid' | 'propr'
-): Promise<{ ok: boolean; status: ProprStatus }> {
-	return fetchApi('/api/propr/live-venue', {
-		method: 'POST',
-		body: JSON.stringify({ venue, confirm: true })
+export async function getProprMirror(): Promise<ProprMirror> {
+	return fetchApi('/api/propr/mirror');
+}
+
+export async function updateProprMirror(update: {
+	enabled?: boolean;
+	strategies?: string[];
+}): Promise<{ ok: boolean; enabled: boolean; strategies: Record<string, string> }> {
+	return fetchApi('/api/propr/mirror', {
+		method: 'PUT',
+		body: JSON.stringify(update)
 	});
+}
+
+export async function tickProprMirror(): Promise<{ ok: boolean; result: Record<string, unknown> }> {
+	return fetchApi('/api/propr/mirror/tick', { method: 'POST' });
 }
 
 export async function closeProprPosition(

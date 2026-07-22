@@ -45,7 +45,7 @@ import time
 import requests
 
 from forven.circuit_breaker import propr_account_breaker, propr_trade_breaker
-from forven.config import get_live_venue, load_config, propr_enabled
+from forven.config import load_config, propr_enabled
 from forven.db import kv_get
 
 log = logging.getLogger("forven.exchange.propr")
@@ -101,9 +101,16 @@ def allow_live() -> bool:
 def _assert_propr_execution_allowed() -> None:
     """Single chokepoint guarding every Propr order-placing/cancelling call.
 
-    Propr has no testnet — a placed order spends real challenge-account funds —
-    so mutation requires BOTH the hidden integration flag AND the explicit
-    live opt-in. Read-only functions deliberately do NOT call this.
+    Two ways through (read-only functions deliberately do NOT call this):
+
+    * FORVEN_ALLOW_PROPR_LIVE=1 — the explicit real-money opt-in, or
+    * the account is VERIFIABLY a paper/trial account right now: Propr reports
+      ``account.type`` on the challenge attempt ("paper" during a free-trial
+      evaluation), re-verified at most _ACCOUNT_TYPE_CACHE_TTL_S old. The
+      moment Propr flips the account to a funded type — the evaluation ending
+      is exactly when it "becomes real" — this bypass dies and every order
+      fails closed until the operator sets the env opt-in. A failed or
+      ambiguous type read also fails closed.
     """
     if not propr_enabled():
         raise RuntimeError(
@@ -113,11 +120,46 @@ def _assert_propr_execution_allowed() -> None:
         )
     if allow_live():
         return
+    account_type = get_account_type()
+    if account_type == "paper":
+        return
     raise RuntimeError(
-        "Refusing to place a Propr order: FORVEN_ALLOW_PROPR_LIVE is not set. "
-        "Propr has NO testnet — every order spends real challenge-account money — "
-        "so order placement needs this explicit opt-in on top of FORVEN_PROPR_ENABLED."
+        "Refusing to place a Propr order: the account is not verifiably a "
+        f"paper/trial account (exchange-reported type={account_type!r}) and "
+        "FORVEN_ALLOW_PROPR_LIVE is not set. Once a challenge account is real, "
+        "orders need that explicit opt-in on top of FORVEN_PROPR_ENABLED."
     )
+
+
+_account_type_cache: dict = {"type": None, "at": 0.0}
+_ACCOUNT_TYPE_CACHE_TTL_S = 300.0
+
+
+def get_account_type(force_refresh: bool = False) -> str | None:
+    """The exchange-reported Propr account type ('paper' during a trial).
+
+    Cached briefly; a stale cache is NEVER trusted for the paper bypass — an
+    expired entry re-reads, and a failed re-read returns None (fail closed).
+    """
+    now = time.time()
+    if (
+        not force_refresh
+        and _account_type_cache["type"] is not None
+        and (now - _account_type_cache["at"]) < _ACCOUNT_TYPE_CACHE_TTL_S
+    ):
+        return _account_type_cache["type"]
+    try:
+        _, attempt_id = resolve_account()
+        attempt = get_challenge_attempt(attempt_id) if attempt_id else {}
+        account = attempt.get("account")
+        raw = str(account.get("type") or "").strip().lower() if isinstance(account, dict) else ""
+        if raw:
+            _account_type_cache.update({"type": raw, "at": now})
+            return raw
+        return None
+    except ProprApiError as exc:
+        log.warning("Could not verify Propr account type (fail closed): %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1130,7 +1172,6 @@ def get_status(include_remote: bool = True) -> dict:
         "allow_live": allow_live(),
         "api_key_configured": bool(get_api_key()),
         "base_url": get_base_url(),
-        "live_venue": get_live_venue(),
     }
     if not (include_remote and status["api_key_configured"]):
         status["connected"] = False
@@ -1147,6 +1188,12 @@ def get_status(include_remote: bool = True) -> dict:
             attempt = account.get("attempt") or {}
             if isinstance(attempt, dict) and attempt:
                 status["attempt_status"] = attempt.get("status")
+            status["account_type"] = get_account_type()
+            # Orders place when the operator opted in OR the account is a
+            # verifiable paper/trial account — the page renders this truth.
+            status["orders_allowed"] = bool(
+                status["allow_live"] or status["account_type"] == "paper"
+            )
         except ProprApiError as exc:
             status["account_error"] = str(exc)
         status["connected"] = True

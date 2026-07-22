@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from forven.api_security import require_operator_access
-from forven.config import propr_enabled, set_live_venue
+from forven.config import propr_enabled
 
 router = APIRouter(tags=["propr"], dependencies=[Depends(require_operator_access)])
 
@@ -32,9 +32,9 @@ class ApiKeyRequest(BaseModel):
     api_key: str
 
 
-class LiveVenueRequest(BaseModel):
-    venue: str
-    confirm: bool = False
+class MirrorConfigRequest(BaseModel):
+    enabled: bool | None = None
+    strategies: list[str] | None = None
 
 
 class ClosePositionRequest(BaseModel):
@@ -100,25 +100,46 @@ def propr_overview():
     return overview
 
 
-@router.post("/api/propr/live-venue")
-def propr_set_live_venue(body: LiveVenueRequest):
-    """Flip live execution dispatch between hyperliquid and propr.
+@router.get("/api/propr/mirror")
+def propr_get_mirror():
+    """Mirror config + per-trade mirror state + strategies the picker offers.
 
-    Requires confirm=true — this redirects every live open the scanner makes.
-    Selecting propr also requires a configured API key; actually placing
-    orders still needs FORVEN_ALLOW_PROPR_LIVE on the backend process.
+    The mirror is an observer: it copies roster strategies' trades onto the
+    Propr account and never touches live/paper execution itself.
     """
     _require_enabled()
-    if not body.confirm:
-        raise HTTPException(status_code=400, detail="confirm=true is required")
-    venue = str(body.venue or "").strip().lower()
-    if venue == "propr" and not _propr().get_api_key():
+    from forven import propr_mirror
+
+    return {
+        "enabled": propr_mirror.mirror_enabled(),
+        "strategies": propr_mirror.mirror_roster(),
+        "candidates": propr_mirror.roster_candidates(),
+        "state": propr_mirror.get_state(),
+    }
+
+
+@router.put("/api/propr/mirror")
+def propr_update_mirror(body: MirrorConfigRequest):
+    _require_enabled()
+    if body.enabled is None and body.strategies is None:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    if body.enabled and not _propr().get_api_key():
         raise HTTPException(status_code=400, detail="configure the Propr API key first")
-    try:
-        set_live_venue(venue)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"ok": True, "status": _propr().get_status()}
+    from forven import propr_mirror
+
+    result = propr_mirror.set_mirror_config(
+        enabled=body.enabled, strategy_ids=body.strategies
+    )
+    return {"ok": True, **result}
+
+
+@router.post("/api/propr/mirror/tick")
+def propr_mirror_tick_now():
+    """Force one observer pass (the scheduler runs it every 60s anyway)."""
+    _require_enabled()
+    from forven.propr_mirror import mirror_tick
+
+    return {"ok": True, "result": mirror_tick()}
 
 
 @router.post("/api/propr/positions/close")

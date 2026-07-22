@@ -249,42 +249,6 @@ def propr_enabled() -> bool:
         return False
 
 
-def get_live_venue() -> str:
-    """Which venue live execution dispatches to: 'hyperliquid' or 'propr'.
-
-    Resolution order: FORVEN_LIVE_VENUE env, then config.json "live_venue",
-    defaulting to hyperliquid. 'propr' only takes effect while propr_enabled()
-    is true — turning the hidden flag off instantly reverts live dispatch to
-    Hyperliquid, so a stale config value can never route orders to a disabled
-    integration.
-    """
-    venue = str(os.environ.get("FORVEN_LIVE_VENUE", "") or "").strip().lower()
-    if not venue:
-        try:
-            venue = str(load_config().get("live_venue", "") or "").strip().lower()
-        except Exception:
-            venue = ""
-    if venue == "propr" and propr_enabled():
-        return "propr"
-    return "hyperliquid"
-
-
-def set_live_venue(venue: str):
-    """Persist the live execution venue. Refuses unknown venues, and refuses
-    'propr' while the hidden integration flag is off — the flag is the outer
-    gate and config must not be able to pre-arm a disabled venue."""
-    cleaned = str(venue or "").strip().lower()
-    if cleaned not in ("hyperliquid", "propr"):
-        raise ValueError(f"Unsupported live venue: {venue!r} (hyperliquid | propr)")
-    if cleaned == "propr" and not propr_enabled():
-        raise ValueError(
-            "Propr integration is not enabled — set FORVEN_PROPR_ENABLED=1 first"
-        )
-    cfg = load_config()
-    cfg["live_venue"] = cleaned
-    save_config(cfg)
-
-
 def _parse_float(value, default: float) -> float:
     """Parse float-like values with fallback."""
     if isinstance(value, (int, float)):

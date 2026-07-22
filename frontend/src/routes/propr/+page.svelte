@@ -4,12 +4,15 @@
 		cancelProprOrder,
 		clearProprApiKey,
 		closeProprPosition,
+		getProprMirror,
 		getProprOverview,
 		getProprStatus,
 		runProprConnectionTest,
 		setProprApiKey,
-		setProprLiveVenue,
+		tickProprMirror,
+		updateProprMirror,
 		type ProprConnectionCheck,
+		type ProprMirror,
 		type ProprOverview,
 		type ProprStatus,
 	} from '$lib/api/propr';
@@ -33,11 +36,17 @@
 	let keyBusy = false;
 	let testBusy = false;
 	let testChecks: ProprConnectionCheck[] | null = null;
-	let venueBusy = false;
-	let confirmingVenue: string | null = null;
 	let closingPosition: string | null = null;
 	let confirmingClose: string | null = null;
 	let cancellingOrder: string | null = null;
+
+	// --- strategy mirror ----------------------------------------------------
+	let mirror: ProprMirror | null = null;
+	let rosterDraft: Set<string> = new Set();
+	let rosterDirty = false;
+	let mirrorBusy = false;
+	let mirrorTickBusy = false;
+	let strategyFilter = '';
 
 	type Row = Record<string, unknown>;
 	// Propr response field names are matched permissively — the docs don't pin
@@ -82,8 +91,14 @@
 				loading = false;
 				return;
 			}
-			overview = await getProprOverview();
-			status = overview.status;
+			const [ov, mi] = await Promise.all([
+				getProprOverview(),
+				getProprMirror().catch(() => null),
+			]);
+			overview = ov;
+			status = ov.status;
+			mirror = mi;
+			if (mi && !rosterDirty) rosterDraft = new Set(Object.keys(mi.strategies));
 			error = '';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -147,25 +162,56 @@
 		}
 	}
 
-	async function switchVenue(venue: 'hyperliquid' | 'propr') {
-		if (confirmingVenue !== venue) {
-			confirmingVenue = venue;
-			return;
-		}
-		confirmingVenue = null;
-		venueBusy = true;
+	function toggleRosterStrategy(id: string) {
+		if (rosterDraft.has(id)) rosterDraft.delete(id);
+		else rosterDraft.add(id);
+		rosterDraft = new Set(rosterDraft);
+		rosterDirty = true;
+	}
+
+	async function saveRoster() {
+		mirrorBusy = true;
 		actionMessage = '';
 		try {
-			await setProprLiveVenue(venue);
-			actionMessage =
-				venue === 'propr'
-					? 'Live dispatch now targets Propr. Orders still require the backend live opt-in to actually place.'
-					: 'Live dispatch reverted to Hyperliquid.';
+			await updateProprMirror({ strategies: [...rosterDraft] });
+			rosterDirty = false;
+			actionMessage = `Mirror roster saved (${rosterDraft.size} strateg${rosterDraft.size === 1 ? 'y' : 'ies'}). Only trades opened from now on are mirrored.`;
 			await load();
 		} catch (e) {
-			actionMessage = `Venue switch refused: ${e instanceof Error ? e.message : e}`;
+			actionMessage = `Roster save failed: ${e instanceof Error ? e.message : e}`;
 		} finally {
-			venueBusy = false;
+			mirrorBusy = false;
+		}
+	}
+
+	async function toggleMirror() {
+		mirrorBusy = true;
+		actionMessage = '';
+		try {
+			const next = !mirror?.enabled;
+			await updateProprMirror({ enabled: next });
+			actionMessage = next
+				? 'Mirror enabled — the observer copies new roster trades to Propr every 60s.'
+				: 'Mirror disabled — no new Propr orders; existing mirrored positions keep their brackets.';
+			await load();
+		} catch (e) {
+			actionMessage = `Mirror toggle failed: ${e instanceof Error ? e.message : e}`;
+		} finally {
+			mirrorBusy = false;
+		}
+	}
+
+	async function forceMirrorTick() {
+		mirrorTickBusy = true;
+		actionMessage = '';
+		try {
+			const res = await tickProprMirror();
+			actionMessage = `Mirror tick: ${JSON.stringify(res.result)}`;
+			await load();
+		} catch (e) {
+			actionMessage = `Mirror tick failed: ${e instanceof Error ? e.message : e}`;
+		} finally {
+			mirrorTickBusy = false;
 		}
 	}
 
@@ -207,6 +253,15 @@
 		}
 	}
 
+	$: candidates = (mirror?.candidates ?? []).filter(
+		(c) =>
+			!strategyFilter.trim() ||
+			`${c.id} ${c.name}`.toLowerCase().includes(strategyFilter.trim().toLowerCase())
+	);
+	$: mirrorRows = Object.entries(mirror?.state ?? {}).sort(
+		(a, b) => (b[1].opened_at ?? '').localeCompare(a[1].opened_at ?? '')
+	);
+	$: accountIsPaper = status?.account_type === 'paper';
 	$: positions = (overview?.positions ?? []) as Row[];
 	$: openOrders = ((overview?.orders ?? []) as Row[]).filter((o) =>
 		['pending', 'open', 'partially_filled'].includes(pickStr(o, 'status').toLowerCase())
@@ -237,10 +292,20 @@
 				>
 					{status.connected ? 'Connected' : status.api_key_configured ? 'Not connected' : 'No API key'}
 				</span>
+				{#if status.account_type}
+					<span
+						class={`text-xs px-2 py-1 border ${accountIsPaper ? 'text-[#c9a227] border-[#8a6d1a]' : 'text-red-400 border-red-800'}`}
+						title={accountIsPaper
+							? 'Propr reports this account as a paper/trial account — mirrored orders spend no real money.'
+							: 'Propr reports this account as REAL — orders require the backend live opt-in.'}
+					>
+						{accountIsPaper ? 'PAPER ACCOUNT' : `REAL (${status.account_type})`}
+					</span>
+				{/if}
 				<span
-					class={`text-xs px-2 py-1 border ${status.live_venue === 'propr' ? 'text-red-400 border-red-800' : 'text-[#666] border-[#333]'}`}
+					class={`text-xs px-2 py-1 border ${mirror?.enabled ? 'text-emerald-400 border-emerald-800' : 'text-[#666] border-[#333]'}`}
 				>
-					{status.live_venue === 'propr' ? 'LIVE DISPATCH: PROPR' : 'Live dispatch: Hyperliquid'}
+					{mirror?.enabled ? 'Mirror ON' : 'Mirror off'}
 				</span>
 			</div>
 		{/if}
@@ -271,11 +336,18 @@
 				<h2 class="text-sm font-bold uppercase tracking-wider text-white">Connection</h2>
 				<span class="text-[10px] text-[#666]">{status?.base_url}</span>
 			</div>
-			{#if !status?.allow_live}
+			{#if status?.connected && !status?.orders_allowed}
 				<div class="border border-yellow-900 bg-yellow-500/5 px-3 py-2 text-[11px] text-yellow-500">
-					Order placement is DISARMED on the backend process — reads work, but any open/close will be
-					refused until the live opt-in is set in the backend environment. Propr has no testnet:
-					once armed, every order spends real challenge money.
+					Order placement is DISARMED: the account is not verifiably a paper/trial account
+					(type: {status?.account_type ?? 'unknown'}) and the backend live opt-in is not set.
+					Reads work; every open/close is refused. This is the designed behavior for when the
+					evaluation ends and the account becomes real.
+				</div>
+			{:else if accountIsPaper && !status?.allow_live}
+				<div class="border border-[#1a2438] bg-[#050a12] px-3 py-2 text-[11px] text-[#9ab]">
+					Orders are allowed WITHOUT the backend live opt-in because Propr reports this account
+					as paper — verified against the exchange every few minutes. The moment the evaluation
+					ends and the account type changes, order placement fails closed automatically.
 				</div>
 			{/if}
 			<div class="grid grid-cols-1 md:grid-cols-3 gap-2 items-end text-[11px]">
@@ -376,38 +448,131 @@
 			{/if}
 		</div>
 
-		<!-- ─────────────────────── live dispatch ─────────────────────── -->
+		<!-- ─────────────────────── strategy mirror ─────────────────────── -->
 		<div
-			class={`border p-4 space-y-3 ${status?.live_venue === 'propr' ? 'border-red-800 bg-[#0a0505]' : 'border-[#222] bg-[#050505]'}`}
+			class={`border p-4 space-y-3 ${mirror?.enabled ? 'border-emerald-900 bg-[#050805]' : 'border-[#222] bg-[#050505]'}`}
 		>
-			<h2 class="text-sm font-bold uppercase tracking-wider text-white">Live dispatch</h2>
-			<p class="text-[11px] text-[#666]">
-				Which venue the scanner sends LIVE orders to. Paper trading is unaffected (it stays on the
-				HL-testnet path). Positions close on the venue that opened them, so flipping this never
-				strands an open position. Placing Propr orders additionally requires the backend live
-				opt-in above.
-			</p>
-			<div class="flex items-center gap-2">
-				{#each ['hyperliquid', 'propr'] as venue}
+			<div class="flex items-center justify-between">
+				<div>
+					<h2 class="text-sm font-bold uppercase tracking-wider text-white">Strategy mirror</h2>
+					<p class="text-[11px] text-[#666]">
+						Pick the strategies whose trades get copied onto the Propr account. Live and paper
+						trading are completely untouched — the mirror only observes their trades and places
+						its own independently-sized orders here (risk % of the challenge equity at each
+						trade's stop, entry + stop + take-profit as one bracket, reduce-only closes). Only
+						trades opened AFTER a strategy joins the roster are mirrored.
+					</p>
+				</div>
+				<div class="flex items-center gap-2 shrink-0">
 					<button
 						class={`border px-3 py-1.5 text-xs disabled:opacity-50 ${
-							status?.live_venue === venue
-								? 'border-white text-white bg-[#111]'
-								: confirmingVenue === venue
-									? 'border-red-700 bg-red-950 text-red-300'
-									: 'border-[#333] bg-[#111] text-[#aaa] hover:bg-[#1a1a1a]'
+							mirror?.enabled
+								? 'border-emerald-800 text-emerald-400 bg-[#081008] hover:bg-[#0a140a]'
+								: 'border-[#333] bg-[#111] text-[#aaa] hover:bg-[#1a1a1a]'
 						}`}
-						on:click={() => switchVenue(venue as 'hyperliquid' | 'propr')}
-						disabled={venueBusy || status?.live_venue === venue}
+						on:click={toggleMirror}
+						disabled={mirrorBusy || !status?.api_key_configured}
 					>
-						{confirmingVenue === venue ? `Click again: dispatch live orders to ${venue}` : venue}
+						{mirror?.enabled ? 'Mirror is ON — click to disable' : 'Enable mirror'}
 					</button>
-				{/each}
-				{#if confirmingVenue}
-					<button class="text-[11px] text-[#666] hover:text-[#888]" on:click={() => (confirmingVenue = null)}>
-						cancel
+					<button
+						class="border border-[#333] bg-[#111] px-3 py-1.5 text-xs text-[#aaa] hover:bg-[#1a1a1a] disabled:opacity-50"
+						on:click={forceMirrorTick}
+						disabled={mirrorTickBusy || !mirror?.enabled}
+					>
+						{mirrorTickBusy ? 'Ticking…' : 'Tick now'}
 					</button>
-				{/if}
+				</div>
+			</div>
+
+			<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+				<div class="space-y-2">
+					<div class="flex items-center justify-between">
+						<span class="text-[10px] uppercase tracking-wider text-[#666]">
+							Strategies ({rosterDraft.size} selected)
+						</span>
+						<input
+							type="text"
+							bind:value={strategyFilter}
+							placeholder="filter…"
+							class="border border-[#333] bg-[#0a0a0a] px-2 py-1 text-[11px] text-white outline-none w-32"
+						/>
+					</div>
+					<div class="max-h-64 overflow-y-auto border border-[#1a1a1a] divide-y divide-[#141414]">
+						{#each candidates as c (c.id)}
+							<label class="flex items-center gap-2 px-2 py-1.5 text-[11px] cursor-pointer hover:bg-[#0d0d0d]">
+								<input
+									type="checkbox"
+									checked={rosterDraft.has(c.id)}
+									on:change={() => toggleRosterStrategy(c.id)}
+								/>
+								<span class="font-bold text-[#bbb]">{c.id}</span>
+								<span class="text-[#777] truncate flex-1">{c.name}</span>
+								<span
+									class={`text-[9px] uppercase tracking-wider px-1 py-0.5 border ${
+										c.stage === 'live_graduated'
+											? 'border-red-900 text-red-400'
+											: c.stage === 'paper'
+												? 'border-[#1c2b1c] text-emerald-500'
+												: 'border-[#333] text-[#777]'
+									}`}
+								>
+									{c.stage}
+								</span>
+								{#if c.timeframe}<span class="text-[#555] text-[10px]">{c.timeframe}</span>{/if}
+							</label>
+						{:else}
+							<div class="px-2 py-3 text-[11px] text-[#555]">No strategies match the filter.</div>
+						{/each}
+					</div>
+					{#if rosterDirty}
+						<button
+							class="border border-emerald-900 bg-[#081008] px-3 py-1.5 text-xs text-emerald-400 hover:bg-[#0a140a] disabled:opacity-50"
+							on:click={saveRoster}
+							disabled={mirrorBusy}
+						>
+							{mirrorBusy ? 'Saving…' : `Save roster (${rosterDraft.size})`}
+						</button>
+					{/if}
+				</div>
+
+				<div class="space-y-1">
+					<span class="text-[10px] uppercase tracking-wider text-[#666]">Mirrored trades</span>
+					{#if mirrorRows.length === 0}
+						<div class="text-[11px] text-[#555]">
+							Nothing mirrored yet — trades appear here within a minute of a roster strategy
+							opening one.
+						</div>
+					{:else}
+						<div class="max-h-64 overflow-y-auto space-y-0.5">
+							{#each mirrorRows as [tradeId, st] (tradeId)}
+								<div class="border border-[#151515] bg-[#0a0a0a] px-2 py-1 text-[11px] flex items-center gap-2">
+									<span
+										class={`text-[9px] uppercase tracking-wider px-1 py-0.5 border shrink-0 ${
+											st.status === 'open'
+												? 'border-emerald-800 text-emerald-400'
+												: st.status === 'closed'
+													? 'border-[#333] text-[#888]'
+													: st.status === 'skipped'
+														? 'border-[#333] text-[#666]'
+														: 'border-red-900 text-red-400'
+										}`}
+									>
+										{st.status}
+									</span>
+									<span class="font-bold text-[#bbb] shrink-0">{st.asset}</span>
+									<span class={st.direction === 'short' ? 'text-red-400' : 'text-emerald-400'}>
+										{st.direction}
+									</span>
+									<span class="text-[#777] truncate flex-1" title={st.reason ?? ''}>
+										{st.strategy}{st.reason ? ` — ${st.reason}` : ''}
+									</span>
+									{#if st.quantity}<span class="text-[#666]">{fmtNum(st.quantity, 5)}</span>{/if}
+								</div>
+							{/each}
+						</div>
+					{/if}
+				</div>
 			</div>
 		</div>
 

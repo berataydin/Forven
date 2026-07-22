@@ -3593,48 +3593,17 @@ def _execute_direct(
     close_reason: str | None = None,
 ) -> dict:
     """Execute directly on exchange and update DB with the fill."""
-    from forven.config import get_live_venue
+    from forven.exchange.hyperliquid import close_position, market_order
     from forven.sim.clock import is_sim_active
 
-    # PROPR-1 venue dispatch: both venue modules expose the same function
-    # surface and return-payload contract, so everything below this block is
-    # venue-agnostic. Sim-active calls redirect to the mock exchange inside
-    # either adapter, exactly as before. Paper mode is pinned to Hyperliquid —
-    # paper *is* HL-testnet trading, and live_venue must never be able to point
-    # a paper strategy at Propr's real challenge money.
-    from forven.config import get_execution_mode
-    venue = get_live_venue() if get_execution_mode() == "live" else "hyperliquid"
-    if action in ("close", "cancel"):
-        # Close on the venue that HOLDS the position (stamped at open), not
-        # whatever live_venue points at today. No stamp (older trades) keeps
-        # the config-resolved venue. A stored "propr" with the integration
-        # disabled fails closed inside the adapter guard rather than silently
-        # sending the close to the wrong venue.
-        _stored_venue = _resolve_trade_venue(trade_id)
-        if _stored_venue:
-            venue = _stored_venue
-    if venue == "propr":
-        from forven.exchange import propr as _venue_mod
-    else:
-        from forven.exchange import hyperliquid as _venue_mod
-    close_position = _venue_mod.close_position
-    market_order = _venue_mod.market_order
-
-    if venue == "propr":
-        # Propr has no testnet (testnet=False marks every order as real capital
-        # for the risk clamp below) and no sub-account routing — a challenge is
-        # a single account, so direction books don't apply.
-        testnet = False
-        vault_address = None
-    else:
-        testnet = _resolve_hyperliquid_testnet()
-        # Route to the trade's direction sub-account (Approach C). The book was
-        # stored at OPEN time and persists for the CLOSE, so a position always
-        # closes on the SAME account that holds it. NULL book (paper/legacy) and an
-        # unconfigured long book resolve to None = master wallet (unchanged).
-        # strict=True: a resolution failure must FAIL the order (not silently route
-        # to master), so a routed close can't no-op and strand a live position.
-        vault_address = _resolve_trade_vault_address(trade_id, strict=True)
+    testnet = _resolve_hyperliquid_testnet()
+    # Route to the trade's direction sub-account (Approach C). The book was
+    # stored at OPEN time and persists for the CLOSE, so a position always
+    # closes on the SAME account that holds it. NULL book (paper/legacy) and an
+    # unconfigured long book resolve to None = master wallet (unchanged).
+    # strict=True: a resolution failure must FAIL the order (not silently route
+    # to master), so a routed close can't no-op and strand a live position.
+    vault_address = _resolve_trade_vault_address(trade_id, strict=True)
 
     def _extract_order_meta(payload: dict) -> tuple[float | None, str | None, dict]:
         if not isinstance(payload, dict):
@@ -3716,18 +3685,7 @@ def _execute_direct(
                 _cap = None
             if not _cap:
                 _cap = _LIVE_PER_TRADE_RISK_CAP_DEFAULT
-            if venue == "propr":
-                # The daemon equity snapshot tracks the HL wallet; the clamp on
-                # a Propr order must read the CHALLENGE account's equity.
-                try:
-                    _acct = _venue_mod.get_account_value(require_connection=True)
-                    _real_equity = _coerce_positive_float(
-                        _acct.get("accountValue") if isinstance(_acct, dict) else None
-                    )
-                except Exception:
-                    _real_equity = None
-            else:
-                _real_equity = _coerce_positive_float(_get_real_account_equity())
+            _real_equity = _coerce_positive_float(_get_real_account_equity())
             if not _real_equity:
                 raise RuntimeError(
                     f"refusing to open {trade_id}: live risk clamp cannot resolve "
@@ -3753,7 +3711,7 @@ def _execute_direct(
         # instead of the venue default (often 20-40x). Fail closed if it can't be
         # set — opening at an unknown leverage silently invalidates the stop math.
         if not is_sim_active():
-            set_leverage = _venue_mod.set_leverage
+            from forven.exchange.hyperliquid import set_leverage
             lev_res = set_leverage(asset, leverage, testnet=testnet, vault_address=vault_address)
             if isinstance(lev_res, dict) and lev_res.get("error"):
                 raise RuntimeError(
@@ -3777,11 +3735,6 @@ def _execute_direct(
             if result.get("error"):
                 raise RuntimeError(result.get("error"))
             fill, exchange_order_id, order_meta = _extract_order_meta(result)
-            # PROPR-1: stamp the venue on every live open so closes, manual
-            # controls, and the Propr page can tell which venue holds the
-            # position without re-deriving it from config (which may change).
-            if not is_sim_active():
-                order_meta["venue"] = venue
             # LIVE-6: a missing avgPx means the fill price is UNKNOWN — an IOC that didn't
             # fill, or a filled response that omitted avgPx. Do NOT record the aggressive
             # 2% limit as the real entry (it mis-prices PnL/stop distance) or book an
@@ -3848,8 +3801,7 @@ def _execute_direct(
             # discard the fill (the unprotected-orphan bug).
             _protective_failed = result.get("protective_leg_failed") or []
             if _protective_failed and fill is not None and not is_sim_active():
-                place_protective_stop = _venue_mod.place_protective_stop
-                place_take_profit = _venue_mod.place_take_profit
+                from forven.exchange.hyperliquid import place_protective_stop, place_take_profit
                 _prot_kwargs = {"testnet": testnet}
                 if vault_address:
                     _prot_kwargs["vault_address"] = vault_address
@@ -3926,7 +3878,7 @@ def _execute_direct(
         # Best-effort — a read failure must never block the close.
         funding_since_open_usd = None
         try:
-            _get_positions_for_funding = _venue_mod.get_positions
+            from forven.exchange.hyperliquid import get_positions as _get_positions_for_funding
             _pos_payload = _get_positions_for_funding(
                 testnet=testnet, **({"account_address": vault_address} if vault_address else {})
             )
@@ -4082,36 +4034,6 @@ def _notify_long_only_mode(asset: str) -> None:
         kv_set("live_long_only_notified_at", now.isoformat())
     except Exception as exc:
         log.debug("Could not emit long-only notification: %s", exc)
-
-
-def _resolve_trade_venue(trade_id) -> str | None:
-    """The venue stamped on a live trade at OPEN time (PROPR-1), or None.
-
-    A close must execute on the venue that HOLDS the position, not whatever
-    live_venue currently points at — flipping the config back to hyperliquid
-    must not strand an open Propr position (or vice versa). Older trades have
-    no stamp and resolve None (caller keeps the config-resolved venue).
-    """
-    normalized = str(trade_id or "").strip()
-    if not normalized:
-        return None
-    try:
-        with get_db() as conn:
-            row = conn.execute(
-                "SELECT signal_data FROM trades WHERE id = ?", (normalized,)
-            ).fetchone()
-        raw = dict(row).get("signal_data") if row else None
-        if isinstance(raw, str):
-            data = json.loads(raw) if raw else {}
-        elif isinstance(raw, dict):
-            data = raw
-        else:
-            data = {}
-        venue = str(data.get("venue") or "").strip().lower()
-        return venue if venue in ("hyperliquid", "propr") else None
-    except Exception as exc:
-        log.debug("Could not resolve venue for trade %s: %s", normalized, exc)
-        return None
 
 
 def _resolve_trade_vault_address(trade_id, *, strict: bool = False) -> str | None:

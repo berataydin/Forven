@@ -100,6 +100,13 @@ _PORTFOLIO_JOB_IDS = {
     "forven-basket-funding-carry",
 }
 
+# PROPR-1: same dark-feature treatment as the portfolio jobs — the mirror job
+# exists only while the hidden Propr flag is on, so the scheduler page leaks
+# nothing while it's off.
+_PROPR_JOB_IDS = {
+    "forven-propr-mirror",
+}
+
 
 def _portfolio_layer_on() -> bool:
     try:
@@ -110,10 +117,22 @@ def _portfolio_layer_on() -> bool:
         return False
 
 
+def _propr_on() -> bool:
+    try:
+        from forven.config import propr_enabled
+
+        return bool(propr_enabled())
+    except Exception:
+        return False
+
+
 def _default_job_ids() -> set[str]:
+    ids = set(_DEFAULT_JOB_IDS)
     if _portfolio_layer_on():
-        return _DEFAULT_JOB_IDS | _PORTFOLIO_JOB_IDS
-    return set(_DEFAULT_JOB_IDS)
+        ids |= _PORTFOLIO_JOB_IDS
+    if _propr_on():
+        ids |= _PROPR_JOB_IDS
+    return ids
 
 
 _SUPERSEDED_CRUCIBLE_AGENT_JOB_IDS = {
@@ -1832,6 +1851,24 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             log.info("Testnet execution harness: %s", status)
             return "ok", None
 
+        # Propr strategy mirror — copy roster strategies' trades onto the Propr
+        # challenge account (PROPR-2). Observer-only: never touches live/paper
+        # execution; no-ops in microseconds while the toggle/roster are off.
+        if kind == "propr_mirror_tick":
+            from forven.propr_mirror import mirror_tick
+            result = await _run_sync_job(mirror_tick)
+            if isinstance(result, dict):
+                if result.get("skipped"):
+                    return "ok", None
+                opened = result.get("opened", 0)
+                closed = result.get("closed", 0)
+                errors = result.get("errors", 0)
+                if opened or closed or errors:
+                    note = f"{opened} opened, {closed} closed, {errors} error(s)"
+                    log.info("Propr mirror tick: %s", note)
+                    return ("error" if errors and not (opened or closed) else "ok"), note
+            return "ok", None
+
         # Regime gate MTM follow-up — back-fill mark-to-market on gate ledger
         # events whose 48h horizon has passed (REGIME-GATE-1 prove-it loop).
         if kind == "regime_gate_mtm":
@@ -3225,6 +3262,20 @@ def seed_forven_jobs():
             command="basket-funding-carry",
             timezone_str="UTC",
             payload={"kind": "basket_funding_carry_tick"},
+        )
+
+    # PROPR-1: the strategy-mirror observer exists only while the hidden Propr
+    # flag is on. The tick itself is a cheap no-op unless the mirror toggle is
+    # enabled AND the roster is non-empty, so a 60s cadence costs nothing idle.
+    if _propr_on():
+        add_job(
+            job_id="forven-propr-mirror",
+            name="Propr Strategy Mirror",
+            schedule_type="interval",
+            schedule_expr="60000",  # 60s in ms
+            command="propr-mirror",
+            timezone_str="UTC",
+            payload={"kind": "propr_mirror_tick"},
         )
 
     # 5. Regime + Market Pot refresh — every 4 hours
