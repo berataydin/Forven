@@ -50,6 +50,19 @@ log = logging.getLogger("forven.propr_mirror")
 MIRROR_ENABLED_KEY = "propr_mirror_enabled"
 MIRROR_STRATEGIES_KEY = "propr_mirror_strategies"
 STATE_KEY = "forven:propr-mirror:state"
+HALT_STATE_KEY = "forven:propr-mirror:halt"
+
+# Account-level halt (PROPR-3): stop OPENING mirrored positions well before the
+# venue's challenge rules fail the attempt. 0.8 = halt at 80% of the allowance
+# (e.g. a $150/day cap halts new opens at $120 of daily loss). Closes always
+# run — reducing risk is never halted.
+DAILY_LOSS_HALT_FRACTION = 0.8
+DRAWDOWN_HALT_FRACTION = 0.8
+# Used only when the challenge payload doesn't carry readable rules — the
+# free-trial terms (3%/day, 6% drawdown), which are also Propr's strictest
+# published tier, so the fallback can only ever be MORE conservative.
+_FALLBACK_DAILY_LOSS_PCT = 3.0
+_FALLBACK_DRAWDOWN_PCT = 6.0
 
 # Risk defaults — independent of the source account's sizing.
 DEFAULT_RISK_PCT = 0.01
@@ -120,6 +133,162 @@ def get_state() -> dict:
 
 def _save_state(state: dict) -> None:
     kv_set(STATE_KEY, state)
+
+
+def get_halt_state() -> dict:
+    raw = kv_get(HALT_STATE_KEY, {}) or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _num(value) -> float | None:
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _challenge_rules(attempt: dict, equity: float, high_water_mark: float | None) -> dict:
+    """The CURRENT phase's risk rules, from the venue's own challenge payload.
+
+    Propr expresses limits as percentages of the phase starting balance
+    (maxDailyLossPercent / maxDrawdownPercent) with drawdownType static
+    (measured from the starting balance) or trailing (from the high-water
+    mark). Unreadable fields fall back to the strictest published tier, so a
+    parse failure can only make the halt MORE conservative.
+    """
+    challenge = attempt.get("challenge") if isinstance(attempt.get("challenge"), dict) else {}
+    attempt_phases = [p for p in (attempt.get("phases") or []) if isinstance(p, dict)]
+    current_id = str(attempt.get("currentPhaseId") or "")
+    att_phase = next(
+        (p for p in attempt_phases if str(p.get("attemptPhaseId") or "") == current_id), None
+    )
+    if att_phase is None and attempt_phases:
+        att_phase = next(
+            (p for p in attempt_phases if str(p.get("status") or "").lower() == "active"),
+            attempt_phases[0],
+        )
+    starting_balance = _num((att_phase or {}).get("startingBalance")) or _num(
+        challenge.get("initialBalance")
+    )
+
+    ch_phase = None
+    if att_phase is not None:
+        phase_id = str(att_phase.get("phaseId") or "")
+        ch_phase = next(
+            (p for p in (challenge.get("phases") or [])
+             if isinstance(p, dict) and str(p.get("phaseId") or "") == phase_id),
+            None,
+        )
+    if ch_phase is None:
+        phases = [p for p in (challenge.get("phases") or []) if isinstance(p, dict)]
+        ch_phase = phases[0] if phases else {}
+
+    daily_pct = _num(ch_phase.get("maxDailyLossPercent"))
+    dd_pct = _num(ch_phase.get("maxDrawdownPercent"))
+    dd_type = str(ch_phase.get("drawdownType") or "").strip().lower()
+    source = "challenge"
+    if daily_pct is None or dd_pct is None or starting_balance is None:
+        source = "defaults"
+        daily_pct = daily_pct or _FALLBACK_DAILY_LOSS_PCT
+        dd_pct = dd_pct or _FALLBACK_DRAWDOWN_PCT
+        starting_balance = starting_balance or equity
+
+    # Drawdown reference/floor pair by type; unknown type takes whichever pair
+    # yields the HIGHER floor (the conservative one).
+    static_ref = starting_balance
+    static_floor = starting_balance * (1 - dd_pct / 100.0)
+    trailing_ref = high_water_mark or equity
+    trailing_floor = trailing_ref * (1 - dd_pct / 100.0)
+    if dd_type == "trailing":
+        dd_ref, dd_floor = trailing_ref, trailing_floor
+    elif dd_type == "static":
+        dd_ref, dd_floor = static_ref, static_floor
+    else:
+        dd_ref, dd_floor = (
+            (trailing_ref, trailing_floor)
+            if trailing_floor >= static_floor
+            else (static_ref, static_floor)
+        )
+
+    return {
+        "source": source,
+        "starting_balance": starting_balance,
+        "daily_loss_limit_usd": starting_balance * daily_pct / 100.0,
+        "drawdown_type": dd_type or "unknown",
+        "drawdown_ref": dd_ref,
+        "drawdown_floor": dd_floor,
+    }
+
+
+def _evaluate_halt(attempt: dict, equity: float, now: datetime) -> dict:
+    """Account-level halt check, persisted for the page. Day-start equity is
+    OUR first observation of the UTC day — a strictly tighter proxy than the
+    venue's day anchor is guaranteed to be, since we can only observe late."""
+    prev = get_halt_state()
+    day = now.strftime("%Y-%m-%d")
+    if str(prev.get("day") or "") == day and _num(prev.get("day_start_equity")):
+        day_start = float(prev["day_start_equity"])
+    else:
+        day_start = equity
+
+    account = attempt.get("account") if isinstance(attempt.get("account"), dict) else {}
+    high_water_mark = _num(account.get("highWaterMark"))
+    rules = _challenge_rules(attempt, equity, high_water_mark)
+
+    reasons: list[str] = []
+    daily_loss = max(0.0, day_start - equity)
+    daily_budget = rules["daily_loss_limit_usd"] * DAILY_LOSS_HALT_FRACTION
+    if daily_loss >= daily_budget:
+        reasons.append(
+            f"daily loss ${daily_loss:.2f} reached {DAILY_LOSS_HALT_FRACTION:.0%} of the "
+            f"${rules['daily_loss_limit_usd']:.2f} venue cap"
+        )
+    dd_used = max(0.0, rules["drawdown_ref"] - equity)
+    dd_allowance = max(0.0, rules["drawdown_ref"] - rules["drawdown_floor"])
+    if dd_allowance > 0 and dd_used >= DRAWDOWN_HALT_FRACTION * dd_allowance:
+        reasons.append(
+            f"drawdown ${dd_used:.2f} reached {DRAWDOWN_HALT_FRACTION:.0%} of the "
+            f"${dd_allowance:.2f} allowance ({rules['drawdown_type']})"
+        )
+
+    halt = {
+        "day": day,
+        "day_start_equity": day_start,
+        "equity": equity,
+        "daily_loss": daily_loss,
+        "daily_loss_limit_usd": rules["daily_loss_limit_usd"],
+        "daily_halt_at_usd": daily_budget,
+        "drawdown_used": dd_used,
+        "drawdown_allowance_usd": dd_allowance,
+        "drawdown_type": rules["drawdown_type"],
+        "rules_source": rules["source"],
+        "halted": bool(reasons),
+        "reasons": reasons,
+        "checked_at": now.isoformat(),
+    }
+    kv_set(HALT_STATE_KEY, halt)
+
+    if reasons and not prev.get("halted"):
+        log.warning("Propr mirror HALTED (opens blocked): %s", "; ".join(reasons))
+        try:
+            from forven.notifications import emit_notification
+            emit_notification(
+                "propr_mirror_halt",
+                severity="warning",
+                source="propr_mirror",
+                title="Propr mirror halted — challenge limit proximity",
+                summary="; ".join(reasons),
+                body=(
+                    "New mirrored opens are blocked to protect the challenge account. "
+                    "Closes still execute. The daily-loss halt clears at the next UTC "
+                    "day; the drawdown halt clears if equity recovers."
+                ),
+                dedupe_key=f"propr_mirror_halt:{day}",
+            )
+        except Exception as exc:
+            log.debug("Could not emit propr mirror halt notification: %s", exc)
+    return halt
 
 
 def roster_candidates() -> list[dict]:
@@ -224,7 +393,10 @@ def _size_mirror_order(
     return size, None
 
 
-def _mirror_open(propr, row: dict, state: dict, equity: float, now: datetime) -> None:
+def _mirror_open(
+    propr, row: dict, state: dict, equity: float, now: datetime,
+    risk_budget: dict | None = None,
+) -> None:
     trade_id = str(row["id"])
     entry = state.setdefault(trade_id, {"status": "pending", "attempts": 0})
     entry.update({
@@ -260,6 +432,22 @@ def _mirror_open(propr, row: dict, state: dict, equity: float, now: datetime) ->
         entry.update({"status": "skipped", "reason": skip_reason or "size resolved to zero"})
         return
 
+    # PROPR-3: loss-at-stop of everything already open counts against the
+    # remaining daily budget, so N concurrent stop-outs can't stack past the
+    # venue's daily cap. Deferred (status stays pending) — it retries next
+    # tick and mirrors normally if room frees up inside the freshness window.
+    risk_usd = size * abs(mid - stop_price)
+    if risk_budget is not None:
+        if risk_usd > risk_budget.get("remaining", 0.0):
+            entry.update({
+                "status": "pending",
+                "reason": (
+                    f"deferred: risk-at-stop ${risk_usd:.2f} exceeds the remaining "
+                    f"daily budget ${risk_budget.get('remaining', 0.0):.2f}"
+                ),
+            })
+            return
+
     lev = propr.set_leverage(asset, float(row.get("leverage") or 1.0))
     if isinstance(lev, dict) and lev.get("error"):
         entry["attempts"] = int(entry.get("attempts") or 0) + 1
@@ -284,8 +472,11 @@ def _mirror_open(propr, row: dict, state: dict, equity: float, now: datetime) ->
             "entry_order_id": result.get("entry_order_id"),
             "stop_order_id": result.get("stop_order_id"),
             "take_profit_order_id": result.get("take_profit_order_id"),
+            "risk_usd": risk_usd,
             "opened_at": now.isoformat(),
         })
+        if risk_budget is not None:
+            risk_budget["remaining"] = max(0.0, risk_budget.get("remaining", 0.0) - risk_usd)
         log.info("Propr mirror OPEN %s %s %s (size %.6g) for trade %s",
                  asset, direction, entry["strategy"], size, trade_id)
     else:
@@ -366,6 +557,20 @@ def mirror_tick() -> dict:
             entry["reason"] = str(exc)
             log.warning("Propr mirror close for %s raised: %s", trade_id, exc)
 
+    # --- account read + PROPR-3 halt evaluation ------------------------------
+    # Every active tick (not just when there's something to open) so the
+    # day-start equity anchor is captured early and the page's halt readout
+    # stays current.
+    equity = None
+    attempt_payload: dict = {}
+    try:
+        account = propr.get_account_value() or {}
+        equity = _num(account.get("accountValue"))
+        attempt_payload = account.get("attempt") if isinstance(account.get("attempt"), dict) else {}
+    except Exception as exc:
+        log.debug("Propr mirror: account read failed: %s", exc)
+    halt = _evaluate_halt(attempt_payload, equity, now) if equity else None
+
     # --- open pass -----------------------------------------------------------
     try:
         open_rows = _roster_trades(roster_ids)
@@ -394,24 +599,47 @@ def mirror_tick() -> dict:
             continue
         to_open.append(row)
 
-    if to_open:
-        try:
-            equity = (propr.get_account_value() or {}).get("accountValue")
-            equity = float(equity) if equity else None
-        except Exception:
-            equity = None
-        if not equity or equity <= 0:
+    if to_open and halt and halt.get("halted"):
+        # PROPR-3: opens blocked near the challenge limits. Trades are NOT
+        # marked in state — if the halt clears inside their freshness window
+        # they mirror normally; past it they expire to a stale-skip, which is
+        # correct (a delayed entry is a different trade than the strategy took).
+        summary["halted"] = halt.get("reasons")
+    elif to_open:
+        if not equity:
             for row in to_open:
                 entry = state.setdefault(str(row["id"]), {"attempts": 0})
                 entry.update({"status": "error", "reason": "challenge equity unavailable — fail closed"})
             summary["errors"] += len(to_open)
         else:
+            # Remaining daily risk room = the halt line, minus realized daily
+            # loss, minus loss-at-stop of every mirrored position still open —
+            # so concurrent stop-outs can't stack past the venue's daily cap.
+            risk_budget = None
+            if halt is not None:
+                open_risk = sum(
+                    _num(e.get("risk_usd")) or 0.0
+                    for e in state.values()
+                    if e.get("status") == "open"
+                )
+                risk_budget = {
+                    "remaining": max(
+                        0.0,
+                        float(halt["daily_halt_at_usd"]) - float(halt["daily_loss"]) - open_risk,
+                    )
+                }
             for row in to_open[:MAX_OPENS_PER_TICK]:
                 try:
-                    _mirror_open(propr, row, state, equity, now)
+                    _mirror_open(propr, row, state, equity, now, risk_budget=risk_budget)
                     status = state.get(str(row["id"]), {}).get("status")
-                    summary["opened" if status == "open" else
-                            "skipped" if status == "skipped" else "errors"] += 1
+                    if status == "open":
+                        summary["opened"] += 1
+                    elif status == "skipped":
+                        summary["skipped"] += 1
+                    elif status == "pending":
+                        summary["deferred"] = summary.get("deferred", 0) + 1
+                    else:
+                        summary["errors"] += 1
                 except Exception as exc:
                     summary["errors"] += 1
                     state.setdefault(str(row["id"]), {})["reason"] = str(exc)

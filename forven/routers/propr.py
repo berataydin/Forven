@@ -115,6 +115,7 @@ def propr_get_mirror():
         "strategies": propr_mirror.mirror_roster(),
         "candidates": propr_mirror.roster_candidates(),
         "state": propr_mirror.get_state(),
+        "halt": propr_mirror.get_halt_state(),
     }
 
 

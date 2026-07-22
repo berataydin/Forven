@@ -286,10 +286,25 @@ def mirror_env(forven_db, monkeypatch):
     settings[pm.MIRROR_STRATEGIES_KEY] = {"S-M1": "2020-01-01T00:00:00+00:00"}
     kv_set("forven:settings", settings)
 
-    calls: dict = {"orders": [], "closes": [], "levs": []}
+    calls: dict = {"orders": [], "closes": [], "levs": [], "equity": {"value": 5_000.0}}
+    # Shaped like the real attempt-detail payload (verified live): static
+    # 3%-daily / 6%-drawdown rules on a $5,000 phase.
+    attempt_payload = {
+        "currentPhaseId": "ap-1",
+        "phases": [{"attemptPhaseId": "ap-1", "phaseId": "p-1",
+                    "status": "active", "startingBalance": "5000"}],
+        "challenge": {
+            "initialBalance": "5000",
+            "phases": [{"phaseId": "p-1", "maxDailyLossPercent": "3",
+                        "maxDrawdownPercent": "6", "drawdownType": "static"}],
+        },
+        "account": {"highWaterMark": "5000"},
+    }
     monkeypatch.setattr(propr, "get_all_mids", lambda testnet=True: {"BTC": 50_000.0})
-    monkeypatch.setattr(propr, "get_account_value",
-                        lambda *a, **k: {"accountValue": 5_000.0})
+    monkeypatch.setattr(
+        propr, "get_account_value",
+        lambda *a, **k: {"accountValue": calls["equity"]["value"], "attempt": attempt_payload},
+    )
     monkeypatch.setattr(propr, "set_leverage",
                         lambda *a, **k: calls["levs"].append(a) or {"leverage": 1.0})
 
@@ -369,6 +384,125 @@ def test_mirror_closes_when_source_closes(mirror_env):
     assert close["side"] == "sell"
     assert close["size"] == pytest.approx(0.025)
     assert pm.get_state()["T-m2"]["status"] == "closed"
+
+
+def test_challenge_rules_parse_the_real_payload_shape():
+    from forven.propr_mirror import _challenge_rules
+
+    attempt = {
+        "currentPhaseId": "ap-1",
+        "phases": [{"attemptPhaseId": "ap-1", "phaseId": "p-1", "startingBalance": "5000"}],
+        "challenge": {"phases": [{"phaseId": "p-1", "maxDailyLossPercent": "3",
+                                  "maxDrawdownPercent": "6", "drawdownType": "static"}]},
+    }
+    rules = _challenge_rules(attempt, equity=4_900.0, high_water_mark=5_100.0)
+    assert rules["source"] == "challenge"
+    assert rules["daily_loss_limit_usd"] == pytest.approx(150.0)
+    assert rules["drawdown_ref"] == pytest.approx(5_000.0)  # static: starting balance
+    assert rules["drawdown_floor"] == pytest.approx(4_700.0)
+
+
+def test_challenge_rules_fall_back_conservatively():
+    from forven.propr_mirror import _challenge_rules
+
+    rules = _challenge_rules({}, equity=5_000.0, high_water_mark=None)
+    assert rules["source"] == "defaults"
+    assert rules["daily_loss_limit_usd"] == pytest.approx(150.0)  # 3% of equity
+    assert rules["drawdown_floor"] == pytest.approx(4_700.0)
+
+
+def test_halt_trips_on_trailing_drawdown(forven_db):
+    from datetime import datetime, timezone
+
+    from forven.propr_mirror import _evaluate_halt
+
+    attempt = {
+        "currentPhaseId": "ap-1",
+        "phases": [{"attemptPhaseId": "ap-1", "phaseId": "p-1", "startingBalance": "5000"}],
+        "challenge": {"phases": [{"phaseId": "p-1", "maxDailyLossPercent": "3",
+                                  "maxDrawdownPercent": "6", "drawdownType": "trailing"}]},
+        "account": {"highWaterMark": "6000"},
+    }
+    # HWM 6000, 6% trailing => $360 allowance; $400 used >= 80% of it.
+    halt = _evaluate_halt(attempt, equity=5_600.0, now=datetime.now(timezone.utc))
+    assert halt["halted"] is True
+    assert any("drawdown" in r for r in halt["reasons"])
+
+
+def test_halted_tick_blocks_opens_but_still_closes(mirror_env):
+    from datetime import datetime, timezone
+
+    from forven.db import get_db, kv_set
+
+    pm, calls = mirror_env
+    # A previously mirrored trade whose source has since closed...
+    _insert_trade("T-h1", "S-M1")
+    pm.mirror_tick()
+    assert pm.get_state()["T-h1"]["status"] == "open"
+    with get_db() as conn:
+        conn.execute("UPDATE trades SET status = 'CLOSED' WHERE id = ?", ("T-h1",))
+    # ...plus a fresh open, arriving while daily loss sits past the halt line:
+    # day-start $5,000 vs equity $4,870 = $130 loss >= 80% of the $150 cap.
+    _insert_trade("T-h2", "S-M1", asset="BTC")
+    kv_set(pm.HALT_STATE_KEY, {
+        "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "day_start_equity": 5_000.0,
+    })
+    calls["equity"]["value"] = 4_870.0
+
+    summary = pm.mirror_tick()
+    assert summary["closed"] == 1 and calls["closes"]      # risk reduction ran
+    assert summary["opened"] == 0                           # new risk blocked
+    assert len(calls["orders"]) == 1                        # only T-h1's original open
+    assert "halted" in summary and any("daily loss" in r for r in summary["halted"])
+    halt = pm.get_halt_state()
+    assert halt["halted"] is True
+    assert halt["daily_loss"] == pytest.approx(130.0)
+    # T-h2 was NOT stamped in state — it mirrors normally if the halt clears
+    # within its freshness window.
+    assert "T-h2" not in pm.get_state()
+
+
+def test_open_risk_at_stops_consumes_the_daily_budget(mirror_env):
+    """Three concurrent 1%-risk opens would stack $150 of stop risk — exactly
+    the venue's daily cap. The budget check defers the third at the $120 halt
+    line instead of letting simultaneous stop-outs fail the challenge."""
+    pm, calls = mirror_env
+    for i in range(3):
+        _insert_trade(f"T-b{i}", "S-M1", asset=["BTC", "ETH", "SOL"][i])
+    # All three price/size identically for the test.
+    from forven.exchange import propr
+    mids = {"BTC": 50_000.0, "ETH": 50_000.0, "SOL": 50_000.0}
+    import unittest.mock as mock
+    with mock.patch.object(propr, "get_all_mids", lambda testnet=True: mids):
+        summary = pm.mirror_tick()
+    # $50 risk each against the $120 budget: two open, the third defers.
+    assert summary["opened"] == 2
+    assert summary.get("deferred") == 1
+    assert len(calls["orders"]) == 2
+    deferred = [e for e in pm.get_state().values() if e.get("status") == "pending"]
+    assert len(deferred) == 1 and "deferred" in deferred[0]["reason"]
+
+
+def test_day_rollover_resets_the_daily_anchor(mirror_env):
+    from datetime import datetime, timezone
+
+    from forven.db import kv_set
+
+    pm, calls = mirror_env
+    kv_set(pm.HALT_STATE_KEY, {"day": "2020-01-01", "day_start_equity": 5_000.0})
+    calls["equity"]["value"] = 4_870.0
+    _insert_trade("T-d1", "S-M1")
+
+    summary = pm.mirror_tick()
+    # New UTC day: the anchor re-bases to current equity, so yesterday's loss
+    # doesn't halt today ($130 drawdown is also inside the $240 halt line).
+    assert "halted" not in summary
+    assert summary["opened"] == 1
+    halt = pm.get_halt_state()
+    assert halt["day"] == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert halt["day_start_equity"] == pytest.approx(4_870.0)
+    assert halt["daily_loss"] == pytest.approx(0.0)
 
 
 def test_mirror_roster_preserves_join_timestamps(forven_db, monkeypatch):

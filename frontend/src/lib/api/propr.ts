@@ -42,11 +42,28 @@ export interface ProprMirrorTradeState {
 	source_execution_type?: string;
 }
 
+export interface ProprMirrorHalt {
+	day?: string;
+	day_start_equity?: number;
+	equity?: number;
+	daily_loss?: number;
+	daily_loss_limit_usd?: number;
+	daily_halt_at_usd?: number;
+	drawdown_used?: number;
+	drawdown_allowance_usd?: number;
+	drawdown_type?: string;
+	rules_source?: string;
+	halted?: boolean;
+	reasons?: string[];
+	checked_at?: string;
+}
+
 export interface ProprMirror {
 	enabled: boolean;
 	strategies: Record<string, string>;
 	candidates: ProprMirrorCandidate[];
 	state: Record<string, ProprMirrorTradeState>;
+	halt?: ProprMirrorHalt;
 }
 
 export interface ProprOverview {

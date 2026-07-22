@@ -262,6 +262,7 @@
 		(a, b) => (b[1].opened_at ?? '').localeCompare(a[1].opened_at ?? '')
 	);
 	$: accountIsPaper = status?.account_type === 'paper';
+	$: halt = mirror?.halt ?? null;
 	$: positions = (overview?.positions ?? []) as Row[];
 	$: openOrders = ((overview?.orders ?? []) as Row[]).filter((o) =>
 		['pending', 'open', 'partially_filled'].includes(pickStr(o, 'status').toLowerCase())
@@ -484,6 +485,58 @@
 					</button>
 				</div>
 			</div>
+
+			{#if halt?.halted}
+				<div class="border border-red-900 bg-red-500/5 px-3 py-2 text-[11px] text-red-400">
+					<span class="font-bold uppercase tracking-wider">Halted — new opens blocked:</span>
+					{(halt.reasons ?? []).join('; ')}. Closes still execute. The daily-loss halt clears at
+					the next UTC day; the drawdown halt clears if equity recovers.
+				</div>
+			{/if}
+			{#if halt?.checked_at}
+				<div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-center text-[11px]">
+					<div
+						class="border border-[#222] bg-[#0a0a0a] p-2"
+						title="Loss since the first equity reading of the UTC day. New opens halt at the budget — 80% of the venue's cap — so the challenge can't fail on daily loss."
+					>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Daily loss</div>
+						<div
+							class={`font-bold ${(halt.daily_loss ?? 0) >= (halt.daily_halt_at_usd ?? Infinity) ? 'text-red-400' : 'text-white'}`}
+						>
+							{fmtUsd(halt.daily_loss)}
+							<span class="block text-[10px] font-normal text-[#666]">
+								halts at {fmtUsd(halt.daily_halt_at_usd)} / cap {fmtUsd(halt.daily_loss_limit_usd)}
+							</span>
+						</div>
+					</div>
+					<div
+						class="border border-[#222] bg-[#0a0a0a] p-2"
+						title="Drawdown from the venue's reference (static: starting balance; trailing: high-water mark). New opens halt at 80% of the allowance."
+					>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">
+							Drawdown ({halt.drawdown_type ?? '—'})
+						</div>
+						<div
+							class={`font-bold ${(halt.drawdown_used ?? 0) >= 0.8 * (halt.drawdown_allowance_usd ?? Infinity) ? 'text-red-400' : 'text-white'}`}
+						>
+							{fmtUsd(halt.drawdown_used)}
+							<span class="block text-[10px] font-normal text-[#666]">
+								of {fmtUsd(halt.drawdown_allowance_usd)} allowed
+							</span>
+						</div>
+					</div>
+					<div class="border border-[#222] bg-[#0a0a0a] p-2">
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Day-start equity</div>
+						<div class="font-bold text-white">{fmtUsd(halt.day_start_equity)}</div>
+					</div>
+					<div class="border border-[#222] bg-[#0a0a0a] p-2">
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Rules</div>
+						<div class="text-[11px] font-bold text-[#aaa] pt-1">
+							{halt.rules_source === 'challenge' ? 'from challenge' : 'fallback defaults'}
+						</div>
+					</div>
+				</div>
+			{/if}
 
 			<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
 				<div class="space-y-2">
