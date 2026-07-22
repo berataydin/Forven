@@ -834,7 +834,10 @@ def get_account_value(
         if value is None:
             account = attempt.get("account")
             if isinstance(account, dict):
-                for key in ("balance", "equity", "currentBalance"):
+                # marginBalance = wallet balance + unrealized PnL — the true
+                # current equity (verified against a live attempt payload);
+                # bare "balance" is the realized wallet only.
+                for key in ("marginBalance", "margin_balance", "equity", "balance", "currentBalance"):
                     raw = account.get(key)
                     if raw not in (None, ""):
                         try:
