@@ -263,6 +263,15 @@
 	);
 	$: accountIsPaper = status?.account_type === 'paper';
 	$: halt = mirror?.halt ?? null;
+
+	// Gauge helpers for the challenge-rules panel: fill % of the venue limit,
+	// clamped, with color stepping at 50% and at the 80% halt line.
+	const gaugePct = (used: number | null | undefined, limit: number | null | undefined) => {
+		if (!limit || limit <= 0) return 0;
+		return Math.max(0, Math.min(100, ((used ?? 0) / limit) * 100));
+	};
+	const gaugeColor = (pctUsed: number) =>
+		pctUsed >= 80 ? '#f87171' : pctUsed >= 50 ? '#eab308' : '#34d399';
 	$: positions = (overview?.positions ?? []) as Row[];
 	$: openOrders = ((overview?.orders ?? []) as Row[]).filter((o) =>
 		['pending', 'open', 'partially_filled'].includes(pickStr(o, 'status').toLowerCase())
@@ -449,6 +458,109 @@
 			{/if}
 		</div>
 
+		<!-- ─────────────────────── challenge rules ─────────────────────── -->
+		{#if halt?.checked_at}
+			{@const dailyPct = gaugePct(halt.daily_loss, halt.daily_loss_limit_usd)}
+			{@const ddPct = gaugePct(halt.drawdown_used, halt.drawdown_allowance_usd)}
+			{@const targetPct = gaugePct(halt.profit_progress_usd, halt.profit_target_usd)}
+			<div class="border border-[#222] bg-[#050505] p-4 space-y-4">
+				<div class="flex items-center justify-between">
+					<div>
+						<h2 class="text-sm font-bold uppercase tracking-wider text-white">Challenge rules</h2>
+						<p class="text-[11px] text-[#666]">
+							The venue's kill conditions, read from the challenge itself
+							({halt.rules_source === 'challenge' ? "Propr's own phase rules" : 'conservative fallback defaults'}),
+							and how close the account is to each. The white tick on each bar is the mirror's
+							halt line — new opens stop there, 20% before Propr would fail the attempt.
+						</p>
+					</div>
+					<span class="text-[10px] text-[#666] shrink-0">
+						checked {fmtWhen(halt.checked_at)}
+					</span>
+				</div>
+
+				<!-- daily loss gauge -->
+				<div class="space-y-1">
+					<div class="flex items-baseline justify-between text-[11px]">
+						<span class="uppercase tracking-wider text-[10px] text-[#888]">
+							Max daily loss
+							<span class="text-[#555] normal-case">— resets each UTC day</span>
+						</span>
+						<span class={dailyPct >= 80 ? 'text-red-400 font-bold' : 'text-[#aaa]'}>
+							{fmtUsd(halt.daily_loss)} of {fmtUsd(halt.daily_loss_limit_usd)}
+							<span class="text-[#666]">· halts at {fmtUsd(halt.daily_halt_at_usd)}</span>
+						</span>
+					</div>
+					<div class="relative h-3 border border-[#222] bg-[#0a0a0a]">
+						<div
+							class="absolute inset-y-0 left-0"
+							style={`width:${dailyPct}%; background:${gaugeColor(dailyPct)}; opacity:.85`}
+						></div>
+						<div class="absolute inset-y-0 w-px bg-white" style="left:80%" title="Mirror halt line (80% of the venue cap)"></div>
+					</div>
+					<div class="text-[10px] text-[#555]">
+						Guarded by: open-halt at 80% · loss-at-stop of open positions counts against the
+						remaining budget, so simultaneous stop-outs can't stack past the cap.
+					</div>
+				</div>
+
+				<!-- drawdown gauge -->
+				<div class="space-y-1">
+					<div class="flex items-baseline justify-between text-[11px]">
+						<span class="uppercase tracking-wider text-[10px] text-[#888]">
+							Max drawdown
+							<span class="text-[#555] normal-case">
+								— {halt.drawdown_type === 'trailing' ? 'trailing, from the high-water mark' : `static, from the ${fmtUsd(halt.starting_balance)} starting balance`}
+							</span>
+						</span>
+						<span class={ddPct >= 80 ? 'text-red-400 font-bold' : 'text-[#aaa]'}>
+							{fmtUsd(halt.drawdown_used)} of {fmtUsd(halt.drawdown_allowance_usd)}
+						</span>
+					</div>
+					<div class="relative h-3 border border-[#222] bg-[#0a0a0a]">
+						<div
+							class="absolute inset-y-0 left-0"
+							style={`width:${ddPct}%; background:${gaugeColor(ddPct)}; opacity:.85`}
+						></div>
+						<div class="absolute inset-y-0 w-px bg-white" style="left:80%" title="Mirror halt line (80% of the allowance)"></div>
+					</div>
+					<div class="text-[10px] text-[#555]">
+						Guarded by: open-halt at 80% · every mirrored entry carries an exchange-side stop
+						bracket · sizing risks 1% of challenge equity per trade (hard cap 2%) · closes are
+						never halted, so risk can always come down.
+					</div>
+				</div>
+
+				<!-- profit target gauge -->
+				{#if halt.profit_target_usd}
+					<div class="space-y-1">
+						<div class="flex items-baseline justify-between text-[11px]">
+							<span class="uppercase tracking-wider text-[10px] text-[#888]">
+								Profit target
+								<span class="text-[#555] normal-case">— passes the phase</span>
+							</span>
+							<span class={(halt.profit_progress_usd ?? 0) < 0 ? 'text-red-400' : 'text-emerald-400'}>
+								{fmtUsd(halt.profit_progress_usd)} of {fmtUsd(halt.profit_target_usd)}
+							</span>
+						</div>
+						<div class="relative h-3 border border-[#222] bg-[#0a0a0a]">
+							<div
+								class="absolute inset-y-0 left-0 bg-emerald-500"
+								style={`width:${targetPct}%; opacity:.85`}
+							></div>
+						</div>
+					</div>
+				{/if}
+
+				<div class="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-[#666] border-t border-[#151515] pt-2">
+					<span>✓ no unprotected entries (source trades without a stop are never mirrored)</span>
+					<span>✓ day-start equity anchored to our first reading — tighter than the venue's</span>
+					<span>✓ auto-disarm if the account stops reporting as paper</span>
+					<span>✓ unreadable rules fall back to the strictest tier (3% / 6%)</span>
+				</div>
+			</div>
+		{/if}
+
 		<!-- ─────────────────────── strategy mirror ─────────────────────── -->
 		<div
 			class={`border p-4 space-y-3 ${mirror?.enabled ? 'border-emerald-900 bg-[#050805]' : 'border-[#222] bg-[#050505]'}`}
@@ -493,51 +605,6 @@
 					the next UTC day; the drawdown halt clears if equity recovers.
 				</div>
 			{/if}
-			{#if halt?.checked_at}
-				<div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-center text-[11px]">
-					<div
-						class="border border-[#222] bg-[#0a0a0a] p-2"
-						title="Loss since the first equity reading of the UTC day. New opens halt at the budget — 80% of the venue's cap — so the challenge can't fail on daily loss."
-					>
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Daily loss</div>
-						<div
-							class={`font-bold ${(halt.daily_loss ?? 0) >= (halt.daily_halt_at_usd ?? Infinity) ? 'text-red-400' : 'text-white'}`}
-						>
-							{fmtUsd(halt.daily_loss)}
-							<span class="block text-[10px] font-normal text-[#666]">
-								halts at {fmtUsd(halt.daily_halt_at_usd)} / cap {fmtUsd(halt.daily_loss_limit_usd)}
-							</span>
-						</div>
-					</div>
-					<div
-						class="border border-[#222] bg-[#0a0a0a] p-2"
-						title="Drawdown from the venue's reference (static: starting balance; trailing: high-water mark). New opens halt at 80% of the allowance."
-					>
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">
-							Drawdown ({halt.drawdown_type ?? '—'})
-						</div>
-						<div
-							class={`font-bold ${(halt.drawdown_used ?? 0) >= 0.8 * (halt.drawdown_allowance_usd ?? Infinity) ? 'text-red-400' : 'text-white'}`}
-						>
-							{fmtUsd(halt.drawdown_used)}
-							<span class="block text-[10px] font-normal text-[#666]">
-								of {fmtUsd(halt.drawdown_allowance_usd)} allowed
-							</span>
-						</div>
-					</div>
-					<div class="border border-[#222] bg-[#0a0a0a] p-2">
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Day-start equity</div>
-						<div class="font-bold text-white">{fmtUsd(halt.day_start_equity)}</div>
-					</div>
-					<div class="border border-[#222] bg-[#0a0a0a] p-2">
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Rules</div>
-						<div class="text-[11px] font-bold text-[#aaa] pt-1">
-							{halt.rules_source === 'challenge' ? 'from challenge' : 'fallback defaults'}
-						</div>
-					</div>
-				</div>
-			{/if}
-
 			<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
 				<div class="space-y-2">
 					<div class="flex items-center justify-between">

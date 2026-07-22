@@ -52,6 +52,9 @@ export interface ProprMirrorHalt {
 	drawdown_used?: number;
 	drawdown_allowance_usd?: number;
 	drawdown_type?: string;
+	starting_balance?: number;
+	profit_target_usd?: number | null;
+	profit_progress_usd?: number;
 	rules_source?: string;
 	halted?: boolean;
 	reasons?: string[];

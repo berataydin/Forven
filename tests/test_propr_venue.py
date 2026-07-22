@@ -296,7 +296,8 @@ def mirror_env(forven_db, monkeypatch):
         "challenge": {
             "initialBalance": "5000",
             "phases": [{"phaseId": "p-1", "maxDailyLossPercent": "3",
-                        "maxDrawdownPercent": "6", "drawdownType": "static"}],
+                        "maxDrawdownPercent": "6", "drawdownType": "static",
+                        "profitTargetPercent": "10"}],
         },
         "account": {"highWaterMark": "5000"},
     }
@@ -458,6 +459,11 @@ def test_halted_tick_blocks_opens_but_still_closes(mirror_env):
     halt = pm.get_halt_state()
     assert halt["halted"] is True
     assert halt["daily_loss"] == pytest.approx(130.0)
+    # Rules-panel fields (visual on the page): target and progress from the
+    # venue's own phase terms.
+    assert halt["starting_balance"] == pytest.approx(5_000.0)
+    assert halt["profit_target_usd"] == pytest.approx(500.0)
+    assert halt["profit_progress_usd"] == pytest.approx(-130.0)
     # T-h2 was NOT stamped in state — it mirrors normally if the halt clears
     # within its freshness window.
     assert "T-h2" not in pm.get_state()

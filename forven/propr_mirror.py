@@ -186,6 +186,7 @@ def _challenge_rules(attempt: dict, equity: float, high_water_mark: float | None
 
     daily_pct = _num(ch_phase.get("maxDailyLossPercent"))
     dd_pct = _num(ch_phase.get("maxDrawdownPercent"))
+    target_pct = _num(ch_phase.get("profitTargetPercent"))
     dd_type = str(ch_phase.get("drawdownType") or "").strip().lower()
     source = "challenge"
     if daily_pct is None or dd_pct is None or starting_balance is None:
@@ -218,6 +219,11 @@ def _challenge_rules(attempt: dict, equity: float, high_water_mark: float | None
         "drawdown_type": dd_type or "unknown",
         "drawdown_ref": dd_ref,
         "drawdown_floor": dd_floor,
+        # Informational (not a halt input): the phase's profit goal, so the
+        # page can show progress toward passing next to the two kill rules.
+        "profit_target_usd": (
+            starting_balance * target_pct / 100.0 if target_pct else None
+        ),
     }
 
 
@@ -262,6 +268,9 @@ def _evaluate_halt(attempt: dict, equity: float, now: datetime) -> dict:
         "drawdown_used": dd_used,
         "drawdown_allowance_usd": dd_allowance,
         "drawdown_type": rules["drawdown_type"],
+        "starting_balance": rules["starting_balance"],
+        "profit_target_usd": rules["profit_target_usd"],
+        "profit_progress_usd": equity - rules["starting_balance"],
         "rules_source": rules["source"],
         "halted": bool(reasons),
         "reasons": reasons,
