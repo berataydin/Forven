@@ -209,10 +209,11 @@ def test_market_order_rejects_vault_routing(armed_propr):
     assert "sub-account" in result["error"]
 
 
-def test_set_leverage_sends_decimal_strings(monkeypatch):
-    """Propr serializes numerics as decimal strings (its GET returns
-    leverage "1"); a JSON float in the PUT is a 400 — observed live on the
-    first mirrored trade, 2026-07-23."""
+def test_set_leverage_sends_the_sdk_exact_body(monkeypatch):
+    """The margin-config PUT requires ALL FOUR fields (exchange, asset,
+    marginMode, leverage) with leverage as an INTEGER — per Propr's own SDK
+    (update_margin_config). Missing exchange/asset 400'd the first mirrored
+    trades on 2026-07-23."""
     from forven.exchange import propr
 
     monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
@@ -232,10 +233,15 @@ def test_set_leverage_sends_decimal_strings(monkeypatch):
 
     monkeypatch.setattr(propr, "_request", fake_request)
     result = propr.set_leverage("ETH", 2.0)
-    assert result == {"leverage": 2.0, "clamped": False}
+    assert result == {"leverage": 2, "clamped": False}
     put = next(c for c in calls if c["method"] == "PUT")
-    assert put["body"] == {"leverage": "2", "marginMode": "cross"}
-    assert isinstance(put["body"]["leverage"], str)
+    assert put["body"] == {
+        "exchange": "hyperliquid",
+        "asset": "ETH",
+        "marginMode": "cross",
+        "leverage": 2,
+    }
+    assert isinstance(put["body"]["leverage"], int)
 
 
 # ---------------------------------------------------------------------------

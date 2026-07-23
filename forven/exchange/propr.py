@@ -37,6 +37,7 @@ Venue quirks (from github.com/XBorgLabs/propr-docs):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -278,6 +279,12 @@ def _request(method: str, path: str, *, breaker, body=None, params=None,
             message = None
             if isinstance(payload, dict):
                 message = payload.get("message") or payload.get("error")
+                # Generic messages ("Bad Request Exception") hide the venue's
+                # validation detail — append the rest of the payload compactly.
+                detail = {k: v for k, v in payload.items()
+                          if k not in ("message", "error") and v is not None}
+                if message and detail:
+                    message = f"{message} {json.dumps(detail, default=str)[:250]}"
             message = message or (resp.text or "")[:300] or f"HTTP {resp.status_code}"
             if resp.status_code >= 500:
                 breaker.record_failure()
@@ -1105,7 +1112,9 @@ def set_leverage(
     cap = _effective_leverage_limit(asset_n)
     if cap is None:
         cap = _DOCUMENTED_LEVERAGE_CAPS.get(asset_n, _DEFAULT_LEVERAGE_CAP)
-    applied = min(requested, float(cap))
+    # Whole-number leverage (the venue's margin config takes an integer);
+    # flooring keeps a fractional request on the conservative side.
+    applied = max(1, int(min(requested, float(cap))))
 
     account_id, _ = resolve_account()
     try:
@@ -1133,12 +1142,16 @@ def set_leverage(
     if current_leverage == applied and (not desired_mode or desired_mode == margin_mode):
         return {"leverage": applied, "clamped": applied < requested, "unchanged": True}
 
-    # Propr serializes every numeric field as a decimal string — its own GET
-    # returns leverage "1" — and rejects a JSON float with a bare 400
-    # (observed live 2026-07-23 on the first mirrored S03402 trade).
-    body: dict = {"leverage": _fmt_decimal(applied)}
-    if desired_mode:
-        body["marginMode"] = desired_mode
+    # SDK-exact body (propr-docs python/propr_sdk.py update_margin_config):
+    # all four fields are required — omitting exchange/asset was the silent
+    # 400 on the first mirrored trades — and leverage is an INTEGER here,
+    # unlike every other numeric in this API (decimal strings).
+    body: dict = {
+        "exchange": "hyperliquid",
+        "asset": asset_n,
+        "marginMode": desired_mode or margin_mode or "cross",
+        "leverage": applied,
+    }
     try:
         _request(
             "PUT", f"/accounts/{account_id}/margin-config/{config_id}",
