@@ -209,6 +209,35 @@ def test_market_order_rejects_vault_routing(armed_propr):
     assert "sub-account" in result["error"]
 
 
+def test_set_leverage_sends_decimal_strings(monkeypatch):
+    """Propr serializes numerics as decimal strings (its GET returns
+    leverage "1"); a JSON float in the PUT is a 400 — observed live on the
+    first mirrored trade, 2026-07-23."""
+    from forven.exchange import propr
+
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.setenv("FORVEN_ALLOW_PROPR_LIVE", "1")
+    monkeypatch.setattr(propr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    propr._leverage_limits_cache.update({"limits": {"ETH": 5.0}, "at": 1e18})
+
+    calls = []
+
+    def fake_request(method, path, *, breaker, body=None, params=None, **kw):
+        calls.append({"method": method, "path": path, "body": body})
+        if method == "GET" and "margin-config" in path:
+            # Real live response shape.
+            return {"configId": "urn:prp-margin-config:X", "asset": "ETH",
+                    "marginMode": "cross", "leverage": "1"}
+        return {}
+
+    monkeypatch.setattr(propr, "_request", fake_request)
+    result = propr.set_leverage("ETH", 2.0)
+    assert result == {"leverage": 2.0, "clamped": False}
+    put = next(c for c in calls if c["method"] == "PUT")
+    assert put["body"] == {"leverage": "2", "marginMode": "cross"}
+    assert isinstance(put["body"]["leverage"], str)
+
+
 # ---------------------------------------------------------------------------
 # Router hiding
 # ---------------------------------------------------------------------------

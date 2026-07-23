@@ -402,6 +402,39 @@ def _size_mirror_order(
     return size, None
 
 
+def _notify_mirror_failure(trade_id: str, entry: dict, kind: str) -> None:
+    """Terminal mirror failures must reach the operator, not just the page."""
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "propr_mirror_failure",
+            severity="warning",
+            source="propr_mirror",
+            title=f"Propr mirror {kind} failed ({entry.get('asset')})",
+            summary=(
+                f"{entry.get('strategy')} {entry.get('asset')} {entry.get('direction')} "
+                f"(trade {trade_id}): {entry.get('reason')}"
+            ),
+            body=str(entry.get("reason") or ""),
+            dedupe_key=f"propr_mirror_failure:{trade_id}:{kind}",
+        )
+    except Exception as exc:
+        log.debug("Could not emit propr mirror failure notification: %s", exc)
+
+
+def _record_open_error(trade_id: str, entry: dict, reason: str) -> None:
+    """Bounded-retry bookkeeping for a failed open attempt; notifies once the
+    failure turns terminal."""
+    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    entry["reason"] = reason
+    if entry["attempts"] < MAX_OPEN_ATTEMPTS:
+        entry["status"] = "error"
+    else:
+        entry["status"] = "failed"
+        log.error("Propr mirror open for trade %s FAILED terminally: %s", trade_id, reason)
+        _notify_mirror_failure(trade_id, entry, "open")
+
+
 def _mirror_open(
     propr, row: dict, state: dict, equity: float, now: datetime,
     risk_budget: dict | None = None,
@@ -424,9 +457,7 @@ def _mirror_open(
 
     mid = float(propr.get_all_mids().get(asset, 0) or 0)
     if mid <= 0:
-        entry["attempts"] = int(entry.get("attempts") or 0) + 1
-        entry.update({"status": "error" if entry["attempts"] < MAX_OPEN_ATTEMPTS else "failed",
-                      "reason": f"no mid price for {asset}"})
+        _record_open_error(trade_id, entry, f"no mid price for {asset}")
         return
 
     # Price already through the stop => the trade is over before we arrived.
@@ -459,9 +490,7 @@ def _mirror_open(
 
     lev = propr.set_leverage(asset, float(row.get("leverage") or 1.0))
     if isinstance(lev, dict) and lev.get("error"):
-        entry["attempts"] = int(entry.get("attempts") or 0) + 1
-        entry.update({"status": "error" if entry["attempts"] < MAX_OPEN_ATTEMPTS else "failed",
-                      "reason": f"set_leverage: {lev['error']}"})
+        _record_open_error(trade_id, entry, f"set_leverage: {lev['error']}")
         return
 
     result = propr.market_order(
@@ -489,9 +518,7 @@ def _mirror_open(
         log.info("Propr mirror OPEN %s %s %s (size %.6g) for trade %s",
                  asset, direction, entry["strategy"], size, trade_id)
     else:
-        entry["attempts"] = int(entry.get("attempts") or 0) + 1
-        entry.update({"status": "error" if entry["attempts"] < MAX_OPEN_ATTEMPTS else "failed",
-                      "reason": str((result or {}).get("error") or "order rejected")})
+        _record_open_error(trade_id, entry, str((result or {}).get("error") or "order rejected"))
 
 
 def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
@@ -527,6 +554,7 @@ def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
             entry["status"] = "close_failed"
             log.error("Propr mirror: close for trade %s FAILED after %d attempts: %s",
                       trade_id, attempts, entry["reason"])
+            _notify_mirror_failure(trade_id, entry, "close")
 
 
 def mirror_tick() -> dict:

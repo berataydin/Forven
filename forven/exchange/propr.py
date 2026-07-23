@@ -1133,7 +1133,10 @@ def set_leverage(
     if current_leverage == applied and (not desired_mode or desired_mode == margin_mode):
         return {"leverage": applied, "clamped": applied < requested, "unchanged": True}
 
-    body: dict = {"leverage": applied}
+    # Propr serializes every numeric field as a decimal string — its own GET
+    # returns leverage "1" — and rejects a JSON float with a bare 400
+    # (observed live 2026-07-23 on the first mirrored S03402 trade).
+    body: dict = {"leverage": _fmt_decimal(applied)}
     if desired_mode:
         body["marginMode"] = desired_mode
     try:
