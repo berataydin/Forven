@@ -637,6 +637,54 @@ def _record_schema_migration_failures(
         log.exception("Failed to record schema-migration failure flag.")
 
 
+def _snapshot_before_pending_migrations(conn: sqlite3.Connection) -> None:
+    """Take a managed DB snapshot iff named migrations are actually pending.
+
+    HARDEN-DATA-OPS / OPS-7. Deliberately cheap on the common path: init_db runs
+    on EVERY startup path (api, cli, agents, bot, every spawned worker), so the
+    snapshot is gated on there being unapplied migrations — a steady-state boot
+    pays one `schema_migrations` lookup and nothing else.
+
+    Worker subprocesses skip it entirely: they re-run init_db concurrently with
+    the main writer, and six children each copying a multi-GB file the moment a
+    migration lands would be its own outage (same class as the JOB-SWEEP-1
+    import-time-side-effect-in-every-pool-worker defect). The parent takes the
+    snapshot; children just apply.
+
+    Never raises into startup — a missing snapshot must not brick the app — but
+    it logs loudly, because migrating without one is the risk this exists to
+    remove.
+    """
+    try:
+        import multiprocessing
+
+        if multiprocessing.parent_process() is not None:
+            return
+        from forven.migrations import pending_migrations
+
+        pending = pending_migrations(conn)
+    except Exception:
+        log.exception("Could not determine pending migrations; skipping pre-migration snapshot.")
+        return
+    if not pending:
+        return
+    try:
+        from forven.backups import create_managed_db_backup
+
+        # backup_db reads through its own connection; in WAL mode that snapshots
+        # the last COMMITTED state — i.e. exactly the pre-migration database.
+        target = create_managed_db_backup("pre-migration")
+        log.warning(
+            "Pre-migration DB snapshot written to %s before applying %d migration(s): %s",
+            target, len(pending), ", ".join(pending),
+        )
+    except Exception:
+        log.exception(
+            "Pre-migration DB snapshot FAILED; applying %d migration(s) with no rollback copy: %s",
+            len(pending), ", ".join(pending),
+        )
+
+
 def init_db():
     """Create all tables if they don't exist."""
     # B-21: schema-init failures below must be LOUD, not swallowed. They are
@@ -668,6 +716,14 @@ def init_db():
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
+        # HARDEN-DATA-OPS (no-backup-before-destructive-migration): named
+        # migrations run row-touching DML against the multi-GB DB that holds
+        # every trade, position, verdict and equity record, and there is NO
+        # downgrade path — a migration that mangles rows is only recoverable
+        # from a snapshot, and nothing was taking one. Snapshot BEFORE the
+        # SAVEPOINT opens (the savepoint only unwinds the current batch's DML,
+        # not a semantically wrong-but-successful migration).
+        _snapshot_before_pending_migrations(conn)
         # H-D3: record the legacy bulk migration in the named-migrations
         # tracking table so operators can see what's been applied, then run
         # any new-style migrations registered in forven.migrations.
@@ -5509,7 +5565,13 @@ def claim_pending_agent_tasks(agent_id: str, limit: int | None = None) -> list[d
         source_clause = "AND COALESCE(source, ?) = ? "
         params.extend([SYSTEM_SOURCE, USER_SOURCE])
     params.append(max(limit, 1) * 5)
-    with get_db() as conn:
+    # HARDEN-DATA-OPS (nonatomic-task-claim): BEGIN IMMEDIATE, not get_db().
+    # The SELECT-then-UPDATE-by-id below is a read-then-write state transition;
+    # on a plain deferred txn two runners could both read the same pending row
+    # and both mark it running — the agent task then EXECUTES TWICE (duplicated
+    # LLM spend, duplicated tool side effects on live containers). The
+    # compare-and-set guard on the UPDATE is the second belt (see below).
+    with get_db_immediate() as conn:
         rows = conn.execute(
             "SELECT * FROM agent_tasks WHERE agent_id = ? AND status = 'pending' "
             "AND (retry_at IS NULL OR retry_at <= ?) "
@@ -5560,11 +5622,36 @@ def claim_pending_agent_tasks(agent_id: str, limit: int | None = None) -> list[d
             return []
 
         placeholders = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE agent_tasks SET status='running', started_at=?, error=NULL WHERE id IN ({placeholders})",
+        # Compare-and-set: only rows STILL pending are ours. Under BEGIN
+        # IMMEDIATE this always claims all of them; the guard is what keeps a
+        # future caller that forgets the immediate txn from double-claiming.
+        cursor = conn.execute(
+            f"UPDATE agent_tasks SET status='running', started_at=?, error=NULL "
+            f"WHERE id IN ({placeholders}) AND status='pending'",
             (now, *ids),
         )
-        return claimed_rows[:len(ids)]
+        if cursor.rowcount == len(ids):
+            return claimed_rows[:len(ids)]
+        won = _rows_we_actually_claimed(conn, "agent_tasks", ids, "started_at", now)
+        return [row for row in claimed_rows[:len(ids)] if str(row["id"]) in won]
+
+
+def _rows_we_actually_claimed(
+    conn: sqlite3.Connection, table: str, ids: list[str], stamp_column: str, stamp: str
+) -> set[str]:
+    """Ids from ``ids`` that THIS claim transitioned to running (HARDEN-DATA-OPS).
+
+    Only reached when the compare-and-set UPDATE moved fewer rows than we
+    selected — i.e. someone else claimed one out from under us. ``table`` and
+    ``stamp_column`` are module-internal literals, never caller input.
+    """
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id FROM {table} WHERE id IN ({placeholders}) "  # noqa: S608 — literals only
+        f"AND status='running' AND {stamp_column}=?",
+        (*ids, stamp),
+    ).fetchall()
+    return {str(row["id"]) for row in rows}
 
 
 def claim_pending_tasks(task_type: str, limit: int | None = None, priority: bool = True) -> list[dict]:
@@ -5586,7 +5673,10 @@ def claim_pending_tasks(task_type: str, limit: int | None = None, priority: bool
         source_clause = "AND COALESCE(source, ?) = ? "
         params.extend([SYSTEM_SOURCE, USER_SOURCE])
     params.append(limit)
-    with get_db() as conn:
+    # HARDEN-DATA-OPS (nonatomic-task-claim): same race as the agent queue above —
+    # a brain_invoke row read as pending by two runners was executed twice (two
+    # LLM calls, two sets of tool side effects). BEGIN IMMEDIATE + compare-and-set.
+    with get_db_immediate() as conn:
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE type = ? AND status = 'pending' "
             f"AND (retry_at IS NULL OR retry_at <= ?) {source_clause}{order} LIMIT ?",
@@ -5598,11 +5688,15 @@ def claim_pending_tasks(task_type: str, limit: int | None = None, priority: bool
             return []
 
         placeholders = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE tasks SET status='running', claimed_at=?, error=NULL WHERE id IN ({placeholders})",
+        cursor = conn.execute(
+            f"UPDATE tasks SET status='running', claimed_at=?, error=NULL "
+            f"WHERE id IN ({placeholders}) AND status='pending'",
             (now, *ids),
         )
-        return [dict(r) for r in rows]
+        if cursor.rowcount == len(ids):
+            return [dict(r) for r in rows]
+        won = _rows_we_actually_claimed(conn, "tasks", ids, "claimed_at", now)
+        return [dict(r) for r in rows if str(r["id"]) in won]
 
 
 def recover_stale_running_tasks(

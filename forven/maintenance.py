@@ -51,8 +51,31 @@ DEFAULT_RETENTION_DAYS: dict[str, int] = {
     # their run; this age prune catches chat (CHAT:)/deepdive (DD:) keys that
     # have no queue-row parent, plus any legacy orphans.
     "retention_agent_transcript_days": 45,
+    # HARDEN-DATA-OPS (unbounded-growth-tables-no-retention): the last two
+    # append-only tables with no age prune at all.
+    #
+    # market_data_history (~486k rows, ~1.1k/day) is the funding/OI series the
+    # enrichment reads. 900d, NOT something tighter: ensure_funding_history
+    # backfills to DEFAULT_FUNDING_TARGET_DAYS (730), so any window at or below
+    # that turns the prune into a treadmill — the reconcile job re-downloads
+    # exactly what maintenance deleted, every single day. _RETENTION_FLOOR_DAYS
+    # enforces the margin even if an operator dials this down in Settings.
+    "retention_market_data_history_days": 900,
+    # strategy_events (~24k rows) is the stage/ownership audit trail (it is what
+    # the out-of-band-stage-write tripwire writes into). Small and genuinely
+    # useful, so it gets a long window rather than an aggressive one — this is
+    # a growth bound, not a cleanup.
+    "retention_strategy_events_days": 365,
 }
 RETENTION_SETTING_KEYS = tuple(DEFAULT_RETENTION_DAYS.keys())
+
+# Hard floors (days) applied AFTER the operator's setting is read. A window
+# shorter than the history the pipeline rebuilds from does not save space — it
+# just makes the collector re-download the same rows forever. 0 (disabled) is
+# still honoured; the floor only clamps a nonzero-but-too-short window.
+_RETENTION_FLOOR_DAYS: dict[str, int] = {
+    "retention_market_data_history_days": 760,  # > DEFAULT_FUNDING_TARGET_DAYS (730)
+}
 
 # Queue-row (agent_tasks/tasks) terminal-row retention, in HOURS. This is a
 # separate, generous knob from the day-based table windows above because the
@@ -88,6 +111,10 @@ _AGE_PRUNE_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("task_audit_log", "created_at"),
         ("tool_truncations", "created_at"),
     ),
+    # market_data_history stores an ISO-8601 `timestamp` alongside the
+    # `timestamp_ms` uniqueness key; the ISO column is what datetime() can compare.
+    "retention_market_data_history_days": (("market_data_history", "timestamp"),),
+    "retention_strategy_events_days": (("strategy_events", "created_at"),),
 }
 
 
@@ -106,7 +133,11 @@ def _resolve_retention(settings: dict | None = None) -> dict[str, int]:
             value = int(settings.get(key, default))
         except (TypeError, ValueError):
             value = default
-        resolved[key] = max(0, value)
+        value = max(0, value)
+        floor = _RETENTION_FLOOR_DAYS.get(key)
+        if floor and value:  # 0 stays 0 — that means "pruning disabled"
+            value = max(value, floor)
+        resolved[key] = value
     return resolved
 
 

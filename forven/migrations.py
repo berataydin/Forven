@@ -764,6 +764,18 @@ def list_applied(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def pending_migrations(conn: sqlite3.Connection) -> list[str]:
+    """Names of MIGRATIONS entries not yet recorded on this database.
+
+    HARDEN-DATA-OPS: lets ``db.init_db`` decide whether a pre-migration DB
+    snapshot is warranted BEFORE it opens the named-migration SAVEPOINT — the
+    common startup path (nothing pending) must pay nothing, and once
+    ``apply_pending`` has started there is no downgrade path to snapshot back to.
+    """
+    ensure_migrations_table(conn)
+    return [migration.name for migration in MIGRATIONS if not is_applied(conn, migration.name)]
+
+
 def apply_pending(conn: sqlite3.Connection) -> list[str]:
     """Apply every MIGRATIONS entry whose name has not been recorded.
 
@@ -798,5 +810,6 @@ __all__ = [
     "ensure_migrations_table",
     "is_applied",
     "list_applied",
+    "pending_migrations",
     "record_applied",
 ]

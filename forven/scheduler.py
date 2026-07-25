@@ -83,6 +83,11 @@ _DEFAULT_JOB_IDS = {
     "forven-auto-intake",
     "forven-wal-checkpoint",
     "forven-db-maintenance",
+    # HARDEN-DATA-OPS (no-backup-before-destructive-migration): nothing was
+    # taking a periodic copy of the DB that holds every trade, position, verdict
+    # and equity record. Listed here as well as in seed_forven_jobs — SEED-DRIFT-1
+    # above is exactly this omission, and it has silently deleted seeded jobs twice.
+    "forven-db-backup",
     "forven-capital-slot-dedupe",
     "forven-hypothesis-verdict-loop",
     "forven-hypothesis-promotion-loop",
@@ -1701,6 +1706,30 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             )
             return "ok", None
 
+        # Daily managed DB snapshot (HARDEN-DATA-OPS). backup_db uses SQLite's
+        # online backup API, so this is safe against the live writer; retention
+        # for the "scheduled" reason keeps a week of dailies without touching
+        # pre-migration or operator snapshots, and a global byte ceiling bounds
+        # the snapshot directory across every reason.
+        if kind == "db_backup":
+            from forven.backups import InsufficientBackupSpace, create_managed_db_backup
+            # 600s, not more: _SCHEDULER_TICK_WATCHDOG_SECONDS (900s) must stay
+            # above the largest in-tick job timeout or a legitimate heavy tick
+            # trips the circuit breaker.
+            try:
+                target = await _run_sync_job(
+                    create_managed_db_backup, "scheduled", timeout_seconds=600.0
+                )
+            except InsufficientBackupSpace as exc:
+                # SKIPPED, not crashed: the snapshot is refused precisely so the
+                # volume holding the live DB keeps enough room to write. Surfaced
+                # as a job error so it shows up in the jobs UI — a silent skip
+                # here is how you discover a month later that you have no backups.
+                log.error("Scheduled DB backup skipped — %s", exc)
+                return "error", str(exc)
+            log.info("Scheduled DB backup written: %s", target)
+            return "ok", None
+
         # Capital-slot de-duplication — archive redundant incumbents so each
         # symbol/timeframe capital slot holds only the single best-Sharpe
         # strategy. Strategies promoted before the slot/duplicate gate existed can
@@ -3198,6 +3227,21 @@ def seed_forven_jobs():
         command="db-maintenance",
         timezone_str="America/Halifax",
         payload={"kind": "db_maintenance"},
+    )
+
+    # 4c4b. Daily DB Backup — HARDEN-DATA-OPS: there was NO periodic snapshot of
+    # the SQLite file holding every trade, position, verdict and equity record;
+    # the only copies were ad-hoc ones taken by destructive operator scripts.
+    # Runs 20 minutes before the retention prune so the day's snapshot predates
+    # any deletion. Uses the online backup API (no exclusive lock).
+    add_job(
+        job_id="forven-db-backup",
+        name="Daily Database Backup",
+        schedule_type="cron",
+        schedule_expr="40 4 * * *",  # daily 04:40, ahead of db-maintenance at 05:00
+        command="db-backup",
+        timezone_str="America/Halifax",
+        payload={"kind": "db_backup"},
     )
 
     # 4c5. Capital-Slot De-duplication — every 6h, drain multi-incumbent capital

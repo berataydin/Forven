@@ -153,7 +153,16 @@ def _apply_rebuild(fs_symbol: str, tf: str, new_frame: pd.DataFrame) -> dict:
 
             pq.write_table(pa.Table.from_pandas(old, preserve_index=False), backup, compression="zstd")
         # save_parquet clears the tail sidecar and stamps source/market.
-        save_parquet(new_frame, fs_symbol, tf, source="binanceusdm")
+        #
+        # allow_shrink is REQUIRED here and only here: a perp rebuild starts at
+        # the venue's listing (BTC: 2019-09), so replacing a series that carries
+        # pre-2019 spot history deliberately shortens it — see the module
+        # docstring, "that is the point". save_parquet's shrink backstop assumes
+        # a replacing write that lost history did so by accident (an unreadable
+        # cold parquet read as "absent"); this is the one writer in the tree for
+        # which that is untrue, and it takes the *.spotmix.bak copy above first,
+        # so the old series is recoverable.
+        save_parquet(new_frame, fs_symbol, tf, source="binanceusdm", allow_shrink=True)
         stray_tail = tail_path(fs_symbol, tf)
         if stray_tail.exists():
             stray_tail.unlink()

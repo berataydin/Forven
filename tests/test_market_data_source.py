@@ -130,12 +130,26 @@ class _FakeFuturesExchange:
 
 def test_binance_funding_series_is_expressed_per_hour(monkeypatch):
     md._FUNDING_SERIES_CACHE.clear()
-    # Binance reports an 8h rate; the series must divide by 8 (per-hour) so it
-    # accrues via _apply_funding_to_trades exactly like the hourly HL series.
-    funding = [{"timestamp": 1000, "fundingRate": 0.0008}, {"timestamp": 2000, "fundingRate": 0.0016}]
+    # Binance reports a PER-SETTLEMENT rate; the series must divide by the
+    # settlement interval (per-hour) so it accrues via _apply_funding_to_trades
+    # exactly like the hourly HL series.
+    # HARDEN-DATA-OPS: the divisor is measured from the prints' own spacing now
+    # (a hardcoded /8 mis-charged every 4h-settling perp by 2x), so the fixture
+    # has to be stamped on a real 8h grid rather than 1s apart.
+    h8 = 8 * 3_600_000
+    base = 1_600_000_000_000
+    funding = [
+        {"timestamp": base, "fundingRate": 0.0008},
+        {"timestamp": base + h8, "fundingRate": 0.0016},
+        {"timestamp": base + 2 * h8, "fundingRate": 0.0024},
+    ]
     monkeypatch.setattr(md, "_binance_futures_exchange", lambda: _FakeFuturesExchange(funding=funding))
-    series = md.fetch_binance_funding_series("BTC", start_ms=1000, end_ms=10000)
-    assert series == [(1000, 0.0008 / 8), (2000, 0.0016 / 8)]
+    series = md.fetch_binance_funding_series("BTC", start_ms=base, end_ms=base + 10 * h8)
+    assert series == [
+        (base, 0.0008 / 8),
+        (base + h8, 0.0016 / 8),
+        (base + 2 * h8, 0.0024 / 8),  # last print falls back to the series median (8h)
+    ]
 
 
 def test_binance_funding_series_caches(monkeypatch):

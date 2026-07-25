@@ -28,6 +28,15 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+# One definition of "how long is a funding print good for", shared with
+# market_data (HARDEN-DATA-OPS: the backtest/kernel/paper path carried its own
+# hardcoded /8 while this module measured the cadence — the two engines
+# disagreed on funding for every non-8h perp).
+from forven.market_data import (
+    DEFAULT_FUNDING_INTERVAL_HOURS,
+    funding_interval_hours_per_print,
+)
+
 log = logging.getLogger(__name__)
 
 DEFAULT_FEE_BPS = 4.5  # per side, policy.py default
@@ -78,9 +87,6 @@ def deep_universe_symbols(min_bars: int = 17520, timeframe: str = "1h") -> list[
     return out
 
 
-DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
-
-
 def _funding_interval_hours(symbol: str) -> float:
     """Observed settlement interval of a symbol's stored funding history.
 
@@ -122,7 +128,9 @@ def _per_hour_funding_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series 
     each rate is divided by ITS OWN interval (gap to the following print,
     clamped to [1h, 24h]; the last print uses the file median). This stays
     correct when a file carries mixed cadences — the failure mode a single
-    whole-file divisor cannot survive.
+    whole-file divisor cannot survive. The interval rule itself lives in
+    ``market_data.funding_interval_hours_per_print`` — one implementation, so
+    the panel and the backtest/kernel/paper enrichment can never disagree.
     """
     try:
         from forven.data import symbol_to_fs
@@ -143,11 +151,12 @@ def _per_hour_funding_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series 
         if frame.empty:
             return None
         frame = frame.sort_values("ts").drop_duplicates("ts", keep="last")
-        hours = (frame["ts"].shift(-1) - frame["ts"]).dt.total_seconds() / 3600.0
-        median = float(hours.median()) if hours.notna().any() else DEFAULT_FUNDING_INTERVAL_HOURS
-        if not (1.0 <= median <= 24.0):
-            median = DEFAULT_FUNDING_INTERVAL_HOURS
-        hours = hours.fillna(median).clip(1.0, 24.0)
+        stamps_ms = pd.DatetimeIndex(frame["ts"]).as_unit("ns").astype("int64") // 1_000_000
+        hours = pd.Series(
+            funding_interval_hours_per_print(stamps_ms.tolist()),
+            index=frame.index,
+            dtype="float64",
+        )
         # Keep the tz-aware index (``.values`` would strip UTC and make the
         # reindex against the tz-aware panel index raise).
         per_hour = pd.Series(
