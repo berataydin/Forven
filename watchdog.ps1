@@ -24,7 +24,104 @@ function Write-Log {
     try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
+# OPS-3/OPS-10: `Start-Process -RedirectStandardOutput/-RedirectStandardError`
+# TRUNCATES its target the instant the new process opens it, so relaunching a
+# crashed service destroyed the only record of WHY it died - the 2026-07-07
+# backend-crash triage ended in "environmental, logs truncate on restart"
+# precisely because of this. Rename the file aside BEFORE relaunching, then
+# prune: that accidental truncation was also the only thing bounding these
+# logs, so rotating without retention would trade one bug for a disk leak.
+$LogRetainCount = 10
+$WatchdogLogMaxBytes = 5MB
+
+function Move-LogAside {
+    param([string]$Path, [int]$Keep = 10)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try {
+        if (Test-Path $Path) {
+            $item = Get-Item -Path $Path -ErrorAction Stop
+            if ($item.Length -gt 0) {
+                $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+                $rotated = "$Path.$stamp"
+                # Two rotations inside the same second (a restart storm) must not
+                # collide - the second one would silently lose its evidence.
+                if (Test-Path $rotated) { $rotated = "$Path.$stamp-$PID" }
+                Move-Item -Path $Path -Destination $rotated -Force -ErrorAction Stop
+            } else {
+                Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+
+    try {
+        $dir = Split-Path -Parent $Path
+        $leaf = Split-Path -Leaf $Path
+        # -like (not -Filter): the Windows filter engine's legacy 8.3 matching
+        # makes "name.log.*" also match "name.log", which would prune the LIVE log.
+        $stale = @(Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "$leaf.*" -and $_.Name -ne $leaf } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip ([Math]::Max(0, $Keep)))
+        foreach ($old in $stale) {
+            Remove-Item -Path $old.FullName -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+# OPS-10: the watchdog runs every 2 minutes forever, so any line it logs on
+# EVERY cycle becomes the whole file. Throttle those to once per interval,
+# persisting the stamp on disk because each cycle is a separate process.
+function Write-LogThrottled {
+    param([string]$Message, [string]$Key, [int]$IntervalSeconds = 3600)
+
+    $stampPath = Join-Path (Join-Path $RepoRoot ".tmp") ("watchdog.notice." + $Key)
+    $now = (Get-Date).ToUniversalTime()
+    $last = $null
+    if (Test-Path $stampPath) {
+        try {
+            $raw = (Get-Content -Path $stampPath -Raw -ErrorAction Stop).Trim()
+            $last = [DateTime]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        } catch {}
+    }
+    if ($null -ne $last -and ($now - $last).TotalSeconds -lt $IntervalSeconds) { return }
+    try { Set-Content -Path $stampPath -Value $now.ToString("o") -ErrorAction Stop } catch {}
+    Write-Log $Message
+}
+
+# A condition the watchdog deliberately REFUSES to auto-remediate has to reach a
+# human, or "we chose not to restart" is indistinguishable from "nothing was
+# wrong". Mirrors start_all.ps1::Send-SupervisorNotification. Best-effort: a
+# broken notification pipeline must never take the watchdog cycle down with it.
+function Send-WatchdogNotification {
+    param([string]$Title, [string]$Summary, [string]$Severity = "critical", [string]$DedupeKey)
+
+    $pythonVar = Get-Variable -Name "python" -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $pythonVar -or [string]::IsNullOrWhiteSpace([string]$pythonVar.Value)) { return }
+    $pythonExe = [string]$pythonVar.Value
+
+    try {
+        $payload = @{
+            title = $Title; summary = $Summary; severity = $Severity; dedupe_key = $DedupeKey
+        } | ConvertTo-Json -Compress
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
+        # base64 argv, not inline interpolation: reason strings reach this
+        # function unescaped and would otherwise break the -c literal.
+        $code = "import base64, json, sys; from forven.notifications import emit_notification; p = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8')); emit_notification('system_degraded', severity=p['severity'], source='watchdog', title=p['title'], summary=p['summary'], dedupe_key=(p.get('dedupe_key') or None))"
+        & $pythonExe -c $code $encoded *> $null
+    } catch {
+        Write-Log ("WARN: Could not emit watchdog notification: " + $_.Exception.Message)
+    }
+}
+
 if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+
+# OPS-10: watchdog.log itself has no natural bound - cap it the same way.
+try {
+    if ((Test-Path $LogFile) -and ((Get-Item -Path $LogFile -ErrorAction Stop).Length -gt $WatchdogLogMaxBytes)) {
+        Move-LogAside -Path $LogFile -Keep 5
+    }
+} catch {}
 
 $BackendPort = 8003
 if (-not [string]::IsNullOrWhiteSpace($env:FORVEN_PORT)) { $BackendPort = [int]$env:FORVEN_PORT }
@@ -235,11 +332,132 @@ function Release-WatchdogOwnerLock {
     $script:WatchdogOwnerAcquiredAt = $null
 }
 
-function Get-BotHealthSnapshot {
+function ConvertTo-NullableInt {
+    param([object]$Value)
+
+    # OPS-2: `ConvertFrom-Json` types JSON integers as Int32 on Windows
+    # PowerShell 5.1 but Int64 on pwsh 7, so the original `-is [int]` guards on
+    # this snapshot evaluated to $false under pwsh and EVERY scheduler rule was
+    # dead code there - the same script silently supervised differently
+    # depending on which host the scheduled task happened to launch. Coerce
+    # instead of type-testing so both hosts behave identically.
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value)) { return $null }
+    try { return [int64]$Value } catch { return $null }
+}
+
+function Get-SnapshotValue {
+    param([object]$Source, [string]$Name)
+
+    # `Set-StrictMode -Version Latest` (watchdog.ps1:9) turns a MISSING property
+    # into a terminating error, and this snapshot is produced by a separate
+    # short-lived interpreter that can legitimately hand back a partial payload.
+    # Missing must read as unknown ($null), not as a dead watchdog cycle.
+    if ($null -eq $Source) { return $null }
+    try {
+        $prop = $Source.PSObject.Properties[$Name]
+        if ($null -eq $prop) { return $null }
+        return $prop.Value
+    } catch { return $null }
+}
+
+# The stall gate must clear the scheduler's OWN tolerance before it means
+# anything: scheduler.py's _SCHEDULER_TICK_WATCHDOG_SECONDS is 900s, and a single
+# legitimate heavy tick (db_maintenance alone budgets 600s) can hold the
+# heartbeat that long. The previous 300s gate turned that into "stalled":
+# .tmp/logs/watchdog.log 2026-07-12 has NINE self-resolving 2-3-cycle bursts in
+# one day (07:41, 07:57, 12:19, 14:33, 15:43, 16:53, 18:01, 19:27, 20:13), every
+# one bracketed by "All services healthy." with no probe failure. 1800s is 2x
+# the scheduler's own watchdog, and it is only ONE THIRD of the gate - see
+# Resolve-SchedulerStallAction for the other two conditions.
+$SchedulerStallThresholdSeconds = 1800
+# Consecutive watchdog cycles the stall must survive. At a 120s cycle that is
+# ~10 minutes of re-observation on top of the staleness threshold; none of the
+# 2026-07-12 bursts (2-3 cycles, and none of them stale for 1800s) reaches it.
+$SchedulerStallCycleLimit = 5
+
+function Resolve-SchedulerStallReason {
+    param([object]$Health, [int]$ThresholdSeconds = 1800)
+
+    if ($null -eq $Health) { return $null }
+
+    # scheduler_heartbeat_age_seconds, NOT last_success_age_seconds: the snapshot
+    # folds last_tick_started / last_progress_at / MAX(running_since) in the way
+    # forven/health_monitor.py::check_scheduler does, because every one of those
+    # keys is written with kv_set_best_effort (0.25s timeout) and is SILENTLY
+    # DROPPED under SQLite lock contention. Acting on the raw last_successful_tick
+    # key is acting on a known false positive.
+    $heartbeatAge = ConvertTo-NullableInt (Get-SnapshotValue $Health "scheduler_heartbeat_age_seconds")
+    $lastErrorAge = ConvertTo-NullableInt (Get-SnapshotValue $Health "last_error_age_seconds")
+    $stuckJobs = ConvertTo-NullableInt (Get-SnapshotValue $Health "stuck_job_count")
+    $hardTimeoutJobs = ConvertTo-NullableInt (Get-SnapshotValue $Health "hard_timeout_job_count")
+    $lastError = [string](Get-SnapshotValue $Health "last_error")
+
+    if ($null -ne $heartbeatAge -and $heartbeatAge -gt $ThresholdSeconds) {
+        return "scheduler heartbeat stale"
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($lastError) -and
+        $lastError -like "*Scheduler tick exceeded 25s hard timeout*" -and
+        $null -ne $lastErrorAge -and
+        $lastErrorAge -lt 900
+    ) {
+        return "scheduler stuck in 25s timeout loop"
+    }
+    if (
+        $null -ne $stuckJobs -and
+        $null -ne $hardTimeoutJobs -and
+        $stuckJobs -ge 3 -and
+        $hardTimeoutJobs -ge 3
+    ) {
+        return "scheduler jobs are stuck in hard-timeout state"
+    }
+    return $null
+}
+
+function Resolve-SchedulerStallAction {
+    param(
+        [string]$RuntimeOwner,
+        [string]$StallReason,
+        [int]$StallCycles,
+        [int]$StallLimit,
+        [bool]$BackendHealthy
+    )
+
+    # Attributing a scheduler stall to the backend (OPS-2) does NOT mean
+    # auto-killing it. This is the process that owns the live trading loops;
+    # bouncing it aborts in-flight jobs and open-order bookkeeping - the sibling
+    # supervisor at start_all.ps1 makes exactly this call for exactly this
+    # reason ("A live+listening backend that fails a few probes is almost always
+    # mid-job - restarting it kills the job, so wait it out", 120 probes / ~20
+    # min). So "restart-backend" needs ALL of:
+    #   1. runtime_owner = api                    (the backend owns the state)
+    #   2. staleness past $SchedulerStallThresholdSeconds (2x the scheduler's own watchdog)
+    #   3. >= $StallLimit consecutive cycles      (~10 min of re-observation)
+    #   4. the backend is NOT serving /api/health (it is genuinely sick)
+    # A backend that still answers /api/health is NEVER killed for scheduler
+    # staleness: the scheduler has its own in-process circuit breaker for a real
+    # wedge, and a false positive here costs live money. That case returns
+    # "notify" - escalate to a human, do not reach for Stop-BackendProcesses.
+    if ([string]::IsNullOrWhiteSpace($StallReason)) { return "none" }
+    if ($RuntimeOwner -ne "api") { return "none" }
+    if ($StallCycles -lt $StallLimit) { return "observe" }
+    if ($BackendHealthy) { return "notify" }
+    return "restart-backend"
+}
+
+function Get-RuntimeHealthSnapshot {
     param([string]$PythonPath)
 
+    # OPS-2: this snapshot is scheduler state, and the scheduler is owned by the
+    # API (backend) process unless FORVEN_BOT_OWNS_RUNTIME is set - see
+    # forven/bot.py::_bot_owns_runtime_loops and control_plane/status.py, which
+    # both report runtime_owner the same way. The snapshot therefore carries the
+    # owner so the caller can remediate the process that actually owns the state
+    # instead of bouncing the Discord bot forever.
     $script = @'
 import json
+import os
 from datetime import datetime, timezone
 
 from forven.db import get_db, kv_get
@@ -258,8 +476,46 @@ def parse_ts(value):
     return dt
 
 
+def newest(*values):
+    best = None
+    for value in values:
+        if value is not None and (best is None or value > best):
+            best = value
+    return best
+
+
 now = datetime.now(timezone.utc)
+bot_owns_runtime = os.environ.get('FORVEN_BOT_OWNS_RUNTIME', '').strip().lower() in {
+    '1', 'true', 'yes', 'on',
+}
+
+bot_worker_fresh = None
+bot_worker_age = None
+bot_worker_stale_seconds = None
+if bot_owns_runtime:
+    try:
+        from forven.runtime_worker import get_bot_task_worker_status
+
+        bot_worker = get_bot_task_worker_status()
+        raw_stale = bot_worker.get('stale_seconds')
+        bot_worker_stale_seconds = None if raw_stale is None else max(1, int(float(raw_stale)))
+        raw_age = bot_worker.get('age_seconds')
+        # A MISSING heartbeat is UNKNOWN, not unhealthy. runtime_worker.py seeds
+        # the status dict with fresh=False and returns it UNCHANGED when
+        # bot:task_worker:last_seen is absent or unparseable, so reporting
+        # `fresh` verbatim would mark a bot that has simply never written a
+        # heartbeat yet (e.g. one this very rule just relaunched) as stale.
+        if raw_age is None:
+            bot_worker_fresh = None
+        else:
+            bot_worker_age = max(0, int(float(raw_age)))
+            bot_worker_fresh = bool(bot_worker.get('fresh'))
+    except Exception:
+        bot_worker_fresh = None
+
 last_success = parse_ts(kv_get('scheduler:last_successful_tick'))
+last_tick_started = parse_ts(kv_get('scheduler:last_tick_started'))
+last_progress = parse_ts(kv_get('scheduler:last_progress_at'))
 last_error = str(kv_get('scheduler:last_error') or '')
 last_error_at = parse_ts(kv_get('scheduler:last_error_at'))
 
@@ -271,10 +527,41 @@ with get_db() as conn:
         "SELECT COUNT(*) FROM scheduler_jobs "
         "WHERE enabled = 1 AND last_status = 'error' AND COALESCE(last_error, '') LIKE 'Hard timeout exceeded (%'"
     ).fetchone()[0])
+    running_since_max = parse_ts(conn.execute(
+        "SELECT MAX(running_since) FROM scheduler_jobs "
+        "WHERE running_since IS NOT NULL AND TRIM(running_since) != ''"
+    ).fetchone()[0])
+
+# Scheduler freshness = the MAX of every heartbeat the loop writes, exactly as
+# forven/health_monitor.py::check_scheduler computes it (health_monitor.py:343-370
+# plus the running_since fold at :385-386). Reading
+# scheduler:last_successful_tick ALONE is a known false-positive generator: it is
+# only written after a whole tick returns (bounded at 900s), and every one of
+# these keys goes through kv_set_best_effort, which has a 0.25s timeout and
+# SILENTLY DROPS the write under SQLite lock contention. health_monitor's own
+# comment: "would falsely flip the scheduler RED while the loop is fine".
+#
+# health_monitor additionally prefers scheduler.get_last_tick_at(), an
+# in-process value that can never be dropped — unavailable here, because this
+# snapshot runs in a SEPARATE short-lived interpreter. That missing compensation
+# is why the PowerShell gate that consumes this uses a staleness threshold far
+# above the scheduler's own 900s tick watchdog, and never acts on one reading.
+scheduler_heartbeat = newest(last_success, last_tick_started, last_progress, running_since_max)
 
 snapshot = {
+    "runtime_owner": "bot" if bot_owns_runtime else "api",
+    "bot_task_worker_fresh": bot_worker_fresh,
+    "bot_task_worker_age_seconds": bot_worker_age,
+    "bot_task_worker_stale_seconds": bot_worker_stale_seconds,
+    "scheduler_heartbeat": scheduler_heartbeat.isoformat() if scheduler_heartbeat else None,
+    "scheduler_heartbeat_age_seconds": (
+        None if scheduler_heartbeat is None
+        else max(0, int((now - scheduler_heartbeat).total_seconds()))
+    ),
     "last_successful_tick": last_success.isoformat() if last_success else None,
     "last_success_age_seconds": None if last_success is None else max(0, int((now - last_success).total_seconds())),
+    "last_tick_started": last_tick_started.isoformat() if last_tick_started else None,
+    "last_progress_at": last_progress.isoformat() if last_progress else None,
     "last_error": last_error,
     "last_error_at": last_error_at.isoformat() if last_error_at else None,
     "last_error_age_seconds": None if last_error_at is None else max(0, int((now - last_error_at).total_seconds())),
@@ -321,12 +608,19 @@ function Stop-BotProcesses {
     param([int[]]$ProcessIds)
 
     $stoppedAll = $true
-    foreach ($pid in @($ProcessIds | Where-Object { $_ -and $_ -gt 0 } | Select-Object -Unique)) {
+    # OPS-1: the loop variable MUST NOT be $pid. $PID is a PowerShell *Constant*
+    # automatic variable, so `foreach ($pid in ...)` throws a terminating error -
+    # and because this function sits at the top of the bot-restart path, the
+    # whole watchdog run died here. .tmp/logs/watchdog.log 2026-07-20 15:11-15:53
+    # shows 22 consecutive cycles that logged "Bot unhealthy - restarting" and
+    # nothing else: 42 minutes with no daemon/lab-worker/frontend/pipeline
+    # supervision, and the bot was never actually restarted either.
+    foreach ($procId in @($ProcessIds | Where-Object { $_ -and $_ -gt 0 } | Select-Object -Unique)) {
         try {
-            Stop-Process -Id $pid -Force -ErrorAction Stop
-            Write-Log ("Stopped bot PID " + $pid)
+            Stop-Process -Id $procId -Force -ErrorAction Stop
+            Write-Log ("Stopped bot PID " + $procId)
         } catch {
-            Write-Log ("WARN: Could not stop bot PID " + $pid + ": " + $_.Exception.Message)
+            Write-Log ("WARN: Could not stop bot PID " + $procId + ": " + $_.Exception.Message)
             $stoppedAll = $false
         }
     }
@@ -351,6 +645,15 @@ if ([string]::IsNullOrWhiteSpace($env:FORVEN_HOME)) {
 $logRoot = Join-Path (Join-Path $RepoRoot ".tmp") "logs"
 $restarted = @()
 $watchdogOwnerLockHeld = $false
+$script:WatchdogCycleFailed = $false
+
+function Write-WatchdogSummary {
+    if (@($script:restarted).Count -eq 0) {
+        Write-Log "All services healthy."
+    } else {
+        Write-Log ("Restarted: " + ($script:restarted -join ", "))
+    }
+}
 
 try {
     $watchdogClaim = Acquire-WatchdogOwnerLock -OwnerName "watchdog.ps1"
@@ -358,12 +661,15 @@ try {
         $watchdogStatus = if ($null -ne $watchdogClaim) { $watchdogClaim.status } else { $null }
         $activeOwnerName = if ($null -ne $watchdogStatus -and $null -ne $watchdogStatus.owner_name) { [string]$watchdogStatus.owner_name } else { "watchdog" }
         $activeOwnerPid = if ($null -ne $watchdogStatus -and $null -ne $watchdogStatus.active_pid) { [int]$watchdogStatus.active_pid } else { 0 }
+        # OPS-10: start_all normally holds the owner lock for days, so this branch
+        # fires on EVERY 2-minute cycle and was the single largest contributor to
+        # watchdog.log. It is a normal steady state, not an event - log hourly.
         if ($null -ne $watchdogStatus -and [bool]$watchdogStatus.other_process_active) {
-            Write-Log ("Another watchdog owner is active (" + $activeOwnerName + " PID " + $activeOwnerPid + ") - exiting")
+            Write-LogThrottled -Key "owner_active" -Message ("Another watchdog owner is active (" + $activeOwnerName + " PID " + $activeOwnerPid + ") - exiting")
             exit 0
         }
         if ($null -ne $watchdogStatus -and [bool]$watchdogStatus.lock_held) {
-            Write-Log "Another watchdog owner appears active, but owner metadata is unavailable - exiting"
+            Write-LogThrottled -Key "owner_unknown" -Message "Another watchdog owner appears active, but owner metadata is unavailable - exiting"
             exit 0
         }
         Write-Log "ERROR: Could not acquire watchdog owner lock."
@@ -384,6 +690,38 @@ try {
         }
         $backendRestartForced = $true
     }
+
+    # --- Runtime health snapshot (scheduler state + who owns it) ---
+    # OPS-2: taken BEFORE the backend decision because these rules remediate the
+    # scheduler's OWNER, which is the backend by default.
+    $runtimeHealth = Get-RuntimeHealthSnapshot -PythonPath $python
+    $runtimeOwnerRaw = [string](Get-SnapshotValue $runtimeHealth "runtime_owner")
+    $runtimeOwner = if (-not [string]::IsNullOrWhiteSpace($runtimeOwnerRaw)) { $runtimeOwnerRaw } else { "api" }
+
+    # The three scheduler conditions, evaluated once and attributed to the owner
+    # below. Before OPS-2 these all bounced the Discord bot: a stalled BACKEND
+    # scheduler was detected correctly and "fixed" by restarting a process that
+    # does not run the scheduler, forever.
+    $schedulerStallReason = Resolve-SchedulerStallReason -Health $runtimeHealth -ThresholdSeconds $SchedulerStallThresholdSeconds
+
+    # Persisted consecutive-cycle counter, shared by the backend rule below and
+    # the bot rule further down. Each watchdog run is a separate scheduled-task
+    # process, so tolerance has to live on disk.
+    $schedulerStallFile = Join-Path (Join-Path $RepoRoot ".tmp") "watchdog.scheduler_stall_cycles"
+    $schedulerStallLimit = $SchedulerStallCycleLimit
+    $schedulerStallCycles = 0
+    if ($null -ne $schedulerStallReason) {
+        if (Test-Path $schedulerStallFile) {
+            try { $schedulerStallCycles = [int]((Get-Content $schedulerStallFile -ErrorAction Stop) -join "").Trim() } catch {}
+        }
+        $schedulerStallCycles += 1
+        # Persisted every cycle INCLUDING past the limit, so the "-eq limit"
+        # transition below notifies exactly once per stall episode.
+        try { Set-Content -Path $schedulerStallFile -Value $schedulerStallCycles -ErrorAction Stop } catch {}
+    } else {
+        Remove-Item -Path $schedulerStallFile -Force -ErrorAction SilentlyContinue
+    }
+    $schedulerStallConfirmed = ($null -ne $schedulerStallReason -and $schedulerStallCycles -ge $schedulerStallLimit)
 
     # --- Check Backend ---
     [array]$backendListeners = @(Get-ListeningPids -Port $BackendPort)
@@ -415,12 +753,40 @@ try {
             }
         }
     }
+    # OPS-2: when the API owns the runtime loops (the default), a stalled
+    # scheduler is a BACKEND fault - the pre-OPS-2 code detected it correctly and
+    # then bounced the Discord bot, which does not run the scheduler, forever.
+    # Resolve-SchedulerStallAction holds the four conditions and the reasoning.
+    $backendSchedulerStall = $null
+    $schedulerStallAction = Resolve-SchedulerStallAction `
+        -RuntimeOwner $runtimeOwner -StallReason ([string]$schedulerStallReason) `
+        -StallCycles $schedulerStallCycles -StallLimit $schedulerStallLimit `
+        -BackendHealthy ([bool]$backendHealthy)
+    if ($schedulerStallAction -eq "observe") {
+        Write-Log ("Backend scheduler stalled (" + $schedulerStallReason + ", " + $schedulerStallCycles + "/" + $schedulerStallLimit + " cycles) - not restarting yet.")
+    } elseif ($schedulerStallAction -eq "notify") {
+        if ($schedulerStallCycles -eq $schedulerStallLimit) {
+            Send-WatchdogNotification `
+                -Title "Scheduler stalled on a HEALTHY backend" `
+                -DedupeKey "watchdog:scheduler_stall:backend" `
+                -Summary ("The backend scheduler has been stalled (" + $schedulerStallReason + ") for " + $schedulerStallCycles + " consecutive watchdog cycles, but the backend is still serving /api/health. The watchdog will NOT restart it automatically - a restart aborts in-flight jobs on the live trading process. Investigate the scheduler loop.")
+        }
+        Write-LogThrottled -Key "scheduler_stall_healthy" -IntervalSeconds 3600 `
+            -Message ("Backend scheduler stalled (" + $schedulerStallReason + ", " + $schedulerStallCycles + " cycles) but /api/health is passing - NOT restarting; operator action required.")
+    } elseif ($schedulerStallAction -eq "restart-backend") {
+        $backendSchedulerStall = $schedulerStallReason
+        $backendNeedsRestart = $true
+    }
+
     if ($backendNeedsRestart) {
         Remove-Item -Path $probeFailFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $schedulerStallFile -Force -ErrorAction SilentlyContinue
         $msg = if ($backendRestartForced) {
             "Backend restart requested via sentinel - restarting"
         } elseif ($backendListeners.Count -eq 0) {
             "Backend DOWN (no listener, healthy=" + $backendHealthy + ") - restarting"
+        } elseif ($null -ne $backendSchedulerStall) {
+            "Backend unhealthy (" + $backendSchedulerStall + " for " + $schedulerStallCycles + " cycles AND /api/health failing; runtime_owner=api) - restarting"
         } else {
             "Backend hung (" + $probeFailures + " consecutive failed probes with a live listener) - restarting"
         }
@@ -428,6 +794,8 @@ try {
         Stop-BackendProcesses -ListenerPids $backendListeners
         $backendLog = Join-Path $logRoot "unified_backend.log"
         $backendErr = Join-Path $logRoot "unified_backend.err.log"
+        Move-LogAside -Path $backendLog -Keep $LogRetainCount
+        Move-LogAside -Path $backendErr -Keep $LogRetainCount
         $proc = Start-Process -FilePath $python `
             -ArgumentList @("-m","forven.api","--port",$BackendPort.ToString()) `
             -WorkingDirectory $RepoRoot -RedirectStandardOutput $backendLog -RedirectStandardError $backendErr `
@@ -457,33 +825,62 @@ if (-not $botAlive) {
         if ($botProcs) { $botAlive = $true }
     } catch {}
 }
-$botHealth = Get-BotHealthSnapshot -PythonPath $python
-if ($botAlive -and $null -ne $botHealth) {
-    if ($botHealth.last_success_age_seconds -is [int] -and $botHealth.last_success_age_seconds -gt 300) {
+# OPS-2: the bot rule may only key on BOT-owned state. With the default
+# runtime_owner=api the scheduler conditions belong to the backend (handled
+# above) and there is no bot-owned degradation signal here - liveness alone
+# governs. With FORVEN_BOT_OWNS_RUNTIME=1 the bot legitimately runs the
+# scheduler and its queue loops, so the same scheduler conditions plus the
+# bot task-worker heartbeat (bot:task_worker:last_seen) do target the bot.
+#
+# The task-worker signal needs its own debounce for two reasons the backend
+# signal does not have: BOT_TASK_WORKER_STALE_SECONDS is 120s and this watchdog
+# also cycles every 120s, so a bot this rule just relaunched has essentially no
+# grace before the next cycle reads the still-stale key and kills it again; and
+# a heartbeat that was NEVER written reads as age=null, which is UNKNOWN, not
+# stale. Require a measured age at least 3x past the stale window, then require
+# that to hold for 3 consecutive cycles.
+$botWorkerStallFile = Join-Path (Join-Path $RepoRoot ".tmp") "watchdog.bot_worker_stall_cycles"
+$botWorkerStallLimit = 3
+$botWorkerStallCycles = 0
+$botWorkerStale = $false
+if ($botAlive -and $runtimeOwner -eq "bot" -and $null -ne $runtimeHealth) {
+    $botWorkerAge = ConvertTo-NullableInt (Get-SnapshotValue $runtimeHealth "bot_task_worker_age_seconds")
+    $botWorkerStaleWindow = ConvertTo-NullableInt (Get-SnapshotValue $runtimeHealth "bot_task_worker_stale_seconds")
+    if ($null -eq $botWorkerStaleWindow -or $botWorkerStaleWindow -lt 1) { $botWorkerStaleWindow = 120 }
+    if ($null -ne $botWorkerAge -and $botWorkerAge -gt (3 * $botWorkerStaleWindow)) {
+        $botWorkerStale = $true
+    }
+}
+if ($botWorkerStale) {
+    if (Test-Path $botWorkerStallFile) {
+        try { $botWorkerStallCycles = [int]((Get-Content $botWorkerStallFile -ErrorAction Stop) -join "").Trim() } catch {}
+    }
+    $botWorkerStallCycles += 1
+    try { Set-Content -Path $botWorkerStallFile -Value $botWorkerStallCycles -ErrorAction Stop } catch {}
+} else {
+    Remove-Item -Path $botWorkerStallFile -Force -ErrorAction SilentlyContinue
+}
+
+if ($botAlive -and $runtimeOwner -eq "bot" -and $null -ne $runtimeHealth) {
+    if ($schedulerStallConfirmed) {
         $botHealthy = $false
-        $botHealthReason = "scheduler heartbeat stale"
-    } elseif (
-        -not [string]::IsNullOrWhiteSpace([string]$botHealth.last_error) -and
-        [string]$botHealth.last_error -like "*Scheduler tick exceeded 25s hard timeout*" -and
-        $botHealth.last_error_age_seconds -is [int] -and
-        $botHealth.last_error_age_seconds -lt 900
-    ) {
+        $botHealthReason = $schedulerStallReason
+    } elseif ($botWorkerStallCycles -ge $botWorkerStallLimit) {
         $botHealthy = $false
-        $botHealthReason = "scheduler stuck in 25s timeout loop"
-    } elseif (
-        $botHealth.stuck_job_count -is [int] -and
-        $botHealth.hard_timeout_job_count -is [int] -and
-        $botHealth.stuck_job_count -ge 3 -and
-        $botHealth.hard_timeout_job_count -ge 3
-    ) {
-        $botHealthy = $false
-        $botHealthReason = "scheduler jobs are stuck in hard-timeout state"
+        $botHealthReason = "bot task-worker heartbeat stale"
+    } elseif ($null -ne $schedulerStallReason -or $botWorkerStale) {
+        $observed = if ($null -ne $schedulerStallReason) { $schedulerStallReason } else { "bot task-worker heartbeat stale" }
+        Write-Log ("Bot degradation observed (" + $observed + ") - below the consecutive-cycle threshold, not restarting yet.")
     }
 }
 
 if ($botAlive -and -not $botHealthy) {
     Write-Log ("Bot unhealthy (" + $botHealthReason + ") - restarting")
     $stopped = Stop-BotProcesses -ProcessIds (Get-BotProcessIds -LockFilePath $botLockFile)
+    # Restarting resets both debounce counters: the replacement process must be
+    # given the full grace window before it can be judged again.
+    Remove-Item -Path $botWorkerStallFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $schedulerStallFile -Force -ErrorAction SilentlyContinue
     if (Test-Path $botLockFile) { Remove-Item $botLockFile -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
     $botAlive = $false
@@ -507,6 +904,8 @@ if (-not $botAlive) {
         if (Test-Path $botLockFile) { Remove-Item $botLockFile -Force -ErrorAction SilentlyContinue }
         $botLog = Join-Path $logRoot "forven_bot.log"
         $botErr = Join-Path $logRoot "forven_bot.err.log"
+        Move-LogAside -Path $botLog -Keep $LogRetainCount
+        Move-LogAside -Path $botErr -Keep $LogRetainCount
         $proc = Start-Process -FilePath $python -ArgumentList "-c `"from forven.bot import run_bot; run_bot()`"" `
             -WorkingDirectory $RepoRoot -RedirectStandardOutput $botLog -RedirectStandardError $botErr `
             -WindowStyle Hidden -PassThru
@@ -548,6 +947,8 @@ if (-not $daemonAlive) {
     if (Test-Path $daemonLockFile) { Remove-Item $daemonLockFile -Force -ErrorAction SilentlyContinue }
     $daemonLog = Join-Path $logRoot "forven_daemon.log"
     $daemonErr = Join-Path $logRoot "forven_daemon.err.log"
+    Move-LogAside -Path $daemonLog -Keep $LogRetainCount
+    Move-LogAside -Path $daemonErr -Keep $LogRetainCount
     $proc = Start-Process -FilePath $python -ArgumentList @("-m","forven","daemon","start") `
         -WorkingDirectory $RepoRoot -RedirectStandardOutput $daemonLog -RedirectStandardError $daemonErr `
         -WindowStyle Hidden -PassThru
@@ -570,6 +971,8 @@ if (-not $labWorkerAlive -and $regimeLabEnabled) {
     if (Test-Path $labPidFile) { Remove-Item $labPidFile -Force -ErrorAction SilentlyContinue }
     $labWorkerLog = Join-Path $logRoot "forven_lab_worker.log"
     $labWorkerErr = Join-Path $logRoot "forven_lab_worker.err.log"
+    Move-LogAside -Path $labWorkerLog -Keep $LogRetainCount
+    Move-LogAside -Path $labWorkerErr -Keep $LogRetainCount
     $proc = Start-Process -FilePath $python -ArgumentList @("-m","forven","lab","worker") `
         -WorkingDirectory $RepoRoot -RedirectStandardOutput $labWorkerLog -RedirectStandardError $labWorkerErr `
         -WindowStyle Hidden -PassThru
@@ -585,6 +988,8 @@ if ($frontendListeners.Count -eq 0) {
         $frontendLog = Join-Path $logRoot "unified_frontend.log"
         $frontendErr = Join-Path $logRoot "unified_frontend.err.log"
         $frontendDir = Join-Path $RepoRoot "frontend"
+        Move-LogAside -Path $frontendLog -Keep $LogRetainCount
+        Move-LogAside -Path $frontendErr -Keep $LogRetainCount
         $proc = Start-Process -FilePath $npmCmd.Source `
             -ArgumentList @("run","dev","--","--host","0.0.0.0","--port",$FrontendPort.ToString()) `
             -WorkingDirectory $frontendDir -RedirectStandardOutput $frontendLog -RedirectStandardError $frontendErr `
@@ -692,13 +1097,24 @@ print(json.dumps({'tick': tick or '', 'errors': int(errs or 0)}))
 }
 
 # --- Summary ---
-if ($restarted.Count -eq 0) {
-    Write-Log "All services healthy."
-} else {
-    Write-Log ("Restarted: " + ($restarted -join ", "))
-}
+Write-WatchdogSummary
+} catch {
+    # OPS-1: the outer try had NO catch, so ANY terminating error (the $pid
+    # constant-assignment bug being the one that actually bit us) killed the run
+    # silently after whatever it had already logged - the operator saw "Bot
+    # unhealthy - restarting" 22 times and no summary, with no clue the script
+    # had died. Log it loudly and still emit the summary so the failure is
+    # visible in watchdog.log and every remaining check is known to be skipped.
+    $failure = if ($null -ne $_.Exception) { $_.Exception.Message } else { [string]$_ }
+    $where = if ($null -ne $_.InvocationInfo) { " at " + $_.InvocationInfo.ScriptName + ":" + $_.InvocationInfo.ScriptLineNumber } else { "" }
+    Write-Log ("ERROR: watchdog cycle aborted$where - " + $failure)
+    Write-Log "ERROR: remaining service checks were SKIPPED this cycle."
+    Write-WatchdogSummary
+    $script:WatchdogCycleFailed = $true
 } finally {
     if ($watchdogOwnerLockHeld) {
         Release-WatchdogOwnerLock
     }
 }
+
+if ($script:WatchdogCycleFailed) { exit 1 }

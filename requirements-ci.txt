@@ -1,34 +1,46 @@
 # CI and local quality-gate dependencies.
+#
+# Upper bounds mirror pyproject.toml's: every dep whose behaviour reaches real
+# money (ccxt / hyperliquid-python-sdk / eth-account), the request surface
+# (fastapi / pydantic / uvicorn) or the data lake (duckdb / pyarrow) carries a
+# next-major ceiling. Without them CI was not reproducible — a new upstream
+# major could land between two runs of the SAME commit and change what the
+# gate actually tested. Ceilings are loose on purpose (next major only), so
+# routine patch/minor upgrades still flow.
 beautifulsoup4>=4.12
-ccxt>=4.5.0
+ccxt>=4.5.0,<5
 chromadb>=0.5
 click>=8.0
 croniter>=2.0
 cryptography>=41.0
 discord.py>=2.3
-duckdb>=1.1.0
-eth-account>=0.13.0
-fastapi>=0.111.0
+duckdb>=1.1.0,<2
+eth-account>=0.13.0,<1
+fastapi>=0.111.0,<1
 feedparser>=6.0
 filelock>=3.13
 httpx>=0.25
-hyperliquid-python-sdk>=0.22.0
+hyperliquid-python-sdk>=0.22.0,<1
 mcp>=1.0
-numpy>=1.26
-pandas>=2.2
+numpy>=1.26,<3
+pandas>=2.2,<4
 psutil>=5.9
-pyarrow>=16.0.0
+pyarrow>=16.0.0,<25
+pydantic>=2.7,<3
 PyJWT>=2.8
 pytest>=8.0
 pytest-asyncio>=1.3,<2
-python-multipart>=0.0.9
+# TEST-3: CI runs the FULL suite (~5.8k tests) with `-n auto`. Without xdist
+# that step is a ~90-minute serial run and the job times out.
+pytest-xdist>=3.5,<4
+python-multipart>=0.0.9,<1
 PyYAML>=6.0
 requests>=2.31
 rich>=13.0
 ruff>=0.4
 scikit-learn>=1.5
-scipy>=1.11
-slowapi>=0.1.9
+scipy>=1.11,<2
+slowapi>=0.1.9,<1
 trafilatura>=2.0
 # Pinned explicitly: dateparser (pulled in by trafilatura) needs tzlocal at
 # import time. The unpinned transitive resolution first DROPPED it, and the
@@ -36,7 +48,7 @@ trafilatura>=2.0
 # `pytest --collect-only`. Pin to the last known-good version (5.4, which the
 # last-green CI run used) so collection stays deterministic.
 tzlocal==5.4
-uvicorn>=0.30.0
+uvicorn>=0.30.0,<1
 websockets>=13.0,<17
 yfinance>=0.2
 yt-dlp>=2025.1.0

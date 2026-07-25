@@ -44,7 +44,10 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # TEST-3: the full suite (~5.8k tests) runs here now. Measured at 17m30s with
+    # `-n 6` on the maintainer's machine; a 4-vCPU hosted runner is slower, so the
+    # ceiling is generous. Raise it rather than re-shrinking the suite.
+    timeout-minutes: 50
 
     steps:
       - name: Check out repository
@@ -68,7 +71,55 @@ jobs:
       - name: Collect backend tests
         run: python -m pytest --collect-only -q
 
-      - name: Run backend release stability tests
+      # --------------------------------------------------------------------
+      # TEST-3: the themed steps below are FAST-FAIL ORDERING, not the gate.
+      # They used to BE the gate — a hand-maintained allowlist that covered 44
+      # of 547 test files (8%). Since the previous edit to this file, 21 new
+      # test files were added and none were wired in, including
+      # test_live_risk_clamp.py and test_propr_venue.py (28 tests guarding a
+      # real-money venue). The full suite at the bottom is now the gate; these
+      # run first only so a security or capital-integrity regression fails in
+      # ~30s instead of ~20 minutes. Adding a test file needs NO edit here.
+      # --------------------------------------------------------------------
+
+      # Security regression gate — locks in the 2026-06 security-hardening work so a
+      # regression fails the PR. Fast (~10s), no sandbox-worker subprocess / heavy data
+      # deps, so it is safe on the CI runner. Covers: the AST guard (every confirmed
+      # bypass family stays blocked; the R3-de-allowlisted forven.scanner/data/
+      # data_manager/sentiment stay rejected; the indicator facade stays allowed), the
+      # strategy-worker DB jail, the custom-module intake guard, secret redaction, the
+      # SIZE-1 stop-floor, and the KCOPY-3 impure-strategy fail-closed.
+      - name: Fast-fail — security regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_sandbox_ast_guard.py \
+            tests/test_ast_guard_bypasses.py \
+            tests/test_strategy_worker_db_jail.py \
+            tests/test_registry_custom_module_guard.py \
+            tests/test_redact.py \
+            tests/test_sizing.py \
+            tests/test_per_bar_kernel_adapter.py
+
+      # Real-money execution integrity: ambiguous/partial IOC responses must
+      # never release local exposure or remove the last protective order.
+      - name: Fast-fail — capital-integrity regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_execution_results.py \
+            tests/test_paper_control.py \
+            tests/test_open_trades_exchange_verification.py \
+            tests/test_live_entry_finalization.py \
+            tests/test_kill_switch_close_integrity.py \
+            tests/test_mtier_hardening.py \
+            tests/test_engine_audit_phase1.py
+
+      - name: Fast-fail — async runtime regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_daemon_price_freshness.py \
+            tests/test_loop_starvation_fixes.py
+
+      - name: Fast-fail — backend release stability tests
         run: |
           python -m pytest -q \
             tests/test_db_kv_bootstrap.py \
@@ -87,25 +138,6 @@ jobs:
             tests/test_pipeline_hardening.py::test_evaluate_promotion_accepts_persisted_validation_artifacts_for_paper \
             tests/test_pipeline_hardening.py::test_evaluate_promotion_blocks_failed_required_verdict_tests_for_paper
 
-      - name: Run async runtime regression tests
-        run: |
-          python -m pytest -q \
-            tests/test_daemon_price_freshness.py \
-            tests/test_loop_starvation_fixes.py
-
-      # Real-money execution integrity: ambiguous/partial IOC responses must
-      # never release local exposure or remove the last protective order.
-      - name: Run capital-integrity regression tests
-        run: |
-          python -m pytest -q \
-            tests/test_execution_results.py \
-            tests/test_paper_control.py \
-            tests/test_open_trades_exchange_verification.py \
-            tests/test_live_entry_finalization.py \
-            tests/test_kill_switch_close_integrity.py \
-            tests/test_mtier_hardening.py \
-            tests/test_engine_audit_phase1.py
-
       # Data-engine regression gate — locks in the 2026-07 data hardening + edge-data
       # expansion (tail-append storage, perp canonicalization, causality shifts,
       # quality gates, fingerprints, symbol registry, basis/IV streams, kernel
@@ -113,7 +145,7 @@ jobs:
       # stated prerequisite for flipping data_engine.enabled. Network-free: the
       # autobackfill/registry network paths are pytest-gated, everything runs on tmp
       # lakes (~90s).
-      - name: Run data-engine regression tests
+      - name: Fast-fail — data-engine regression tests
         run: |
           python -m pytest -q \
             tests/test_data_hardening.py \
@@ -132,23 +164,21 @@ jobs:
             tests/test_ohlcv_keepalive_gate.py \
             tests/test_data_root_unified.py
 
-      # Security regression gate — locks in the 2026-06 security-hardening work so a
-      # regression fails the PR. Fast (~10s), no sandbox-worker subprocess / heavy data
-      # deps, so it is safe on the CI runner. Covers: the AST guard (every confirmed
-      # bypass family stays blocked; the R3-de-allowlisted forven.scanner/data/
-      # data_manager/sentiment stay rejected; the indicator facade stays allowed), the
-      # strategy-worker DB jail, the custom-module intake guard, secret redaction, the
-      # SIZE-1 stop-floor, and the KCOPY-3 impure-strategy fail-closed.
-      - name: Run security regression tests
+      # TEST-3: THE GATE. Every test under tests/ runs, so a new test file is
+      # covered the moment it is committed.
+      - name: Run full backend test suite
         run: |
-          python -m pytest -q \
-            tests/test_sandbox_ast_guard.py \
-            tests/test_ast_guard_bypasses.py \
-            tests/test_strategy_worker_db_jail.py \
-            tests/test_registry_custom_module_guard.py \
-            tests/test_redact.py \
-            tests/test_sizing.py \
-            tests/test_per_bar_kernel_adapter.py
+          # QUARANTINE is the ONLY sanctioned way to exclude a test from CI.
+          # Add a fully-qualified `file::test` node id, on its own line, with a
+          # comment naming the tracking issue and the date it was quarantined —
+          # then remove it. An empty list is the correct steady state; anything
+          # in here is a known-broken gate, not a passing build.
+          QUARANTINE=()
+          DESELECT=()
+          for node in "${QUARANTINE[@]}"; do
+            DESELECT+=(--deselect "$node")
+          done
+          python -m pytest -q -n auto "${DESELECT[@]}"
 
   frontend:
     runs-on: ubuntu-latest
