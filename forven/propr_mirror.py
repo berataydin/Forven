@@ -29,8 +29,30 @@ Semantics:
   long the same coin share a merged position, and each mirrored close reduces
   it by that trade's own quantity.
 
+Halts (two independent layers, both OPEN-only — closes are never blocked):
+* The GLOBAL trading halt (`risk.is_trading_allowed`: kill-switch / daily-loss
+  halt / operator STOP). The operator's single "stop everything" control must
+  mean everything, venues included — same stance as
+  `basket_live.reconcile_basket_live`.
+* PROPR-3's account-level halt on the challenge account's own kill rules.
+
+`risk.close_all_positions` deliberately does NOT flatten Propr: it sweeps the
+Hyperliquid wallets that hold this system's real capital, and adding a second
+independent flatten path for a mirror would be a real order placed by the
+kill-switch on a venue it never sized. The mirror instead follows its SOURCES —
+when the kill-switch flattens a live trade, the source row leaves OPEN and the
+close pass reduces the Propr leg on the next tick (<= 60s). A roster of PAPER
+strategies is NOT swept by close_all_positions (live rows only), so those
+mirrored legs ride on their own venue stops under the PROPR-3 account halt.
+If that ever needs to change, it belongs in close_all_positions, not here.
+
 State: kv `forven:propr-mirror:state` {trade_id: {...}} — display + retry
-bookkeeping only; correctness never depends on it surviving.
+bookkeeping only. It is NOT a durable position ledger and correctness must not
+depend on it: mirrored opens are idempotent by intentId and closes are
+reduce-only, but a LOST state entry means nothing here will close that leg. The
+per-tick reconcile against `propr.raw_positions()` exists for exactly that gap
+— it reports venue positions with no open state entry (kv
+`forven:propr-mirror:unmanaged`) so an orphan is visible instead of silent.
 Roster: kv `forven:settings` key `propr_mirror_strategies` {sid: added_iso},
 toggle `propr_mirror_enabled`. Managed ONLY via /api/propr/mirror (the generic
 settings PUT preserves unknown keys; nothing here is in the settings manifest).
@@ -51,6 +73,7 @@ MIRROR_ENABLED_KEY = "propr_mirror_enabled"
 MIRROR_STRATEGIES_KEY = "propr_mirror_strategies"
 STATE_KEY = "forven:propr-mirror:state"
 HALT_STATE_KEY = "forven:propr-mirror:halt"
+UNMANAGED_STATE_KEY = "forven:propr-mirror:unmanaged"
 
 # Account-level halt (PROPR-3): stop OPENING mirrored positions well before the
 # venue's challenge rules fail the attempt. 0.8 = halt at 80% of the allowance
@@ -78,6 +101,12 @@ MAX_OPENS_PER_TICK = 3
 MAX_OPEN_ATTEMPTS = 3
 MAX_CLOSE_ATTEMPTS = 10
 _STATE_RETENTION_DAYS = 7
+
+# PROPR-CLOSE-1: how much of a reduce-only close may go unfilled and still count
+# as complete. The adapter quantizes the close size DOWN to the venue's step, so
+# a full close can legitimately report a hair less than the mirrored quantity;
+# anything beyond that rounding is a REAL residual position, not noise.
+_CLOSE_FILL_TOLERANCE_FRAC = 1e-6
 
 
 def _settings() -> dict:
@@ -137,6 +166,12 @@ def _save_state(state: dict) -> None:
 
 def get_halt_state() -> dict:
     raw = kv_get(HALT_STATE_KEY, {}) or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def get_unmanaged_state() -> dict:
+    """Last reconcile's venue positions that no open state entry accounts for."""
+    raw = kv_get(UNMANAGED_STATE_KEY, {}) or {}
     return raw if isinstance(raw, dict) else {}
 
 
@@ -228,15 +263,43 @@ def _challenge_rules(attempt: dict, equity: float, high_water_mark: float | None
 
 
 def _evaluate_halt(attempt: dict, equity: float, now: datetime) -> dict:
-    """Account-level halt check, persisted for the page. Day-start equity is
-    OUR first observation of the UTC day — a strictly tighter proxy than the
-    venue's day anchor is guaranteed to be, since we can only observe late."""
+    """Account-level halt check, persisted for the page.
+
+    Day-start equity anchors the daily-loss rule. PROPR-ANCHOR-1: this used to
+    claim OUR first observation of the UTC day was "a strictly tighter proxy
+    than the venue's day anchor" — it is the OPPOSITE. The venue measures the
+    day's loss from the balance at the day's start; anchoring on a later
+    observation, AFTER part of that loss has already landed, makes our measured
+    daily loss SMALLER than the venue's and fires the halt LATE. So:
+
+    * ``same_day`` — today's anchor is already recorded: use it (unchanged).
+    * ``carried`` — no anchor for today, but the previous tick's observed equity
+      is on record (written every tick): anchor on the HIGHER of that and
+      current equity, so an overnight/pre-first-tick loss still counts.
+    * ``first_observation`` — nothing on record at all (cold start / wiped
+      state). We genuinely cannot know the day's opening balance; anchor on
+      current equity and stamp ``anchor_source`` so the panel can say the daily
+      rule is only PARTIALLY enforced today. (Anchoring on the PHASE starting
+      balance was considered and rejected: once equity sits below the phase
+      start it would halt every remaining day of the challenge outright, which
+      the drawdown rule already covers more precisely.)
+
+    ``anchor_source`` is carried through the day so a day that began blind stays
+    flagged as such.
+    """
     prev = get_halt_state()
     day = now.strftime("%Y-%m-%d")
     if str(prev.get("day") or "") == day and _num(prev.get("day_start_equity")):
         day_start = float(prev["day_start_equity"])
+        anchor_source = str(prev.get("anchor_source") or "same_day")
     else:
-        day_start = equity
+        carried = _num(prev.get("equity"))
+        if carried:
+            day_start = max(float(equity), carried)
+            anchor_source = "carried"
+        else:
+            day_start = equity
+            anchor_source = "first_observation"
 
     account = attempt.get("account") if isinstance(attempt.get("account"), dict) else {}
     high_water_mark = _num(account.get("highWaterMark"))
@@ -261,6 +324,10 @@ def _evaluate_halt(attempt: dict, equity: float, now: datetime) -> dict:
     halt = {
         "day": day,
         "day_start_equity": day_start,
+        "anchor_source": anchor_source,
+        # The panel should say so when today's daily rule is only partially
+        # enforced (we never saw the day's opening balance).
+        "daily_rule_fully_enforced": anchor_source != "first_observation",
         "equity": equity,
         "daily_loss": daily_loss,
         "daily_loss_limit_usd": rules["daily_loss_limit_usd"],
@@ -517,8 +584,70 @@ def _mirror_open(
             risk_budget["remaining"] = max(0.0, risk_budget.get("remaining", 0.0) - risk_usd)
         log.info("Propr mirror OPEN %s %s %s (size %.6g) for trade %s",
                  asset, direction, entry["strategy"], size, trade_id)
+        # PROPR-LEG-1: the entry filled but the venue rejected a bracket leg. A
+        # rejected STOP left a leveraged challenge position running naked while
+        # the PROPR-3 daily budget kept counting its risk_usd as bounded — the
+        # one thing this mirror refuses to do at open time (see the "never mirror
+        # unprotected" skip above) happening after the fact. Re-arm standalone
+        # (mirrors scanner.py's HL-1 handling); if it still can't be armed, the
+        # position is closed rather than left running.
+        _failed_legs = result.get("protective_leg_failed") or []
+        if "stop" in _failed_legs:
+            _rearm_or_close_unprotected(propr, trade_id, entry, asset, direction, stop_price, now)
     else:
         _record_open_error(trade_id, entry, str((result or {}).get("error") or "order rejected"))
+
+
+def _rearm_or_close_unprotected(
+    propr, trade_id: str, entry: dict, asset: str, direction: str,
+    stop_price: float, now: datetime,
+) -> None:
+    """Arm a rejected stop leg standalone; flatten the mirror if it won't arm."""
+    quantity = _num(entry.get("quantity")) or 0.0
+    rearmed = None
+    try:
+        rearmed = propr.place_protective_stop(asset, direction, quantity, float(stop_price))
+    except Exception as exc:
+        log.error("Propr mirror: stop re-arm for trade %s raised: %s", trade_id, exc)
+        rearmed = {"error": str(exc)}
+    if isinstance(rearmed, dict) and not rearmed.get("error") and rearmed.get("stop_order_id"):
+        entry["stop_order_id"] = str(rearmed["stop_order_id"])
+        entry["protective_stop_rearmed"] = True
+        log.warning("Propr mirror: re-armed the rejected stop leg for trade %s", trade_id)
+        return
+
+    err = (rearmed or {}).get("error") if isinstance(rearmed, dict) else rearmed
+    entry["stop_unarmed"] = True
+    entry["reason"] = f"stop leg rejected and could not be re-armed: {err}"
+    log.critical(
+        "Propr mirror: %s %s for trade %s is UNPROTECTED (stop rejected, re-arm failed: %s) "
+        "— closing the mirrored position", asset, direction, trade_id, err,
+    )
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "propr_mirror_unprotected",
+            severity="critical",
+            source="propr_mirror",
+            title=f"Propr mirror position UNPROTECTED ({asset})",
+            summary=(
+                f"{entry.get('strategy')} {asset} {direction} (trade {trade_id}): the stop "
+                "leg was rejected and could not be re-armed — closing the mirrored position."
+            ),
+            body=str(err or ""),
+            dedupe_key=f"propr_mirror_unprotected:{trade_id}",
+        )
+    except Exception as exc:
+        log.debug("Could not emit propr mirror unprotected notification: %s", exc)
+    # Flatten: an unprotected leveraged position on a challenge account is a
+    # worse outcome than an unmirrored trade. _mirror_close sets the terminal
+    # status (closed / retryable error) itself.
+    try:
+        _mirror_close(propr, trade_id, entry, now)
+    except Exception as exc:
+        log.error("Propr mirror: emergency close of unprotected %s failed: %s", trade_id, exc)
+        entry["status"] = "error"
+        entry["reason"] = f"unprotected and emergency close raised: {exc}"
 
 
 def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
@@ -529,11 +658,39 @@ def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
         entry.update({"status": "closed", "reason": "nothing to close (zero mirrored quantity)"})
         return
     result = propr.close_position(asset, quantity, "sell" if direction == "long" else "buy")
-    if isinstance(result, dict) and not result.get("error"):
+    # PROPR-CLOSE-1: gate the "closed" transition AND the bracket-leg cancels on
+    # a fill that CONFIRMS THE WHOLE MIRRORED QUANTITY. Marking a close "closed"
+    # retires the position from this ledger AND cancels its stop/TP — leaving a
+    # REAL open position on the challenge account with no protection and nothing
+    # left watching it. forven/exchange/propr.py::close_position errors on a
+    # rejected/cancelled order or a NON-POSITIVE filled quantity, so its clean
+    # return only rules out a zero fill: a reduce-only market close that fills 0.4
+    # of 1.0 comes back clean and would retire a still-open 0.6 leg. Re-check the
+    # quantity here — one layer must not own the whole invariant.
+    #
+    # A SHORT fill keeps the entry OPEN at its residual size with the bracket legs
+    # INTACT (the residual stays protected) and retries next tick; closes are
+    # reduce-only, so a duplicate close is harmless by construction, whereas a
+    # false "closed" is not.
+    _errored = not isinstance(result, dict) or bool(result.get("error"))
+    _fill_reported = isinstance(result, dict) and "filled_size" in result
+    filled = _num(result.get("filled_size")) if _fill_reported else None
+    # The venue-quantized size the adapter actually asked for; anything it could
+    # not accept is dust below one size step, not a leg we can retry.
+    _requested = _num((result or {}).get("requested_size")) if isinstance(result, dict) else None
+    _fillable = _requested if (_requested is not None and _requested <= quantity) else quantity
+    _tolerance = max(_fillable * _CLOSE_FILL_TOLERANCE_FRAC, 1e-9)
+    # Only a CLEAN payload may shrink the mirrored quantity: on an errored one the
+    # reported fill is not trustworthy, and a reduce-only close asking for more
+    # than is left is harmless (the venue caps it) while asking for too little
+    # strands the remainder.
+    _short_fill = not _errored and filled is not None and (filled + _tolerance) < _fillable
+    if not _errored and not _short_fill and (filled is not None or not _fill_reported):
         entry.update({
             "status": "closed",
             "reason": None,
             "exit_price": result.get("exit_price"),
+            "closed_quantity": filled,
             "closed_at": now.isoformat(),
         })
         # The bracket legs are reduce-only so they can never re-open a
@@ -549,12 +706,113 @@ def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
     else:
         attempts = int(entry.get("close_attempts") or 0) + 1
         entry["close_attempts"] = attempts
-        entry["reason"] = str((result or {}).get("error") or "close rejected")
+        if _short_fill:
+            residual = round(max(quantity - float(filled or 0.0), 0.0), 10)
+            # Shrink to what is REALLY still on the venue so the next reduce-only
+            # close asks for the residual, and record the partial for the panel.
+            entry["quantity"] = residual
+            entry["status"] = "open"
+            entry["partial_close_filled"] = float(entry.get("partial_close_filled") or 0.0) + float(filled or 0.0)
+            entry["partial_close_at"] = now.isoformat()
+            if result.get("exit_price") is not None:
+                entry["exit_price"] = result.get("exit_price")
+            entry["reason"] = (
+                f"partial close ({float(filled or 0.0):.10g}/{_fillable:.10g}) — residual "
+                f"{residual:.10g} still open and still bracketed (retrying reduce-only)"
+            )
+            log.warning(
+                "Propr mirror PARTIAL close %s %s for trade %s: filled %s of %s, residual %s "
+                "kept open + protected", asset, direction, trade_id, filled, _fillable, residual,
+            )
+        elif isinstance(result, dict) and not result.get("error"):
+            entry["reason"] = (
+                "close order accepted but no fill confirmed — position assumed still "
+                "open (retrying reduce-only)"
+            )
+        else:
+            entry["reason"] = str((result or {}).get("error") or "close rejected")
         if attempts >= MAX_CLOSE_ATTEMPTS:
             entry["status"] = "close_failed"
             log.error("Propr mirror: close for trade %s FAILED after %d attempts: %s",
                       trade_id, attempts, entry["reason"])
             _notify_mirror_failure(trade_id, entry, "close")
+
+
+def _reconcile_unmanaged_positions(propr, state: dict, now: datetime, summary: dict) -> None:
+    """PROPR-LEDGER-1: report venue positions this mirror is not tracking.
+
+    KV state is the ONLY record of a mirrored position — a dropped write, a
+    wiped key or a crash between the fill and the save leaves a REAL leveraged
+    position on the challenge account that nothing here will ever close. Read
+    the venue every tick and flag any (asset, side) with no open state entry.
+
+    Deliberately REPORT-only: the challenge account is the operator's, and a
+    reduce-only close fired at an unrecognized position would be this module
+    placing a real order it never sized against a position it does not
+    understand (a hand-placed hedge, a leftover from a previous roster). The
+    orphan is surfaced in kv ``forven:propr-mirror:unmanaged`` and notified
+    once, so the operator can adopt or flatten it deliberately. A read failure
+    is never fatal — the mirror keeps working."""
+    try:
+        positions = propr.raw_positions() or []
+    except Exception as exc:
+        log.debug("Propr mirror: venue position read failed: %s", exc)
+        return
+
+    tracked: set[tuple[str, str]] = set()
+    for entry in state.values():
+        if entry.get("status") != "open":
+            continue
+        asset = propr.normalize_asset(str(entry.get("asset") or ""))
+        side = str(entry.get("direction") or "").strip().lower()
+        if asset and side:
+            tracked.add((asset, "long" if side == "long" else "short"))
+
+    unmanaged: dict = {}
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        asset = propr.normalize_asset(str(pos.get("asset") or pos.get("coin") or ""))
+        side = str(pos.get("positionSide") or pos.get("side") or "").strip().lower()
+        side = "long" if side not in ("long", "short") else side
+        if not asset or (asset, side) in tracked:
+            continue
+        unmanaged[f"{asset}:{side}"] = {
+            "asset": asset,
+            "direction": side,
+            "quantity": pos.get("quantity") or pos.get("size"),
+            "position_id": pos.get("positionId") or pos.get("id"),
+            "seen_at": now.isoformat(),
+        }
+
+    try:
+        kv_set(UNMANAGED_STATE_KEY, unmanaged)
+    except Exception as exc:
+        log.debug("Propr mirror: could not persist the unmanaged-position report: %s", exc)
+    if not unmanaged:
+        return
+    summary["unmanaged"] = sorted(unmanaged)
+    log.warning(
+        "Propr mirror: %d venue position(s) not tracked by mirror state (%s) — this "
+        "mirror will never close them; adopt or flatten them on the venue",
+        len(unmanaged), ", ".join(sorted(unmanaged)),
+    )
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "propr_mirror_unmanaged_position",
+            severity="warning",
+            source="propr_mirror",
+            title="Propr position not tracked by the mirror",
+            summary=(
+                f"{', '.join(sorted(unmanaged))} open on the challenge account with no "
+                "mirror state entry — the mirror will not close it."
+            ),
+            body=json.dumps(unmanaged, default=str),
+            dedupe_key=f"propr_mirror_unmanaged:{','.join(sorted(unmanaged))}",
+        )
+    except Exception as exc:
+        log.debug("Could not emit propr mirror unmanaged notification: %s", exc)
 
 
 def mirror_tick() -> dict:
@@ -578,6 +836,9 @@ def mirror_tick() -> dict:
     state = get_state()
     summary = {"opened": 0, "closed": 0, "errors": 0, "skipped": 0}
     roster_ids = set(roster)
+
+    # --- venue reconcile: state is bookkeeping, the venue is the truth -------
+    _reconcile_unmanaged_positions(propr, state, now, summary)
 
     # --- close pass first: reducing risk always outranks adding it ----------
     for trade_id, entry in list(state.items()):
@@ -636,7 +897,21 @@ def mirror_tick() -> dict:
             continue
         to_open.append(row)
 
-    if to_open and halt and halt.get("halted"):
+    # PROPR-GLOBAL-HALT-1: the operator's single "stop everything" control has to
+    # mean everything. The kill-switch / daily-loss halt / operator STOP used to
+    # be invisible here, so the mirror kept placing venue orders every 60s
+    # through a system-wide halt. OPEN pass only — the close pass above runs
+    # unconditionally (reducing risk is never halted), exactly as
+    # basket_live.reconcile_basket_live does it. Trades are not stamped in state,
+    # same rationale as the PROPR-3 halt below.
+    _global_ok, _global_why = (True, "OK")
+    if to_open:
+        from forven.exchange.risk import is_trading_allowed
+        _global_ok, _global_why = is_trading_allowed()
+
+    if to_open and not _global_ok:
+        summary["halted"] = [f"trading halted: {_global_why}"]
+    elif to_open and halt and halt.get("halted"):
         # PROPR-3: opens blocked near the challenge limits. Trades are NOT
         # marked in state — if the halt clears inside their freshness window
         # they mirror normally; past it they expire to a stale-skip, which is

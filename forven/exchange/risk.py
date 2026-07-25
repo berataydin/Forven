@@ -875,14 +875,23 @@ def _live_aggregate_equity() -> float | None:
     return None
 
 
-def live_portfolio_exposure() -> dict:
+def live_portfolio_exposure(exclude_trade_ids: "set[str] | None" = None) -> dict:
     """The live book's current dollar exposure, from OPEN live trade rows.
 
     Per row: notional = entry x units; risk = distance to the CURRENT stop x
     units, floored at 0 (a ratcheted trailing stop above a long's entry has
     locked profit — zero remaining risk). Rows with no stop are counted at the
-    conservative no-stop fallback and surfaced via ``stops_missing``."""
+    conservative no-stop fallback and surfaced via ``stops_missing``.
+
+    ``exclude_trade_ids`` drops specific OPEN rows from the tally. Needed by the
+    ORDER-BOUND-1 backstop in scanner._execute_direct: both the kernel and the
+    legacy path INSERT the trade row before the exchange call, so an admission
+    check run at the order itself would count the very order it is admitting
+    twice and refuse it. Excluding the row being placed makes the backstop
+    evaluate the same "book + this order" figure the pre-open callers do."""
     from forven.trade_state import parse_trade_signal_data as _parse_sd
+
+    excluded = {str(t) for t in (exclude_trade_ids or ()) if str(t or "").strip()}
 
     per_asset: dict[str, dict] = {}
     per_group: dict[str, dict] = {}
@@ -903,6 +912,8 @@ def live_portfolio_exposure() -> dict:
         db_rows = []
     for r in db_rows:
         row = dict(r)
+        if excluded and str(row.get("id")) in excluded:
+            continue
         asset_u = str(row.get("asset") or "").strip().upper()
         entry = _coerce_non_negative_float(row.get("fill_entry_price")) or _coerce_non_negative_float(row.get("entry_price"))
         size = _coerce_non_negative_float(row.get("size"))
@@ -970,6 +981,7 @@ def check_live_portfolio_budget(
     asset: str, direction: str, *,
     add_risk_usd: float, add_notional_usd: float, equity: float | None = None,
     book: str | None = None, book_equity_usd: float | None = None,
+    exclude_trade_ids: "set[str] | None" = None,
 ) -> tuple[bool, str]:
     """The account-level admission check for a NEW live position.
 
@@ -978,7 +990,11 @@ def check_live_portfolio_budget(
     for the order about to be placed. With direction books, pass ``book`` (the
     routed wallet's label) and ``book_equity_usd`` (its balance) so admission is
     also checked against THAT wallet's capacity — the aggregate caps alone
-    would let several strategies stack orders into one small wallet."""
+    would let several strategies stack orders into one small wallet.
+
+    ``exclude_trade_ids`` is for callers that already persisted the OPEN row for
+    the order they are admitting (see live_portfolio_exposure) — without it the
+    order would be counted both as existing exposure and as the addition."""
     settings = _load_risk_settings()
     if not bool(settings.get("live_portfolio_budget_enabled", True)):
         return True, "portfolio budget disabled"
@@ -988,7 +1004,7 @@ def check_live_portfolio_budget(
             "portfolio budget: account equity unavailable — refusing the live open "
             "(fail closed) until the daemon equity snapshot recovers"
         )
-    exposure = live_portfolio_exposure()
+    exposure = live_portfolio_exposure(exclude_trade_ids=exclude_trade_ids)
     asset_u = str(asset or "").strip().upper()
     direction = str(direction or "long").strip().lower()
     sign = -1.0 if direction == "short" else 1.0
@@ -1219,6 +1235,77 @@ def revoke_dead_strategy_ceilings() -> list[str]:
     if dead:
         log.info("Revoked stale live ceilings for terminal strategies: %s", ", ".join(dead))
     return dead
+
+
+# --------------------------------------------------------------------------- #
+# LIVE-CLAMP-1: the per-trade loss-at-stop bound on a real-capital order.
+#
+# Conservative per-trade risk cap applied when the configured limits carry no
+# max_risk_per_trade (the pre-existing guard treated a missing cap as "skip the
+# check"; an unbounded live order is worse than a 2% clamp). Equity remaining
+# unresolvable still fails closed — with no equity figure there is nothing to
+# bound against.
+#
+# This lives here rather than in the scanner because it is the LAST hard bound
+# on a single real order's loss and MULTIPLE order paths need it: the scanner's
+# _execute_direct choke point and the manual live open in
+# api_domains/paper_control (which calls hyperliquid.market_order directly and
+# so never reached the scanner's copy — the manual-live-open-bypasses-order-caps
+# finding). One definition = the bound can't drift between them.
+# --------------------------------------------------------------------------- #
+
+LIVE_PER_TRADE_RISK_CAP_DEFAULT = 0.02
+# The conservative stop distance assumed when an order carries no stop price —
+# mirrors _BUDGET_NO_STOP_RISK_FRAC so both bounds price a stopless order the same.
+_CLAMP_NO_STOP_STOP_DIST_FRAC = 0.03
+# 2% slack + a cent so an order clamped exactly to the cap upstream cannot be
+# re-refused here on float noise.
+_CLAMP_SLACK_FRACTION = 0.02
+
+
+def resolve_live_per_trade_risk_cap() -> float:
+    """max_risk_per_trade from the live limits, or the conservative default."""
+    try:
+        cap = _coerce_non_negative_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
+    except Exception:
+        cap = None
+    return float(cap) if cap else LIVE_PER_TRADE_RISK_CAP_DEFAULT
+
+
+def check_live_loss_at_stop(
+    *, size: float, price: float, stop_loss: float | None,
+    equity: float | None, cap: float | None = None,
+) -> tuple[bool, str]:
+    """LIVE-CLAMP-1 backstop: may this real-capital order be placed?
+
+    Returns (allowed, reason). ``size`` x |price - stop_loss| is the order's
+    loss-at-stop; it may not exceed ``cap`` (default: the configured
+    max_risk_per_trade) of real account ``equity``. Kernel mirror-parity sizing
+    deliberately skips the risk-budget caps, so for those callers this is the
+    only per-trade bound. Fails CLOSED when equity can't resolve.
+
+    Callers scope this to REAL capital (not sim, not testnet) themselves — the
+    function has no view of the venue."""
+    resolved_cap = _coerce_non_negative_float(cap) or resolve_live_per_trade_risk_cap()
+    real_equity = _coerce_non_negative_float(equity)
+    if not real_equity:
+        return False, "live risk clamp cannot resolve real account equity — fail closed"
+    stop_dist = (
+        abs(float(price) - float(stop_loss))
+        if stop_loss is not None
+        else float(price) * _CLAMP_NO_STOP_STOP_DIST_FRAC
+    )
+    loss_at_stop = float(size) * stop_dist
+    risk_budget_usd = float(resolved_cap) * float(real_equity)
+    if loss_at_stop > risk_budget_usd * (1.0 + _CLAMP_SLACK_FRACTION) + 0.01:
+        return False, (
+            f"loss-at-stop ${loss_at_stop:,.2f} "
+            f"(size {float(size):g} x stop distance {stop_dist:g}) exceeds the "
+            f"per-trade cap {float(resolved_cap):.2%} of real equity ${float(real_equity):,.2f}"
+        )
+    return True, (
+        f"within the per-trade risk cap (${loss_at_stop:,.2f}/${risk_budget_usd:,.2f})"
+    )
 
 
 def check_live_strategy_ceiling(strategy_id: str, add_notional_usd: float) -> tuple[bool, str]:
@@ -4329,6 +4416,10 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
     # the very first breaching read, so the un-confirmed window blocks entries
     # without flattening the book on a phantom.
     kill_switch_enabled = kv_get("kill_switch_enabled", True)
+    # HALT-STREAK-1: set when a streak is cleared this tick — the clear is as
+    # un-reconstructible as an increment (a dropped reset would let a LATER
+    # breach latch off non-consecutive ticks), so it forces a blocking write too.
+    _streak_reset = False
     if drawdown_pct >= max_drawdown and kill_switch_enabled:
         _ks_streak = int(state.get("kill_switch_breach_streak") or 0) + 1
         state["kill_switch_breach_streak"] = _ks_streak
@@ -4355,6 +4446,7 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
         )
     elif state.get("kill_switch_breach_streak"):
         state["kill_switch_breach_streak"] = 0
+        _streak_reset = True
 
     if daily_pnl_pct <= -daily_loss_limit and not state.get("daily_loss_halt"):
         _dh_streak = int(state.get("daily_halt_breach_streak") or 0) + 1
@@ -4382,10 +4474,23 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
         )
     elif state.get("daily_halt_breach_streak"):
         state["daily_halt_breach_streak"] = 0
+        _streak_reset = True
 
-    # Routine tick: drawdown/daily-PnL decision is already in `result`, so a
-    # dropped snapshot under contention is harmless — the next tick refreshes.
-    _save_risk_state(state, best_effort=True)
+    # HALT-STREAK-1: a PENDING breach streak is the one piece of this snapshot
+    # that is NOT reconstructible from the next tick — it is the confirmation
+    # counter itself. Persisting it best-effort meant that under sustained SQLite
+    # exclusive-lock contention every increment was dropped, the streak could
+    # never reach _HALT_CONFIRM_TICKS, and the kill-switch latch (with its
+    # close_all_positions) stayed deferred for the whole contention window —
+    # exactly when a halt is most likely to be warranted. Block on the write
+    # while a streak is live; a clean tick keeps the droppable fast path since
+    # the drawdown/daily-PnL decision is already in `result`.
+    _streak_pending = bool(
+        int(state.get("kill_switch_breach_streak") or 0)
+        or int(state.get("daily_halt_breach_streak") or 0)
+        or _streak_reset
+    )
+    _save_risk_state(state, best_effort=not _streak_pending)
     return result
 
 

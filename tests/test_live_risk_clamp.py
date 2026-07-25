@@ -18,7 +18,16 @@ def _call_open(monkeypatch, *, size, price=100.0, stop=98.0, cap=0.02,
     monkeypatch.setattr("forven.sim.clock.is_sim_active", lambda: False)
     monkeypatch.setattr(scanner, "_resolve_hyperliquid_testnet", lambda: testnet)
     monkeypatch.setattr(scanner, "_resolve_trade_vault_address", lambda tid, strict=True: None)
-    monkeypatch.setattr(scanner, "get_risk_status", lambda: {"limits": {"max_risk_per_trade": cap}})
+    # The cap is resolved by forven.exchange.risk.resolve_live_per_trade_risk_cap,
+    # which reads get_risk_status from ITS OWN module globals. Patching the
+    # scanner's re-imported name (as this helper used to) is INERT — the suite's
+    # control surface silently stopped influencing the bound, and
+    # test_missing_cap_defaults_conservatively would have reported a false green
+    # off the environment's real max_risk_per_trade. Patch the live seam.
+    monkeypatch.setattr(
+        "forven.exchange.risk.get_risk_status",
+        lambda: {"limits": {"max_risk_per_trade": cap}},
+    )
     monkeypatch.setattr(scanner, "_get_real_account_equity", lambda: equity)
     monkeypatch.setattr("forven.exchange.risk.is_trading_allowed", lambda: (True, "ok"))
 
@@ -65,6 +74,22 @@ class TestLiveRiskClampBackstop:
         assert "loss-at-stop" in str(err.value)
         with pytest.raises(RuntimeError) as err:
             _call_open(monkeypatch, size=5.0, cap=None)
+        assert "REACHED_EXCHANGE" in str(err.value)
+
+    def test_the_configured_cap_actually_drives_the_clamp(self, forven_db, monkeypatch):
+        """Proves the seam is LIVE, not just that the default happens to match.
+
+        The same 15-unit order that is refused at a 2% cap must pass the clamp
+        at a deliberately loose 0.9 cap. The account portfolio budget's own hard
+        per-trade cap (2% of equity by default) is the next bound down and would
+        otherwise refuse it for a different reason, so it is stubbed out here —
+        the clamp is the only thing under test.
+        """
+        monkeypatch.setattr(
+            "forven.scanner.check_live_portfolio_budget", lambda *a, **k: (True, "budget ok")
+        )
+        with pytest.raises(RuntimeError) as err:
+            _call_open(monkeypatch, size=15.0, cap=0.9)
         assert "REACHED_EXCHANGE" in str(err.value)
 
     def test_testnet_orders_are_exempt(self, forven_db, monkeypatch):

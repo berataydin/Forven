@@ -25,9 +25,13 @@ import pandas as pd
 
 from forven.db import get_db, init_db, kv_get, kv_set, log_activity, next_container_id
 from forven.exchange.risk import (
+    LIVE_PER_TRADE_RISK_CAP_DEFAULT as _LIVE_PER_TRADE_RISK_CAP_DEFAULT,
     calculate_position_size,
     cancel_reduce_only_orders_for_asset,
     can_open,
+    check_live_loss_at_stop,
+    check_live_portfolio_budget,
+    check_live_strategy_ceiling,
     get_risk_status,
     is_trading_allowed,
     register,
@@ -928,12 +932,10 @@ def _get_registered_position(trade_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-# LIVE-CLAMP-1: conservative per-trade risk cap applied when the configured
-# limits carry no max_risk_per_trade (the pre-existing guard treated a missing
-# cap as "skip the check"; an unbounded live order is worse than a 2% clamp).
-# Equity remaining unresolvable still fails closed - with no equity figure
-# there is nothing to bound against.
-_LIVE_PER_TRADE_RISK_CAP_DEFAULT = 0.02
+# LIVE-CLAMP-1: the conservative per-trade risk cap (used when the configured
+# limits carry no max_risk_per_trade) now lives in forven.exchange.risk next to
+# check_live_loss_at_stop, so the scanner and the manual live open share ONE
+# definition. Re-exported under the old private name for the call sites below.
 
 
 def _guard_open_trade_execution_intent(
@@ -1088,8 +1090,12 @@ def _guard_open_trade_execution_intent(
                 f"trade {trade_id} requested size {float(size):.6f} exceeds safe max {float(max_size):.6f}"
             )
 
-    # GO-LIVE-1: the operator's go-live per-asset notional ceiling also bounds
-    # the legacy/intent live path (the kernel path checks it before its order).
+    # GO-LIVE-1: the operator's go-live per-asset notional ceiling bounds the
+    # QUEUED-INTENT live path. NOTE (ORDER-BOUND-1): this guard has exactly one
+    # caller — execute_trade_intent. It does NOT cover the legacy per-bar path
+    # (_open_via_execution -> _execute_direct), which an earlier version of this
+    # comment wrongly claimed; that path is bounded by the ceiling + portfolio
+    # budget re-checked inside _execute_direct's open branch.
     if str(trade.get("execution_type") or "").strip().lower() == "live":
         from forven.exchange.risk import check_live_strategy_ceiling
         _cl_ok, _cl_why = check_live_strategy_ceiling(strategy_id, float(size) * float(reference_price))
@@ -3678,34 +3684,43 @@ def _execute_direct(
         # risk-budget caps, so this is the final hard bound on a single order's
         # loss-at-stop. Fail closed when the cap or real equity can't resolve.
         # Sim and testnet orders are exempt (no real capital at risk).
+        # The bound itself lives in forven.exchange.risk.check_live_loss_at_stop
+        # so the manual live open (api_domains/paper_control._live_open, which
+        # places its own market_order and never reaches this choke point) shares
+        # ONE definition instead of a drifting copy.
         if not is_sim_active() and not testnet:
-            try:
-                _cap = _coerce_positive_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
-            except Exception:
-                _cap = None
-            if not _cap:
-                _cap = _LIVE_PER_TRADE_RISK_CAP_DEFAULT
             _real_equity = _coerce_positive_float(_get_real_account_equity())
-            if not _real_equity:
-                raise RuntimeError(
-                    f"refusing to open {trade_id}: live risk clamp cannot resolve "
-                    f"real account equity — fail closed"
-                )
-            _stop_dist = (
-                abs(float(price) - float(stop_loss))
-                if stop_loss is not None
-                else float(price) * 0.03  # no-stop conservative floor, mirrors the budget check
+            _clamp_ok, _clamp_why = check_live_loss_at_stop(
+                size=float(size), price=float(price), stop_loss=stop_loss,
+                equity=_real_equity,
             )
-            _loss_at_stop = float(size) * _stop_dist
-            _risk_budget_usd = float(_cap) * float(_real_equity)
-            # 2% slack + a cent so an order clamped exactly to the cap upstream
-            # cannot be re-refused on float noise.
-            if _loss_at_stop > _risk_budget_usd * 1.02 + 0.01:
-                raise RuntimeError(
-                    f"refusing to open {trade_id}: loss-at-stop ${_loss_at_stop:,.2f} "
-                    f"(size {float(size):g} x stop distance {_stop_dist:g}) exceeds the "
-                    f"per-trade cap {float(_cap):.2%} of real equity ${float(_real_equity):,.2f}"
-                )
+            if not _clamp_ok:
+                raise RuntimeError(f"refusing to open {trade_id}: {_clamp_why}")
+            # ORDER-BOUND-1: the operator's typed GO-LIVE ceiling and the
+            # account-level portfolio budget belong at the ORDER, not only at the
+            # callers that remember to run them. The kernel live path checks both
+            # before sizing; the LEGACY path (_open_via_execution -> here) reached
+            # a real exchange order with neither — _guard_open_trade_execution_intent
+            # claimed to cover it but has exactly one caller (execute_trade_intent)
+            # that this path never reaches. Re-running them here is idempotent for
+            # the kernel path (same figures, same verdict) and is the only bound on
+            # the legacy one. The trade row is already INSERTED by both callers, so
+            # exclude it from the exposure tally or this order is counted twice.
+            _add_notional = float(size) * float(price)
+            _add_risk = (
+                abs(float(price) - float(stop_loss)) * float(size)
+                if stop_loss is not None
+                else _add_notional * 0.03  # no stop known — conservative floor
+            )
+            _cl_ok, _cl_why = check_live_strategy_ceiling(strat_id, _add_notional)
+            if not _cl_ok:
+                raise RuntimeError(f"refusing to open {trade_id}: {_cl_why}")
+            _pb_ok, _pb_why = check_live_portfolio_budget(
+                asset, direction, add_risk_usd=_add_risk, add_notional_usd=_add_notional,
+                equity=_real_equity, exclude_trade_ids={str(trade_id)},
+            )
+            if not _pb_ok:
+                raise RuntimeError(f"refusing to open {trade_id}: {_pb_why}")
         # B2: set + confirm leverage/margin mode on the routed account BEFORE the
         # entry, so the position uses the leverage our risk/stop math assumes
         # instead of the venue default (often 20-40x). Fail closed if it can't be
@@ -4980,9 +4995,22 @@ def manage_positions(
             _closed_gross = (
                 _recent_strategy_returns(strat_id) if _controls.get("sizing_mode") == "kelly" else None
             )
+            # FIXED-DOLLAR-1: pass the strategy's RUNNING equity so `fixed` sizing
+            # means what the shared module documents — a fixed DOLLAR notional
+            # (fixed_size / equity_at_entry), the same thing the kernel walk and the
+            # backtest deploy. Omitting current_equity divided fixed_size by the
+            # profile's static initial_capital (defaulting to the $10k paper sandbox
+            # base), which made `fixed` a fixed FRACTION of that sandbox scaled by
+            # the real wallet — a live account at $50k deployed 5x the configured
+            # dollar amount while sizing_meta still reported method "fixed". This is
+            # a deliberate behaviour change (see tests/test_harden_money_path.py):
+            # it restores backtest parity, and on the live path the resulting order
+            # is still bounded by LIVE-CLAMP-1 + the portfolio budget + the go-live
+            # ceiling. Risk-based modes (fraction/atr/kelly/full) ignore the argument.
             _size_fraction = _sizing.size_fraction(
                 _controls, _sizing_stop_dist, leverage=_leverage,
                 initial_capital=_profile_initial_capital, closed_gross=_closed_gross,
+                current_equity=float(sizing_equity),
             )
             size = round(
                 _sizing.position_units(
@@ -5010,6 +5038,12 @@ def manage_positions(
                 "stop_distance": round(float(_stop_dist_pct) * float(price), 8),
                 "risk_budget_usd": round(float(sizing_equity) * float(alloc_risk), 4),
             }
+            if _controls.get("sizing_mode") == "fixed" and _controls.get("fixed_size"):
+                # FIXED-DOLLAR-1: state the dollar target explicitly so "fixed" on
+                # the position card can't be read as a fixed fraction (the fraction
+                # above is derived from it and shrinks as the account grows).
+                sizing_meta["fixed_notional_usd"] = round(float(_controls["fixed_size"]), 4)
+                sizing_meta["fixed_notional_basis_equity"] = round(float(sizing_equity), 4)
 
             # Min-notional preflight (Approach C / live): Hyperliquid rejects
             # orders under ~$10 notional. Dividing capital across books/strategies

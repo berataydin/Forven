@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from forven.db import get_db, kv_get, kv_set_best_effort
@@ -48,6 +50,13 @@ from forven.sim.clock import get_now
 log = logging.getLogger("forven.portfolio_allocator")
 
 ALLOCATION_KV_KEY = "forven:portfolio:allocation"
+
+# ALLOC-FRESH-1: the live sizing hook refuses to scale a real order off a
+# snapshot older than this. 2x the forven-portfolio-allocation job's 1h interval
+# (scheduler.py) — one missed run is tolerated, a stalled job is not.
+SNAPSHOT_MAX_AGE_SECONDS = 7200.0
+_STALE_WARN_INTERVAL_SECONDS = 600.0
+_last_stale_warn_at = 0.0
 
 DEFAULT_LOOKBACK_DAYS = 60
 DEFAULT_MIN_MULTIPLIER = 0.25
@@ -615,12 +624,46 @@ def get_allocation_snapshot() -> dict[str, Any] | None:
     return snapshot if isinstance(snapshot, dict) else None
 
 
+def _warn_stale_snapshot(age_seconds: float | None) -> None:
+    """Throttled operator warning — the live hook runs per open, not per hour."""
+    global _last_stale_warn_at
+    now = time.monotonic()
+    if now - _last_stale_warn_at < _STALE_WARN_INTERVAL_SECONDS:
+        return
+    _last_stale_warn_at = now
+    detail = f"{age_seconds / 3600.0:.1f}h old" if age_seconds is not None else "no computed_at"
+    log.warning(
+        "Portfolio allocation snapshot is stale (%s, limit %.0fh) — live sizing "
+        "multipliers are clamped to min(1.0, last measured) until the refresh job "
+        "runs (staleness may only de-risk, never up-size)",
+        detail, SNAPSHOT_MAX_AGE_SECONDS / 3600.0,
+    )
+
+
+def _snapshot_age_seconds(snapshot: dict[str, Any]) -> float | None:
+    """Seconds since the snapshot was computed, or None if unparseable."""
+    raw = str(snapshot.get("computed_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        computed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    now = get_now()
+    if computed.tzinfo is None:
+        computed = computed.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now - computed).total_seconds()
+
+
 def live_risk_multiplier(strategy_id: str) -> float:
     """The multiplier the LIVE sizing hook applies for ``strategy_id``.
 
     Neutral 1.0 unless BOTH flags are on AND the strategy has a measured
-    multiplier in a fresh-enough snapshot — every failure mode degrades to
-    legacy flat sizing, never to a surprise size.
+    multiplier — every failure mode degrades to legacy flat sizing, never to a
+    surprise size. A STALE snapshot may only de-risk: the last measured
+    multiplier is clamped to at most 1.0, never restored to neutral.
     """
     settings = _load_settings()
     if not allocator_enabled(settings) or not allocator_live_enabled(settings):
@@ -628,6 +671,15 @@ def live_risk_multiplier(strategy_id: str) -> float:
     snapshot = get_allocation_snapshot()
     if not snapshot:
         return 1.0
+    # ALLOC-FRESH-1: the docstring promised a freshness gate that did not exist —
+    # this scales a REAL order's size, and the snapshot is a best-effort KV write
+    # from an hourly job. A dead scheduler, a dropped write or a long outage left
+    # multipliers from days ago silently sizing live orders off stale measured
+    # vol/correlation. Anything older than 2x the refresh cadence is not evidence
+    # any more. An unparseable/absent computed_at counts as stale for the same
+    # reason.
+    _age = _snapshot_age_seconds(snapshot)
+    _stale = _age is None or _age > SNAPSHOT_MAX_AGE_SECONDS
     entry = (snapshot.get("strategies") or {}).get(str(strategy_id))
     if not isinstance(entry, dict) or not entry.get("measured"):
         return 1.0
@@ -637,4 +689,14 @@ def live_risk_multiplier(strategy_id: str) -> float:
         return 1.0
     if not math.isfinite(multiplier) or multiplier <= 0:
         return 1.0
+    if _stale:
+        # The multiplier range is [DEFAULT_MIN_MULTIPLIER 0.25, DEFAULT_MAX_MULTIPLIER
+        # 2.0], so "fall back to neutral 1.0" is NOT the safe default it looks like:
+        # for a strategy the allocator had scaled DOWN on measured vol/correlation
+        # (0.25x), neutral would size the REAL order up to 4x LARGER — widening a
+        # money bound precisely when the evidence went stale. Staleness may only
+        # DE-RISK: keep the last measured multiplier when it shrinks the order, drop
+        # any up-sizing (>1.0) it claimed.
+        _warn_stale_snapshot(_age)
+        return min(1.0, multiplier)
     return multiplier
