@@ -283,6 +283,50 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
     }
 )
 
+# ANNOT-EVAL-1 (audit 2026-07-25). `typing` and `functools` were allowlisted above
+# as "pure-computation stdlib — none of these expose a filesystem, network,
+# process, or dynamic-exec primitive". That premise was FALSE, and the bypass was
+# reproduced on this repo's own Python 3.11.9:
+#
+#     class C:
+#         x: "<payload>"          # a plain string CONSTANT
+#     typing.get_type_hints(C)    # -> _eval_type -> ForwardRef._evaluate -> eval()
+#
+# `scan_source` returned ok=True / findings=[] and importing the module executed
+# arbitrary code in the HOST process — which holds the decrypted Fernet key, the
+# Hyperliquid wallet private key, and unfiltered os.environ. Three independent
+# entry points reach the same eval(): typing.get_type_hints(),
+# typing.ForwardRef(...)._evaluate(...), and functools.singledispatch(...).register
+# with a string parameter annotation. The scanner never inspected string constants,
+# so none of them were visible to it.
+#
+# Both halves of the gadget are now closed INDEPENDENTLY:
+#   (a) the evaluator entry points are blocked (this set, plus the imported-symbol
+#       check in visit_ImportFrom), and
+#   (b) string ANNOTATIONS — the only way to carry a payload past the AST walk —
+#       are rejected outright (_GuardVisitor._check_annotation).
+# Either alone stops the attack; together they survive a NEW evaluator gadget
+# appearing in a future Python, which a denylist alone would not.
+#
+# `typing`/`functools` stay allowlisted deliberately: 178 files in the live corpus
+# import them for ordinary hints (Optional/Any/Literal/Dict/Tuple/Union/...).
+# Gating the SYMBOLS keeps those working while rejecting the evaluators.
+#
+# Deliberately NOT blocked: bare `_evaluate` and `register`. Both are far too
+# generic — the live corpus defines its own `_evaluate()` methods on strategy
+# classes (same reasoning as `.run`/`.call` below). They are unreachable anyway
+# once `ForwardRef` and `singledispatch` cannot be constructed.
+_EVAL_REACHING_NAMES: frozenset[str] = frozenset(
+    {
+        "get_type_hints",
+        "evaluate_forward_ref",  # public spelling added in 3.13+
+        "ForwardRef",
+        "_eval_type",
+        "singledispatch",
+        "singledispatchmethod",
+    }
+)
+
 # Dangerous callables that an honest indicator strategy never needs. These are
 # blocked in BOTH bare-name form (``eval(x)``) AND attribute form
 # (``builtins.eval(x)``, ``b.open(...)``) — the attribute form was the verified
@@ -290,7 +334,7 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
 # these are builtins reachable without an import, or live on modules the import
 # allowlist already blocks, so the attribute check is defense-in-depth that closes
 # the "reach the same primitive off a re-exported module" gadget.
-FORBIDDEN_CALL_ATTRS: frozenset[str] = frozenset(
+FORBIDDEN_CALL_ATTRS: frozenset[str] = _EVAL_REACHING_NAMES | frozenset(
     {
         "eval",
         "exec",
@@ -518,6 +562,111 @@ class AstReport:
     line_count: int = 0
 
 
+def _is_literal_ref(node: ast.AST) -> bool:
+    """True for ``Literal`` / ``typing.Literal`` / any ``*.Literal`` reference."""
+    if isinstance(node, ast.Name):
+        return node.id == "Literal"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "Literal"
+    return False
+
+
+def _is_dunder(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__")
+
+
+# Names/attributes that may never appear inside a forward-reference annotation.
+# Reuses the guard's existing combined denylist so the annotation path can never
+# drift from the rest of the scanner.
+_BLOCKED_ANNOTATION_NAMES: frozenset[str] = _FORBIDDEN_GETATTR_STR
+
+
+def _is_pure_type_expression(expr: ast.AST, _depth: int = 0) -> bool:
+    """True when ``expr`` is a TYPE expression and nothing more.
+
+    A legitimate forward reference names a type: ``pd.Series``,
+    ``Optional[int]``, ``Dict[str, "Other"]``, ``int | None``, ``Callable[..., X]``.
+    None of those need a call, a lambda, a comprehension or a subscript of an
+    arbitrary value. A payload (``__import__('os').getcwd()``) always does. So the
+    grammar below is the discriminator: it admits the shapes real annotations use
+    and nothing that can execute.
+    """
+    if _depth > 8:  # pathological nesting -> refuse rather than recurse
+        return False
+
+    if isinstance(expr, ast.Expression):
+        return _is_pure_type_expression(expr.body, _depth + 1)
+    if isinstance(expr, ast.Name):
+        return not _is_dunder(expr.id) and expr.id not in _BLOCKED_ANNOTATION_NAMES
+    if isinstance(expr, ast.Attribute):
+        return (
+            not _is_dunder(expr.attr)
+            and expr.attr not in _BLOCKED_ANNOTATION_NAMES
+            and _is_pure_type_expression(expr.value, _depth + 1)
+        )
+    if isinstance(expr, ast.Subscript):
+        return _is_pure_type_expression(expr.value, _depth + 1) and _is_pure_type_expression(
+            expr.slice, _depth + 1
+        )
+    if isinstance(expr, (ast.Tuple, ast.List)):
+        return all(_is_pure_type_expression(e, _depth + 1) for e in expr.elts)
+    if isinstance(expr, ast.BinOp):
+        # PEP 604 unions only (``int | None``); no arithmetic.
+        return (
+            isinstance(expr.op, ast.BitOr)
+            and _is_pure_type_expression(expr.left, _depth + 1)
+            and _is_pure_type_expression(expr.right, _depth + 1)
+        )
+    if isinstance(expr, ast.Constant):
+        # None / Ellipsis / ints appear in real annotations (Literal[3], Callable[...]).
+        if expr.value is None or expr.value is Ellipsis or isinstance(expr.value, (bool, int)):
+            return True
+        if isinstance(expr.value, str):
+            # A nested forward reference — recurse into it rather than trusting it.
+            return _forward_ref_is_safe(expr.value, _depth + 1)
+        return False
+    return False
+
+
+def _forward_ref_is_safe(text: str, _depth: int = 0) -> bool:
+    """Parse a forward-reference string and require it to be a pure type expression."""
+    if _depth > 8 or len(text) > 512:
+        return False
+    try:
+        parsed = ast.parse(text.strip(), mode="eval")
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        # Not even an expression — cannot be a real annotation. Refuse.
+        return False
+    return _is_pure_type_expression(parsed, _depth)
+
+
+def _string_annotation_constants(annotation: ast.AST) -> list[ast.Constant]:
+    """Str constants in an annotation that would reach eval() AND are not pure types.
+
+    Two exclusions keep the live corpus working:
+      * strings inside ``Literal[...]`` are VALUES, not forward references (33
+        corpus files use ``Literal["long", "short"]``; get_type_hints never
+        eval()s them), so that subtree is skipped entirely; and
+      * a forward reference that parses to a pure TYPE expression is allowed —
+        22 corpus files legitimately write ``series: "pd.Series"``.
+    Anything else (``x: "__import__('os').getcwd()"``) is reported. See ANNOT-EVAL-1.
+    """
+    found: list[ast.Constant] = []
+
+    def _walk(node: ast.AST) -> None:
+        if isinstance(node, ast.Subscript) and _is_literal_ref(node.value):
+            return
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and not _forward_ref_is_safe(node.value):
+                found.append(node)
+            return
+        for child in ast.iter_child_nodes(node):
+            _walk(child)
+
+    _walk(annotation)
+    return found
+
+
 class _GuardVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.findings: list[Finding] = []
@@ -580,6 +729,66 @@ class _GuardVisitor(ast.NodeVisitor):
                         node_repr=ast.dump(node),
                     )
                 )
+            # ANNOT-EVAL-1: `from typing import get_type_hints` binds the
+            # evaluator under a bare name, which the attribute check in
+            # visit_Call cannot see. typing/functools stay importable for
+            # ordinary hints; only the eval-reaching symbols are refused.
+            elif alias.name in _EVAL_REACHING_NAMES:
+                self.findings.append(
+                    Finding(
+                        kind="dynamic_exec",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        message=(
+                            f"Forbidden imported symbol: '{alias.name}' evaluates "
+                            "string annotations through eval()"
+                        ),
+                        node_repr=ast.dump(node),
+                    )
+                )
+        self.generic_visit(node)
+
+    def _check_annotation(self, annotation: ast.AST | None) -> None:
+        """Reject string annotations — the payload carrier for ANNOT-EVAL-1.
+
+        A forward-reference annotation is a plain ``str`` that the typing
+        machinery later feeds to ``eval()``. An OHLCV strategy has no legitimate
+        need for one (the live corpus contains zero), so refusing them closes the
+        whole class independently of which evaluator is reachable.
+        """
+        if annotation is None:
+            return
+        for const in _string_annotation_constants(annotation):
+            self._add(
+                const,
+                "Forbidden string annotation: a forward reference is eval()'d by "
+                "the typing machinery and this one is not a plain type expression "
+                f"({const.value[:60]!r})",
+            )
+
+    def _check_function_annotations(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        args = node.args
+        for arg in (
+            *getattr(args, "posonlyargs", []),
+            *args.args,
+            *args.kwonlyargs,
+            args.vararg,
+            args.kwarg,
+        ):
+            if arg is not None:
+                self._check_annotation(arg.annotation)
+        self._check_annotation(node.returns)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._check_annotation(node.annotation)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_function_annotations(node)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._check_function_annotations(node)
         self.generic_visit(node)
 
     def _add(self, node: ast.AST, message: str) -> None:
