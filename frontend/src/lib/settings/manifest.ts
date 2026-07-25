@@ -1124,7 +1124,12 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.quick_screen.min_sharpe',
     label: 'Quick-screen min Sharpe',
-    default: 0.5,
+    // ARCH-05: mirrors DEFAULT_PIPELINE_CONFIG (forven/policy.py). These values are
+    // shown as the "Default" for a knob the operator has never set, AND are what the
+    // field renders when the backend returns no value — a stale number here is the
+    // page telling an operator a gate is stricter than the engine actually runs.
+    // tests/test_arch_wiring.py fails on any divergence; fix BOTH ends together.
+    default: 0,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
@@ -1148,27 +1153,27 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.quick_screen.min_trades',
     label: 'Quick-screen min trades',
-    default: 30,
+    default: 20,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
     backendSection: 'pipeline',
     backendPath: 'quick_screen.min_trades',
     description:
-      'Minimum in-sample trade count for the quick-screen overfitting guardrails (Gate5). Was a hardcoded 30 before; deferred entirely when testing mode is on.',
+      'Minimum in-sample trade count for the quick-screen overfitting guardrails (Gate5). Was a hardcoded 30 before it was wired; the Default preset now runs 20 (the Strict preset restores 30). Deferred entirely when testing mode is on.',
     usedBy: ['forven.brain'],
   },
   {
     id: 'pipeline.quick_screen.min_robustness_score',
     label: 'Quick-screen min robustness',
-    default: 50,
+    default: 0,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
     backendSection: 'pipeline',
     backendPath: 'quick_screen.min_robustness_score',
     description:
-      'Robustness-score floor (0-100) for the quick-screen guardrails (Gate3). The composite score is mostly earned inside the gauntlet, so fresh strategies score near zero — lower this (or enable testing mode) if the pipeline starves at quick screen. Was a hardcoded 50 before.',
+      'Robustness-score floor (0-100) for the quick-screen guardrails (Gate3). The composite score is mostly earned inside the gauntlet, so fresh strategies score near zero — a non-zero floor here is a catch-22 that empties the funnel, which is why the Default preset runs 0 (the Strict preset restores 40). Was a hardcoded 50 before it was wired.',
     usedBy: ['forven.brain'],
   },
   {
@@ -1285,7 +1290,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.gauntlet.min_robustness_score',
     label: 'Gauntlet min robustness score',
-    default: 50,
+    default: 30,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1297,7 +1302,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.gauntlet.min_trades',
     label: 'Gauntlet min trade count',
-    default: 30,
+    default: 20,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1364,7 +1369,11 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     // blocking strategies that lack those artifacts. Those two remain non-required by
     // default; their safety floors (MC tail-drawdown, regime profitability) still fire
     // whenever the test actually ran.
-    default: ['walk_forward', 'param_jitter', 'cost_stress'],
+    // ARCH-05: cost_stress was listed here but is NOT in the backend's Default preset —
+    // it is a strict-LIVE concern deferred to the paper->live gate (the Strict preset
+    // re-adds it at the gauntlet). Listing it made the page claim a ->paper gate the
+    // engine does not run.
+    default: ['walk_forward', 'param_jitter'],
     type: 'csv',
     // Canonical test names from forven.policy._GAUNTLET_VALIDATION_TYPES —
     // providing options renders this as checkboxes instead of a free-text CSV.
@@ -1412,7 +1421,9 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.robustness_thresholds.wfa_fold_pass_rate_min',
     label: 'Walk-forward fold pass-rate floor',
     unit: '%',
-    default: 40,
+    // Backend stores the fraction 0.33 (a ratio rail — see policy._RATIO_THRESHOLD_PATHS,
+    // which accepts either form); this field is the %-shaped mirror of it.
+    default: 33,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1426,7 +1437,8 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.robustness_thresholds.param_jitter_pass_rate_min',
     label: 'Param-jitter pass-rate floor',
     unit: '%',
-    default: 60,
+    // Backend stores the fraction 0.50 (ratio rail, see the note above).
+    default: 50,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1663,7 +1675,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.paper_trading.min_closed_trades',
     label: 'Paper min closed trades',
-    default: 50,
+    default: 10,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-paper-live-gates',
@@ -1676,7 +1688,9 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.paper_trading.min_total_return_pct',
     label: 'Paper min total return',
     unit: '%',
-    // TODO confirm default
+    // Confirmed against DEFAULT_PIPELINE_CONFIG['paper_trading']['min_total_return_pct']
+    // (0.0): "strict live" is carried by the profit-factor / Sharpe / drawdown floors,
+    // not by a raw return threshold. Pinned by tests/test_arch_wiring.py.
     default: 0,
     type: 'number',
     area: 'lab',
@@ -1815,6 +1829,19 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     backendSection: 'pipeline',
     backendPath: 'safety_floors.wfa_fold_pass_rate_min',
     description: 'Absolute walk-forward fold pass-rate floor (fraction 0-1) clamped onto the gauntlet->paper gate. 0.20 = 20% of folds OOS-positive.',
+    usedBy: ['forven.policy'],
+  },
+  {
+    id: 'pipeline.safety_floors.wfa_min_folds',
+    label: 'Floor: min walk-forward folds (->paper)',
+    default: 2,
+    type: 'number',
+    area: 'lab',
+    subsection: 'lab-pipeline-safety-floors',
+    backendSection: 'pipeline',
+    backendPath: 'safety_floors.wfa_min_folds',
+    description:
+      'Absolute minimum judgeable walk-forward folds behind a gauntlet->paper promotion. wfa_min_folds was the only gauntlet threshold with no floor, so setting the gauntlet knob to 1 let a SINGLE lucky OOS window carry a promotion — the fold pass-RATE floor cannot help when there is only one fold to average (1/1 = 100%). Two is the minimum at which "consistent out of sample" means anything. Set 0 to remove the rail.',
     usedBy: ['forven.policy'],
   },
   {
@@ -2676,11 +2703,12 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'bot-operations.pipeline_assignments_per_cycle',
     label: 'Pipeline assignments per cycle',
-    default: 5,
+    default: 3,
     type: 'number',
     area: 'system',
     subsection: 'system-resource-tuning',
     backendSection: 'bot-operations',
+    // ARCH-05: mirrors _DEFAULT_SETTINGS_PAYLOAD (forven/api_core.py), which is 3.
     backendPath: 'pipeline_assignments_per_cycle',
     description: 'Max strategies the pipeline assigns to workers per dispatch cycle.',
     usedBy: ['forven.strategy_lifecycle', 'forven.runtime_worker'],

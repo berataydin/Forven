@@ -43,6 +43,7 @@ import math
 from typing import Any
 
 from forven.db import kv_get, kv_set, kv_set_best_effort
+from forven.execution_results import parse_close_receipt
 from forven.sim.clock import get_now
 
 log = logging.getLogger("forven.basket_live")
@@ -236,6 +237,66 @@ def disarm_basket_live(*, actor: str = "operator", flatten: bool = False) -> dic
     return {"arming": arming, "flattened": results}
 
 
+def _close_outcome(result: object, requested_units: float, *, self_correcting: bool = True) -> dict:
+    """Classify one reduce-only close against the venue's CONFIRMED quantities.
+
+    HL-CLOSE-1 caller side. Checking ``result["error"]`` alone answers "was the
+    order rejected outright?" — it does NOT answer "did the position actually
+    go?". A reduce-only IOC can come back with a fill price and NO error while
+    having moved a fraction of the requested size, and this module recorded that
+    as ``ok: True``: a disarm flatten then logged "flattened N positions" and left
+    a leveraged remainder in the wallet, and the reconcile ledger showed a clean
+    close for a leg that is still half on.
+
+    ``ok`` now requires that no CONFIRMED short fill came back: a receipt that
+    reports a filled quantity smaller than requested ("partial") or an explicit
+    zero ("unfilled") is a failure with its residual recorded. It is stamped
+    ``close_outcome`` either way, so the ambiguity is in the ledger instead of
+    being flattened into a green tick.
+
+    ``self_correcting`` decides how an ``unknown`` receipt — a response carrying no
+    ``filled_size`` at all — is treated, and the distinction is the difference
+    between a harmless ambiguity and abandoned leveraged exposure:
+
+    * ``True`` (the reconcile path, ``_do_close``): stays ``ok``. No local trade row
+      is marked CLOSED, and the NEXT reconcile pass re-reads the venue's real
+      positions and re-issues whatever is left, so the ambiguity resolves itself.
+    * ``False`` (the DISARM path, ``_flatten_wallet``): counts as a failure. There is
+      no next pass — the basket is being disarmed and the wallet stops being
+      watched the moment this returns. Calling an unconfirmed close "ok" there is
+      how the operator gets told "flattened N positions" while a leveraged leg is
+      left running in a wallet nobody is reconciling any more.
+
+    ``parse_close_receipt`` is the shared classifier (the scanner, the manual
+    close and the paper controls all use the same one). Imported at module scope:
+    ``forven.execution_results`` is a leaf (dataclass + typing only), so it adds
+    nothing to the import cluster this refactor exists to break up.
+    """
+    error = result.get("error") if isinstance(result, dict) else None
+    receipt = parse_close_receipt(result, requested_units)
+    short_fill = receipt.outcome in ("partial", "unfilled")
+    unconfirmed = receipt.outcome == "unknown" and not self_correcting
+    entry: dict = {
+        "ok": not error and not short_fill and not unconfirmed,
+        "error": error,
+        "close_outcome": receipt.outcome,
+    }
+    if unconfirmed and not error:
+        entry["error"] = (
+            "close not confirmed by the venue (no filled quantity in the receipt) "
+            "and no reconcile pass will follow — verify the position by hand"
+        )
+    if short_fill:
+        entry["filled_units"] = receipt.filled_size
+        entry["residual_units"] = round(float(receipt.residual_size), 6)
+        if not error:
+            entry["error"] = (
+                f"close did not complete: {receipt.outcome} "
+                f"(filled {receipt.filled_size}, residual {receipt.residual_size:g} units)"
+            )
+    return entry
+
+
 def _flatten_wallet(address: str) -> list[dict]:
     from forven.exchange.hyperliquid import close_position, get_positions, resolve_configured_testnet
 
@@ -255,12 +316,22 @@ def _flatten_wallet(address: str) -> list[dict]:
         side = "sell" if units > 0 else "buy"
         try:
             result = close_position(asset, size, side, testnet=testnet, vault_address=address)
-            ok = not (isinstance(result, dict) and result.get("error"))
-            out.append({"asset": asset, "size": size, "ok": ok,
-                        "error": (result or {}).get("error") if isinstance(result, dict) else None})
+            # self_correcting=False: this is the DISARM flatten. Nothing reconciles
+            # this wallet after we return, so an unconfirmed close must not be
+            # reported as flattened.
+            out.append({"asset": asset, "size": size, **_close_outcome(result, size, self_correcting=False)})
         except Exception as exc:
             out.append({"asset": asset, "size": size, "ok": False, "error": str(exc)})
         _ledger_append({"event": "flatten_close", **out[-1]})
+        if not out[-1].get("ok"):
+            # A disarm flatten that did not fully close is REAL leveraged exposure
+            # left in an about-to-be-unwatched wallet. Never let that be a silent
+            # ledger row.
+            log.critical(
+                "BASKET FLATTEN INCOMPLETE for %s: %s — leveraged exposure remains in "
+                "wallet %s and the basket is being disarmed. Flatten it by hand.",
+                asset, out[-1].get("error"), address,
+            )
     return out
 
 
@@ -438,10 +509,14 @@ def reconcile_basket_live() -> dict | None:
 def _do_close(close_position, asset: str, units: float, side: str, testnet: bool, address: str) -> dict:
     try:
         result = close_position(asset, units, side, testnet=testnet, vault_address=address)
-        ok = not (isinstance(result, dict) and result.get("error"))
+        # HL-CLOSE-1 caller side: `ok` requires a venue-confirmed close of the FULL
+        # requested size, not merely the absence of a top-level error — see
+        # _close_outcome. A short close is self-correcting here (the next reconcile
+        # re-reads real positions and re-issues the remaining delta), but it must be
+        # reported honestly or orders_ok claims a flat leg that is still on.
         entry = {
             "asset": asset, "action": "close", "side": side, "units": round(units, 6),
-            "ok": ok, "error": (result or {}).get("error") if isinstance(result, dict) else None,
+            **_close_outcome(result, units),
         }
     except Exception as exc:
         entry = {"asset": asset, "action": "close", "side": side, "units": round(units, 6),

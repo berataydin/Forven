@@ -210,7 +210,7 @@ def _validate_custom_module(workdir: Path) -> dict:
 
     from forven.strategies import registry
     from forven.strategies.certification import certify_execution_strategy
-    from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
+    from forven.strategies.lookahead_probe import detect_execution_crash, probe_lookahead
 
     # Belt-and-suspenders re-scan in the child (the parent already scanned before
     # write; re-checking here means the worker never imports an unscanned module).
@@ -274,7 +274,15 @@ def _validate_custom_module(workdir: Path) -> dict:
         param_space = None
 
     cert = certify_execution_strategy(str(type_name), default_params)
-    lookahead_reason = detect_lookahead(probe)
+    # lookahead-probe-vacuous-pass (2026-07-25): use the STRUCTURED verdict, not the
+    # `.reason`-only detect_lookahead wrapper. `.reason` is still the ONLY field that
+    # blocks (a quiet strategy is not a leaking one), but the probe can now report that
+    # it compared NOTHING — the all-quiet case that used to be stamped leak-free on zero
+    # evidence. This is the live registration path, so the verifiability fields have to
+    # cross the process boundary as data or the parent has nothing to record:
+    # `intake.lookahead_verifiability()` already reads exactly these keys off this blob
+    # and, until now, every payload was missing them and read as "verifiable" by default.
+    lookahead = probe_lookahead(probe)
     execution_crash_reason = detect_execution_crash(probe)
 
     return {
@@ -287,8 +295,13 @@ def _validate_custom_module(workdir: Path) -> dict:
         "parameter_space": _json_safe(param_space) if param_space is not None else None,
         "certified": bool(cert.certified),
         "cert_error": cert.primary_blocking_reason(),
-        "lookahead_blocked": bool(lookahead_reason),
-        "lookahead_reason": lookahead_reason,
+        "lookahead_blocked": bool(lookahead.reason),
+        "lookahead_reason": lookahead.reason,
+        # Advisory, never a rejection — see intake.lookahead_verifiability().
+        "lookahead_verifiable": not lookahead.inconclusive,
+        "lookahead_inconclusive_reason": lookahead.inconclusive,
+        "lookahead_comparisons": int(lookahead.comparisons),
+        "bounded_lookback": lookahead.bounded_lookback,
         "execution_crash_reason": execution_crash_reason,
     }
 
@@ -646,7 +659,11 @@ def validate_custom_module_isolated(
     that imports the module, builds the probe, certifies, and lookahead-scans it — so
     none of that untrusted code runs in the trusted parent. Returns
     ``{ok, type_name, default_params, canonical_params, asset, certified, cert_error,
-    lookahead_blocked, lookahead_reason}`` on success, or ``{ok: False, error}``.
+    lookahead_blocked, lookahead_reason, lookahead_verifiable,
+    lookahead_inconclusive_reason, lookahead_comparisons, bounded_lookback}`` on
+    success, or ``{ok: False, error}``. The four verifiability keys are ADVISORY —
+    ``lookahead_reason`` alone rejects; the rest tell the operator whether the green
+    tick was earned (``intake.lookahead_verifiability`` normalizes them).
     Raises :class:`StrategyWorkerError` on timeout / no result (fail closed)."""
     with tempfile.TemporaryDirectory(prefix="forven_validate_") as tmp:
         workdir = Path(tmp)

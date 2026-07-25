@@ -52,6 +52,28 @@ class CircuitBreaker:
 
             return False
 
+    def is_likely_available(self) -> bool:
+        """Read-only view of whether a call would be admitted. NEVER mutates.
+
+        ``can_execute()`` is a CONSUME operation, not a predicate: it performs the
+        OPEN->HALF_OPEN transition and, in HALF_OPEN, spends one of the
+        ``half_open_max_calls`` probe slots. Calling it just to *ask* a question
+        therefore steals the recovery budget from the caller that actually intends
+        to make the request — with ``half_open_max_calls=2`` on the price breaker,
+        two such probes exhaust the window and the real caller is refused, so the
+        breaker can never close and recovery stalls.
+
+        Use this when you only want to branch on breaker state; use
+        ``can_execute()`` only when you are about to make the call.
+        """
+        with self._lock:
+            if self.state == State.CLOSED:
+                return True
+            if self.state == State.OPEN:
+                # Would transition to HALF_OPEN on the next real can_execute().
+                return time.time() - self.last_failure_time >= self.recovery_timeout
+            return self.half_open_calls < self.half_open_max_calls
+
     def record_success(self) -> None:
         with self._lock:
             if self.state == State.HALF_OPEN:

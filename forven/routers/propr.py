@@ -106,6 +106,17 @@ def propr_get_mirror():
 
     The mirror is an observer: it copies roster strategies' trades onto the
     Propr account and never touches live/paper execution itself.
+
+    ``unmanaged`` (PROPR-RECONCILE-1) carries the last reconcile's ORPHANED venue
+    positions — real leveraged exposure on the challenge account that no mirror
+    state entry accounts for (a lost KV write, a hand-placed order). The mirror
+    already detects and records them; without surfacing them here the page showed
+    a tidy roster while the account carried positions nothing was watching.
+
+    ``halt`` carries ``anchor_source`` / ``daily_rule_fully_enforced`` (PROPR-ANCHOR-1)
+    so the challenge-rules panel can say "daily rule only PARTIALLY enforced today"
+    on a day whose opening balance we never observed, instead of drawing a gauge
+    that implies the venue's daily-loss rule is fully mirrored.
     """
     _require_enabled()
     from forven import propr_mirror
@@ -116,6 +127,7 @@ def propr_get_mirror():
         "candidates": propr_mirror.roster_candidates(),
         "state": propr_mirror.get_state(),
         "halt": propr_mirror.get_halt_state(),
+        "unmanaged": propr_mirror.get_unmanaged_state(),
     }
 
 
