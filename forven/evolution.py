@@ -588,14 +588,14 @@ def _compute_and_persist_robustness_score(strategy_id: str) -> float:
     """Recompute and persist the composite robustness score.
 
     Delegates to the single canonical, verdict-honoring scorer in
-    forven.routers.robustness (`_recalculate_robustness_score`) so there is exactly
+    forven.robustness.engine (`_recalculate_robustness_score`) so there is exactly
     ONE scoring formula and one set of metric keys feeding the promotion gate. The
     previous evolution-local scorer awarded partial credit (up to 20 pts) to tests
     whose own verdict was FAIL — it only skipped a test on status=='failed'/'error',
     never on the verdict — which inflated the gating composite. Returns the resulting
     0–100 composite (0.0 if it could not be computed).
     """
-    from forven.routers.robustness import _recalculate_robustness_score
+    from forven.robustness.engine import _recalculate_robustness_score
 
     _recalculate_robustness_score(strategy_id)
     with get_db() as conn:
@@ -929,17 +929,23 @@ def _execute_gauntlet_step(
         start_date = str(bt_row["start_date"] or "").strip() or None
         end_date = str(bt_row["end_date"] or "").strip() or None
 
-        from forven.routers.robustness import (
+        # ARCH-03: the validation suite is submitted through the robustness
+        # ENGINE, not through the HTTP endpoints. These are the same entry points
+        # the FastAPI routes delegate to, so the submitted work is identical —
+        # the evolution loop just no longer drags the web layer in to do it.
+        from forven.robustness.engine import (
+            run_cost_stress_submit,
+            run_monte_carlo_submit,
+            run_param_jitter_submit,
+            run_regime_split_submit,
+            run_walk_forward_submit,
+        )
+        from forven.robustness.models import (
             CostStressBody,
             MonteCarloBody,
             ParamJitterBody,
             RegimeSplitBody,
             WalkForwardBody,
-            submit_cost_stress,
-            submit_monte_carlo,
-            submit_param_jitter,
-            submit_regime_split,
-            submit_walk_forward,
         )
 
         robustness_results: dict[str, object] = {}
@@ -953,13 +959,13 @@ def _execute_gauntlet_step(
                     start_date=start_date,
                     end_date=end_date,
                 ),
-                submit_walk_forward,
+                run_walk_forward_submit,
             ),
-            ("monte_carlo", MonteCarloBody(result_id=result_id), submit_monte_carlo),
+            ("monte_carlo", MonteCarloBody(result_id=result_id), run_monte_carlo_submit),
             (
                 "param_jitter",
                 ParamJitterBody(strategy_id=strategy_id, result_id=result_id),
-                submit_param_jitter,
+                run_param_jitter_submit,
             ),
             (
                 "cost_stress",
@@ -970,9 +976,9 @@ def _execute_gauntlet_step(
                     start_date=start_date,
                     end_date=end_date,
                 ),
-                submit_cost_stress,
+                run_cost_stress_submit,
             ),
-            ("regime_split", RegimeSplitBody(result_id=result_id), submit_regime_split),
+            ("regime_split", RegimeSplitBody(result_id=result_id), run_regime_split_submit),
         ]
         for test_name, body, runner in submissions:
             try:

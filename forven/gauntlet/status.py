@@ -316,6 +316,15 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
     # strategies with no artifacts.
     composite = None
     try:
+        # ARCH-03 leftover: the scorer itself now lives in forven.robustness.engine
+        # and forven.routers.robustness only RE-EXPORTS it, so this is a shim hop —
+        # the last place the gauntlet still reaches up through the web layer.
+        # Repointing this line at `forven.robustness.engine` is the finishing move,
+        # but tests/test_gauntlet_status_live_composite.py monkeypatches
+        # `forven.routers.robustness.compute_composite_robustness_score`, and a
+        # monkeypatch on the shim does NOT rebind the engine's own global. Move both
+        # together or the four live-composite regression tests silently stop
+        # exercising anything.
         from forven.routers.robustness import compute_composite_robustness_score
 
         computed = compute_composite_robustness_score(strategy_id)

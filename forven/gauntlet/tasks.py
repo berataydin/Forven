@@ -1444,34 +1444,42 @@ def _baseline_backtest_result(strategy_id: str) -> dict[str, Any] | None:
     return _latest_backtest_result(sid)
 
 
-def _run_walk_forward(body) -> dict[str, Any]:
-    from forven.routers.robustness import post_walk_forward
+# ARCH-03: these call the robustness ENGINE directly. They used to import the
+# decorated FastAPI endpoints out of forven.routers.robustness, which meant the
+# autonomous gauntlet — the thing that decides whether a strategy reaches paper —
+# could not run its own validation suite without the web layer loaded. The
+# endpoints now delegate to these same entry points, so the HTTP path and the
+# gauntlet path remain byte-identical.
 
-    return post_walk_forward(body)
+
+def _run_walk_forward(body) -> dict[str, Any]:
+    from forven.robustness.engine import run_walk_forward_inline
+
+    return run_walk_forward_inline(body)
 
 
 def _run_monte_carlo(body) -> dict[str, Any]:
-    from forven.routers.robustness import post_monte_carlo
+    from forven.robustness.engine import run_monte_carlo_inline
 
-    return post_monte_carlo(body)
+    return run_monte_carlo_inline(body)
 
 
 def _run_parameter_jitter(body) -> dict[str, Any]:
-    from forven.routers.robustness import post_param_jitter
+    from forven.robustness.engine import run_param_jitter_inline
 
-    return post_param_jitter(body)
+    return run_param_jitter_inline(body)
 
 
 def _run_cost_stress(body) -> dict[str, Any]:
-    from forven.routers.robustness import post_cost_stress
+    from forven.robustness.engine import run_cost_stress_inline
 
-    return post_cost_stress(body)
+    return run_cost_stress_inline(body)
 
 
 def _run_regime_split(body) -> dict[str, Any]:
-    from forven.routers.robustness import post_regime_split
+    from forven.robustness.engine import run_regime_split_inline
 
-    return post_regime_split(body)
+    return run_regime_split_inline(body)
 
 
 def _required_tests(workflow: dict[str, Any]) -> list[str]:
@@ -1727,7 +1735,7 @@ def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
             start_date = None
             end_date = None
     try:
-        from forven.routers.robustness import WalkForwardBody
+        from forven.robustness.models import WalkForwardBody
 
         response = _run_walk_forward(
             WalkForwardBody(
@@ -1776,7 +1784,7 @@ def run_monte_carlo(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str,
             return skip
         return {"status": "blocked_data", "message": "Monte Carlo requires a persisted baseline backtest", "retryable": True}
     try:
-        from forven.routers.robustness import MonteCarloBody
+        from forven.robustness.models import MonteCarloBody
 
         response = _run_monte_carlo(MonteCarloBody(result_id=str(baseline["result_id"])))
     except Exception as exc:
@@ -1795,7 +1803,7 @@ def run_parameter_jitter(workflow: dict[str, Any], step: dict[str, Any]) -> dict
             return skip
         return {"status": "blocked_data", "message": "Parameter jitter requires a persisted baseline backtest", "retryable": True}
     try:
-        from forven.routers.robustness import ParamJitterBody
+        from forven.robustness.models import ParamJitterBody
 
         response = _run_parameter_jitter(
             ParamJitterBody(
@@ -1818,7 +1826,7 @@ def run_cost_stress(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str,
         return {"status": "blocked_runtime", "message": "strategy not found", "retryable": True}
     baseline = _baseline_backtest_result(str(row["id"]))
     try:
-        from forven.routers.robustness import CostStressBody
+        from forven.robustness.models import CostStressBody
 
         response = _run_cost_stress(
             CostStressBody(
@@ -1845,7 +1853,7 @@ def run_regime_split(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
             return skip
         return {"status": "blocked_data", "message": "Regime split requires a persisted baseline backtest", "retryable": True}
     try:
-        from forven.routers.robustness import RegimeSplitBody
+        from forven.robustness.models import RegimeSplitBody
 
         response = _run_regime_split(RegimeSplitBody(result_id=str(baseline["result_id"])))
     except Exception as exc:
