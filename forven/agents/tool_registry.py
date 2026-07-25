@@ -322,6 +322,62 @@ def _load_toolset_overrides(agent_id: str | None, context: str) -> dict[str, boo
     return out
 
 
+def _mcp_server_of(tool: ToolDef) -> str | None:
+    """The MCP server that registered *tool*, or None if it isn't stamped.
+
+    ``mcp_client.register_server_tools`` puts ``mcp:<server>`` in every MCP
+    ToolDef's ``permissions`` (that entry is also how per-agent grants are
+    checked), so the server is recorded EXACTLY rather than having to be guessed
+    back out of the tool name.
+    """
+    for perm in tool.permissions or frozenset():
+        if not isinstance(perm, str) or not perm.startswith("mcp:"):
+            continue
+        server = perm[len("mcp:"):].strip()
+        if server and server != "*":
+            return server
+    return None
+
+
+def _mcp_server_override_key(tool: ToolDef, overrides: dict[str, bool]) -> str | None:
+    """Return the ``mcp:<server>`` rule key that governs *tool*, or None.
+
+    AI-05 (audit 2026-07-25): MCP tools are registered as ``mcp_<server>_<tool>``
+    (``mcp_client._mcp_tool_name``) but this resolver used to recover the server
+    by splitting the name on ``__`` — a separator the registrar never emits. The
+    split therefore yielded the WHOLE ``<server>_<tool>`` string, no
+    ``mcp:<server>`` rule ever matched, and an operator's per-server disable was
+    silently inert (only the ``mcp:*`` wildcard ever fired).
+
+    The first fix for that prefix-matched the rule keys against the tool NAME,
+    which is fail-OPEN: ``mcp_<server>_<tool>`` is genuinely ambiguous (server
+    names may contain underscores), so with ``{'mcp:*': False, 'mcp:jira': True}``
+    the tool ``mcp_jira_prod_create_issue`` — server ``jira_prod`` — matched the
+    ``jira`` rule and re-enabled a DIFFERENT server's whole tool surface. Read the
+    server off the ToolDef instead: it is recorded, not inferable.
+
+    ToolDefs that carry no ``mcp:<server>`` stamp (hand-built ones; nothing in
+    the app registers MCP tools any other way) fall back to a prefix scan that
+    honours DENY rules only. Ambiguity there can no longer grant access — at
+    worst an operator's disable is applied to a neighbouring server, and an
+    enable falls through to ``mcp:*`` / category / the context default.
+    """
+    server = _mcp_server_of(tool)
+    if server is not None:
+        key = f"mcp:{server}"
+        return key if key in overrides else None
+
+    for candidate in sorted(overrides, key=len, reverse=True):
+        if not candidate.startswith("mcp:") or overrides[candidate]:
+            continue
+        candidate_server = candidate[len("mcp:"):]
+        if not candidate_server or candidate_server == "*":
+            continue
+        if tool.name.startswith(f"mcp_{candidate_server}_"):
+            return candidate
+    return None
+
+
 def _resolve_tool_enabled(
     tool: ToolDef,
     overrides: dict[str, bool],
@@ -332,15 +388,10 @@ def _resolve_tool_enabled(
         return overrides[tool.name]
 
     if tool.name.startswith("mcp_"):
-        # MCP tools are registered as ``mcp_<server>__<tool>``.
-        # Allow either ``mcp:<server>`` or ``mcp:*`` rules.
-        try:
-            after_prefix = tool.name[len("mcp_"):]
-            server = after_prefix.split("__", 1)[0]
-        except Exception:
-            server = ""
-        if server and f"mcp:{server}" in overrides:
-            return overrides[f"mcp:{server}"]
+        # Allow either ``mcp:<server>`` or ``mcp:*`` rules (AI-05).
+        server_key = _mcp_server_override_key(tool, overrides)
+        if server_key is not None:
+            return overrides[server_key]
         if "mcp:*" in overrides:
             return overrides["mcp:*"]
 
@@ -443,11 +494,12 @@ def compute_effective_toolset(
             enabled = overrides[tool.name]
             source = f"override:tool:{tool.name}"
         elif tool.name.startswith("mcp_"):
-            after_prefix = tool.name[len("mcp_"):]
-            server = after_prefix.split("__", 1)[0] if "__" in after_prefix else ""
-            if server and f"mcp:{server}" in overrides:
-                enabled = overrides[f"mcp:{server}"]
-                source = f"override:mcp:{server}"
+            # AI-05: same server resolution as _resolve_tool_enabled — the matrix
+            # preview must show exactly what the runtime filter will do.
+            server_key = _mcp_server_override_key(tool, overrides)
+            if server_key is not None:
+                enabled = overrides[server_key]
+                source = f"override:{server_key}"
             elif "mcp:*" in overrides:
                 enabled = overrides["mcp:*"]
                 source = "override:mcp:*"
