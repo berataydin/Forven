@@ -44,6 +44,13 @@ _APPLY_LOCK = threading.Lock()
 
 _FETCH_TIMEOUT_S = 60
 _GIT_TIMEOUT_S = 30
+# The update banner calls several short-lived git commands in one check.  A
+# console-subsystem executable launched by the windowless backend can otherwise
+# create a visible console for each command on Windows, producing a burst of
+# flashing command-prompt windows during page startup.
+_GIT_CREATION_FLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+)
 
 
 def _repo_root() -> Path:
@@ -83,6 +90,7 @@ def _git(*args: str, timeout: int = _GIT_TIMEOUT_S, check: bool = True) -> subpr
             check=False,
             shell=False,
             timeout=timeout,
+            creationflags=_GIT_CREATION_FLAGS,
         )
     except FileNotFoundError as exc:  # git not installed / not on PATH
         raise RuntimeError("git executable not found on PATH") from exc
