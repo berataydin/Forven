@@ -2992,7 +2992,16 @@ def _run_migrations(conn: sqlite3.Connection):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_notification_deliveries_notification_id ON notification_deliveries (notification_id)"
     )
-    # Ensure strategy_candidates table exists for existing databases
+    # Ensure strategy_candidates table exists for existing databases.
+    #
+    # ARCH-07 (2026-07-25): the strategy_candidates CRUD block in this module was
+    # deleted as verified-dead code — nothing in forven/, tests/, scripts/ or the
+    # frontend read or wrote this table, and it holds 0 rows in the live DB. The
+    # DDL is DELIBERATELY retained: the backup/restore domain map at the top of
+    # this file still lists `strategy_candidates` among the "strategies" domain
+    # tables, so dropping it here would make domain backups reference a table that
+    # does not exist on fresh databases. Dropping the table is a separate,
+    # data-affecting decision — do not fold it into a refactor.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS strategy_candidates (
             id TEXT PRIMARY KEY,
@@ -4317,7 +4326,7 @@ def get_open_trades(exclude_bots: bool = False) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def create_approval(
+def insert_approval(
     approval_type: str,
     target_type: str = "strategy",
     target_id: str | None = None,
@@ -4330,30 +4339,25 @@ def create_approval(
     decision: str | None = None,
     error: str | None = None,
     owner: str = "ceo",
+    expires_at: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> int:
-    """Create an approval request and return its ID.
+    """Storage primitive: INSERT one approval row and return its ID.
 
-    Phase 5 / P5-T04: also writes ``expires_at`` based on per-category default
-    deadlines from approval-mode settings, and triggers smart classification
-    if the category is in ``smart`` mode (best-effort — failures don't block
-    the insert).
+    Pure storage — this deliberately knows nothing about approval *workflow*
+    (deadline policy, smart classification, mode-driven auto-approve). That
+    logic lives one layer up in :mod:`forven.control_plane.approvals`, which is
+    allowed to import this module; the reverse direction is what put the
+    storage layer inside the import cycle. Callers that want the full workflow
+    should call ``forven.control_plane.approvals.create_approval``.
+
+    ``expires_at`` is accepted as data: the deadline is *computed* by the
+    control plane and merely *recorded* here.
     """
     now = _now()
     payload_json = _serialize_json_value(payload)
     resolved_owner = _normalize_approval_owner(owner) or "ceo"
     norm_type = approval_type.strip().lower()
-
-    # Phase 5: compute expires_at from deadline settings.
-    expires_at = None
-    try:
-        from forven.control_plane.approval_modes import get_deadline_hours
-        from datetime import datetime, timedelta, timezone
-
-        hours = get_deadline_hours(norm_type)
-        expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    except Exception:
-        expires_at = None
 
     def _insert(target_conn: sqlite3.Connection) -> int:
         target_conn.execute(
@@ -4384,57 +4388,99 @@ def create_approval(
         return int(row["approval_id"])
 
     if conn is not None:
-        approval_id = _insert(conn)
-    else:
-        with get_db() as managed_conn:
-            approval_id = _insert(managed_conn)
+        return _insert(conn)
+    with get_db() as managed_conn:
+        return _insert(managed_conn)
 
-    # Phase 5: apply smart-approval mode best-effort. Errors don't bubble.
-    #
-    # Only run auto-apply when create_approval owns the transaction (conn is
-    # None, so the insert above is already committed). When a caller passes its
-    # own conn the row is still uncommitted and the caller may be holding the
-    # WAL write lock across a larger transaction -- e.g. transition_stage's
-    # promotion gate, which reaches here via policy._queue_challenger_dethrone.
-    # Auto-apply opens *separate* connections (apply_smart_decision /
-    # post_approve_approval) whose writes would block on that held lock up to
-    # the 60s busy_timeout. Defer to the caller: it commits, and any auto-apply
-    # happens later outside the lock.
-    if conn is None:
-        try:
-            from forven.control_plane.approval_modes import (
-                get_mode,
-                is_off_allowed,
-            )
 
-            mode = get_mode(norm_type)
-            if mode == "smart":
-                from forven.control_plane.smart_approval import apply_smart_decision
-                apply_smart_decision(approval_id, "smart")
-            elif mode == "off" and is_off_allowed(norm_type):
-                # Direct auto-approve with no classifier — only for safe categories.
-                from forven.control_plane.approvals import post_approve_approval
-                from forven.control_plane.models import ApprovalDecisionBody
-                try:
-                    post_approve_approval(
-                        int(approval_id),
-                        ApprovalDecisionBody(
-                            actor="system:approval_mode_off",
-                            feedback=f"Auto-approved (mode=off) for safe category {norm_type}",
-                        ),
-                    )
-                    with get_db() as c2:
-                        c2.execute(
-                            "UPDATE approvals SET auto_approved = 1 WHERE id = ?",
-                            (int(approval_id),),
-                        )
-                except Exception:
-                    pass
-        except Exception:
-            # Mode-application failure must never block the approval insert.
-            pass
+def mark_approval_auto_approved(approval_id: int) -> None:
+    """Storage primitive: stamp the ``auto_approved`` audit flag on one row.
 
-    return approval_id
+    Written by the control plane after a mode-driven auto-approve so the UI can
+    distinguish "a human clicked approve" from "policy approved this for you".
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE approvals SET auto_approved = 1 WHERE id = ?",
+            (int(approval_id),),
+        )
+
+
+def create_approval(
+    approval_type: str,
+    target_type: str = "strategy",
+    target_id: str | None = None,
+    requested_status: str | None = None,
+    status: str = "pending_approval",
+    actor: str | None = None,
+    reason: str | None = None,
+    payload: object | None = None,
+    feedback: str | None = None,
+    decision: str | None = None,
+    error: str | None = None,
+    owner: str = "ceo",
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """DEPRECATED compatibility shim — call
+    ``forven.control_plane.approvals.create_approval`` instead.
+
+    The approval *workflow* (Phase 5 deadline computation, smart
+    classification, mode='off' auto-approve) used to run here, inside the
+    storage layer: db.py reached up into ``control_plane.approval_modes``,
+    ``control_plane.smart_approval``, ``control_plane.approvals`` and
+    ``control_plane.models`` from inside this function body. That is a layering
+    inversion — storage should RECORD an approval decision, not DECIDE one and
+    certainly not invoke the HTTP-layer handler. The workflow now lives in
+    ``forven.control_plane.approvals.create_approval``; :func:`insert_approval`
+    is the storage primitive it writes through.
+
+    This shim exists only so the seven existing importers
+    (brain, policy, crucibles, agents.tools_brain, lab_matrix_engine,
+    live_graduation, plus tests) keep working untouched. Point new code at the
+    control-plane function.
+    """
+    try:
+        from forven.control_plane.approvals import (
+            create_approval as _control_plane_create_approval,
+        )
+    except Exception:
+        # Control plane unavailable. Degrade to a storage-only insert, which is
+        # exactly what the pre-split code did when its own guarded imports of
+        # control_plane failed: the row still lands, with expires_at NULL and no
+        # mode application. An approval insert must never fail because the
+        # workflow layer is unimportable.
+        return insert_approval(
+            approval_type,
+            target_type=target_type,
+            target_id=target_id,
+            requested_status=requested_status,
+            status=status,
+            actor=actor,
+            reason=reason,
+            payload=payload,
+            feedback=feedback,
+            decision=decision,
+            error=error,
+            owner=owner,
+            expires_at=None,
+            conn=conn,
+        )
+
+    return _control_plane_create_approval(
+        approval_type,
+        target_type=target_type,
+        target_id=target_id,
+        requested_status=requested_status,
+        status=status,
+        actor=actor,
+        reason=reason,
+        payload=payload,
+        feedback=feedback,
+        decision=decision,
+        error=error,
+        owner=owner,
+        conn=conn,
+    )
 
 
 def get_approval(approval_id: int) -> dict | None:
@@ -6742,175 +6788,6 @@ def migrate_from_openclaw(data_dir: Path):
     console.print("[bold green]SQLite migration complete[/bold green]")
 
 
-# ── Strategy Candidates CRUD ──────────────────────────────────────────────────
-
-
-def _candidate_row_to_dict(row: sqlite3.Row) -> dict:
-    """Convert a strategy_candidates row to the JSON shape the frontend expects."""
-    d = dict(row)
-    d["promoted"] = bool(d.get("promoted"))
-    d["archived"] = bool(d.get("archived"))
-    qm = d.pop("quick_metrics_json", None)
-    d["quick_metrics"] = _parse_json_value(qm)
-    return d
-
-
-def list_candidates(
-    source: str | None = None,
-    promoted: bool | None = None,
-    archived: bool = False,
-    limit: int = 200,
-) -> list[dict]:
-    filters: list[str] = []
-    params: list = []
-    if source:
-        filters.append("source = ?")
-        params.append(source)
-    if promoted is not None:
-        filters.append("promoted = ?")
-        params.append(1 if promoted else 0)
-    filters.append("archived = ?")
-    params.append(1 if archived else 0)
-    where = f" WHERE {' AND '.join(filters)}" if filters else ""
-    params.append(max(int(limit), 0))
-    with get_db() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM strategy_candidates{where} ORDER BY created_at DESC LIMIT ?",
-            tuple(params),
-        ).fetchall()
-    return [_candidate_row_to_dict(r) for r in rows]
-
-
-def create_candidate(
-    name: str,
-    source: str = "user",
-    source_ref: str | None = None,
-    definition_json: str | None = None,
-    quick_metrics_json: str | None = None,
-    tags: str | None = None,
-    archived: bool = False,
-) -> dict:
-    cid = str(uuid4())
-    now = _now()
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO strategy_candidates
-            (id, name, source, source_ref, definition_json, quick_metrics_json, promoted, archived, tags, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
-            (cid, name, source, source_ref, definition_json, quick_metrics_json, 1 if archived else 0, tags, now, now),
-        )
-        row = conn.execute("SELECT * FROM strategy_candidates WHERE id = ?", (cid,)).fetchone()
-    return _candidate_row_to_dict(row)
-
-
-def get_candidate(cid: str) -> dict | None:
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM strategy_candidates WHERE id = ?", (cid,)).fetchone()
-    return _candidate_row_to_dict(row) if row else None
-
-
-def update_candidate(cid: str, **kwargs) -> dict | None:
-    allowed = {"name", "quick_metrics_json", "tags", "archived", "promoted", "promoted_at", "source", "source_ref", "definition_json"}
-    sets: list[str] = ["updated_at = ?"]
-    values: list = [_now()]
-    for k, v in kwargs.items():
-        if k not in allowed:
-            continue
-        if k == "archived":
-            sets.append("archived = ?")
-            values.append(1 if v else 0)
-        elif k == "promoted":
-            sets.append("promoted = ?")
-            values.append(1 if v else 0)
-        else:
-            sets.append(f"{k} = ?")
-            values.append(v)
-    values.append(cid)
-    with get_db() as conn:
-        conn.execute(f"UPDATE strategy_candidates SET {', '.join(sets)} WHERE id = ?", tuple(values))
-        row = conn.execute("SELECT * FROM strategy_candidates WHERE id = ?", (cid,)).fetchone()
-    return _candidate_row_to_dict(row) if row else None
-
-
-def delete_candidate(cid: str) -> bool:
-    with get_db() as conn:
-        conn.execute("DELETE FROM strategy_candidates WHERE id = ?", (cid,))
-        return conn.total_changes > 0
-
-
-def batch_action_candidates(ids: list[str], action: str) -> int:
-    if not ids:
-        return 0
-    now = _now()
-    placeholders = ",".join("?" for _ in ids)
-    with get_db() as conn:
-        if action == "archive":
-            conn.execute(f"UPDATE strategy_candidates SET archived = 1, updated_at = ? WHERE id IN ({placeholders})", (now, *ids))
-        elif action == "restore":
-            conn.execute(f"UPDATE strategy_candidates SET archived = 0, updated_at = ? WHERE id IN ({placeholders})", (now, *ids))
-        elif action == "promote":
-            conn.execute(
-                f"UPDATE strategy_candidates SET promoted = 1, promoted_at = ?, updated_at = ? WHERE id IN ({placeholders})",
-                (now, now, *ids),
-            )
-        elif action == "demote":
-            conn.execute(
-                f"UPDATE strategy_candidates SET promoted = 0, promoted_at = NULL, updated_at = ? WHERE id IN ({placeholders})",
-                (now, *ids),
-            )
-        elif action == "delete":
-            conn.execute(f"DELETE FROM strategy_candidates WHERE id IN ({placeholders})", tuple(ids))
-        else:
-            return 0
-        return conn.total_changes
-
-
-def reconcile_core_candidates() -> dict:
-    """Sync built-in strategies from scanner.STRATEGIES into strategy_candidates (idempotent)."""
-    from forven.scanner import STRATEGIES
-
-    inserted = 0
-    existing = 0
-    now = _now()
-    with get_db() as conn:
-        for key, strat in STRATEGIES.items():
-            row = conn.execute(
-                "SELECT id FROM strategy_candidates WHERE source = 'core' AND source_ref = ?",
-                (key,),
-            ).fetchone()
-            if row:
-                existing += 1
-                continue
-            cid = str(uuid4())
-            definition = json.dumps({
-                "type": strat.get("type"),
-                "asset": strat.get("asset"),
-                "params": strat.get("params"),
-            })
-            metrics = {}
-            if strat.get("fitness_v1") is not None:
-                metrics["fitness_v1"] = strat["fitness_v1"]
-            if strat.get("fitness_v2") is not None:
-                metrics["fitness_v2"] = strat["fitness_v2"]
-            conn.execute(
-                """INSERT INTO strategy_candidates
-                (id, name, source, source_ref, definition_json, quick_metrics_json, promoted, archived, tags, created_at, updated_at)
-                VALUES (?, ?, 'core', ?, ?, ?, 0, 0, ?, ?, ?)""",
-                (
-                    cid,
-                    strat.get("name", key),
-                    key,
-                    definition,
-                    json.dumps(metrics) if metrics else None,
-                    f"core,{strat.get('type', '')}",
-                    now,
-                    now,
-                ),
-            )
-            inserted += 1
-    return {"inserted": inserted, "existing": existing}
-
-
 # ---------------------------------------------------------------------------
 # Best symbol/timeframe resolution from backtest results
 # ---------------------------------------------------------------------------
@@ -7266,267 +7143,6 @@ def mark_backtest_failed(strategy_id: str, failure_type: str, reason: str) -> No
             WHERE id = ?""",
             (f"\n[BACKTEST_FAILED] {failure_type}: {reason} at {now}", now, strategy_id)
         )
-
-
-# =============================================================================
-# GHOST STRATEGY PIPELINE INTEGRITY FUNCTIONS
-# =============================================================================
-# Added 2026-03-12 to fix ghost strategy bug (S00370/S00371)
-
-def verify_strategy_exists(strategy_id: str) -> bool:
-    """
-    Verify that a strategy ID actually exists in the database.
-    Returns True if strategy exists, False otherwise.
-    Use before any strategy operation to prevent ghost strategy bugs.
-    """
-    if not strategy_id:
-        return False
-    normalized_id = str(strategy_id).strip().upper()
-    with get_db() as conn:
-        # Check strategies table
-        row = conn.execute(
-            "SELECT 1 FROM strategies WHERE id = ?",
-            (normalized_id,),
-        ).fetchone()
-        if row:
-            return True
-        # Also check archived_strategies
-        row = conn.execute(
-            "SELECT 1 FROM archived_strategies WHERE id = ?",
-            (normalized_id,),
-        ).fetchone()
-        return row is not None
-
-
-def check_id_gap(threshold: int = 50) -> dict:
-    """
-    Check for gaps between container counter and actual max strategy ID.
-    Returns dict with gap info. Alerts when gap > threshold.
-    """
-    with get_db() as conn:
-        # Get current counter
-        counter_row = conn.execute(
-            "SELECT next_val FROM container_counters WHERE prefix = 'S'"
-        ).fetchone()
-        counter_val = int(counter_row["next_val"]) if counter_row else 1
-
-        # Get max actual ID from strategies
-        max_row = conn.execute(
-            "SELECT MAX(CAST(SUBSTR(id, 2) AS INTEGER)) as max_id FROM strategies"
-        ).fetchone()
-        max_id = int(max_row["max_id"]) if max_row and max_row["max_id"] else 0
-
-        # Get max from archived too
-        max_archived_row = conn.execute(
-            "SELECT MAX(CAST(SUBSTR(id, 2) AS INTEGER)) as max_id FROM archived_strategies"
-        ).fetchone()
-        max_archived = int(max_archived_row["max_id"]) if max_archived_row and max_archived_row["max_id"] else 0
-
-        actual_max = max(max_id, max_archived)
-        gap = counter_val - actual_max - 1
-
-        return {
-            "counter_next": counter_val,
-            "max_active_id": max_id,
-            "max_archived_id": max_archived,
-            "actual_max_id": actual_max,
-            "gap": gap,
-            "alert": gap > threshold,
-            "threshold": threshold
-        }
-
-
-def reconcile_strategy_list(display_ids: list[str]) -> dict:
-    """
-    Reconcile a display list of strategy IDs with actual database.
-    Returns dict with validation results.
-    """
-    valid_ids = []
-    ghost_ids = []
-    archived_ids = []
-
-    with get_db() as conn:
-        for sid in display_ids:
-            normalized = str(sid).strip().upper()
-            if not normalized.startswith("S"):
-                continue
-
-            # Check strategies table
-            row = conn.execute(
-                "SELECT 1 FROM strategies WHERE id = ?", (normalized,)
-            ).fetchone()
-            if row:
-                valid_ids.append(normalized)
-                continue
-
-            # Check archived
-            row = conn.execute(
-                "SELECT 1 FROM archived_strategies WHERE id = ?", (normalized,)
-            ).fetchone()
-            if row:
-                archived_ids.append(normalized)
-                continue
-
-            # Not found = ghost
-            ghost_ids.append(normalized)
-
-    return {
-        "valid_count": len(valid_ids),
-        "archived_count": len(archived_ids),
-        "ghost_count": len(ghost_ids),
-        "valid_ids": valid_ids,
-        "archived_ids": archived_ids,
-        "ghost_ids": ghost_ids,
-        "is_clean": len(ghost_ids) == 0
-    }
-
-
-def sync_container_counters() -> dict:
-    """
-    Synchronize container counters with actual max IDs in database.
-    Call this during startup or after detecting inconsistencies.
-    """
-    results = {}
-
-    with get_db() as conn:
-        for prefix in ['S', 'H', 'B', 'T', 'E']:
-            # Get max ID for this prefix
-            if prefix == 'S':
-                # Strategies - check both active and archived
-                max_row = conn.execute(
-                    "SELECT MAX(CAST(SUBSTR(id, 2) AS INTEGER)) as max_id FROM strategies"
-                ).fetchone()
-                max_archived = conn.execute(
-                    "SELECT MAX(CAST(SUBSTR(id, 2) AS INTEGER)) as max_id FROM archived_strategies"
-                ).fetchone()
-                max_id = max(
-                    int(max_row["max_id"]) if max_row and max_row["max_id"] else 0,
-                    int(max_archived["max_id"]) if max_archived and max_archived["max_id"] else 0
-                )
-            elif prefix == 'H':
-                rows = conn.execute(
-                    "SELECT display_id FROM hypotheses WHERE display_id IS NOT NULL AND TRIM(display_id) <> ''"
-                ).fetchall()
-                max_id = 0
-                for row in rows:
-                    parsed = _extract_numeric_suffix(row["display_id"], expected_prefix="H")
-                    if parsed is not None:
-                        max_id = max(max_id, parsed)
-            elif prefix == 'B':
-                max_row = conn.execute(
-                    "SELECT MAX(CAST(SUBSTR(result_id, 2) AS INTEGER)) as max_id FROM backtest_results"
-                ).fetchone()
-                max_id = int(max_row["max_id"]) if max_row and max_row["max_id"] else 0
-            elif prefix == 'T':
-                max_row = conn.execute(
-                    "SELECT MAX(CAST(SUBSTR(id, 2) AS INTEGER)) as max_id FROM tasks"
-                ).fetchone()
-                max_id = int(max_row["max_id"]) if max_row and max_row["max_id"] else 0
-            else:
-                max_id = 0
-
-            next_val = max_id + 1
-
-            # Update counter
-            existing = conn.execute(
-                "SELECT 1 FROM container_counters WHERE prefix = ?", (prefix,)
-            ).fetchone()
-
-            if existing:
-                conn.execute(
-                    "UPDATE container_counters SET next_val = ? WHERE prefix = ?",
-                    (next_val, prefix)
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO container_counters (prefix, next_val) VALUES (?, ?)",
-                    (prefix, next_val)
-                )
-
-            results[prefix] = {
-                "max_id": f"{prefix}{max_id:05d}",
-                "next_val": next_val
-            }
-
-    return results
-
-
-def pipeline_completion_verify(strategy_id: str) -> tuple[bool, str]:
-    """
-    Verify that a strategy pipeline operation completed successfully.
-    Returns (success, message) tuple.
-    Use after strategy creation to ensure it was persisted.
-    """
-    if not strategy_id:
-        return False, "No strategy_id provided"
-
-    normalized = str(strategy_id).strip().upper()
-
-    with get_db() as conn:
-        # Check strategies table
-        row = conn.execute(
-            "SELECT id, name, stage FROM strategies WHERE id = ?",
-            (normalized,)
-        ).fetchone()
-
-        if row:
-            return True, f"Strategy {normalized} verified in database (stage: {row['stage']})"
-
-        # Check archived
-        row = conn.execute(
-            "SELECT id, archived_at FROM archived_strategies WHERE id = ?",
-            (normalized,)
-        ).fetchone()
-
-        if row:
-            return False, f"Strategy {normalized} was archived - pipeline did not complete"
-
-        # Check counter to see if ID was allocated but not persisted
-        counter_row = conn.execute(
-            "SELECT next_val FROM container_counters WHERE prefix = 'S'"
-        ).fetchone()
-
-        if counter_row:
-            counter_val = int(counter_row["next_val"])
-            requested_num = int(normalized[1:])
-
-            if requested_num < counter_val:
-                return False, f"GHOST STRATEGY: {normalized} was allocated ID but not persisted. Counter at {counter_val}"
-
-        return False, f"Strategy {normalized} does not exist in database"
-
-
-def log_pipeline_event(
-    event_type: str,
-    strategy_id: str | None,
-    details: dict,
-    actor: str = "system"
-) -> None:
-    """
-    Log a pipeline event for auditing and debugging.
-    Helps trace ghost strategy issues.
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO strategy_events
-               (strategy_id, from_state, to_state, actor, reason, details_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                strategy_id or "SYSTEM",
-                None,
-                event_type,
-                actor,
-                details.get("reason", ""),
-                json.dumps(details),
-                now
-            )
-        )
-
-
-# =============================================================================
-# END GHOST STRATEGY PIPELINE INTEGRITY FUNCTIONS
-# =============================================================================
 
 
 # ── GHOST CONTAINER DETECTION GUARDRAILS ────────────────────────────────────────

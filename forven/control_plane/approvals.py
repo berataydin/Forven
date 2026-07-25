@@ -1,6 +1,7 @@
 import json
+import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -12,11 +13,19 @@ from forven.db import (
     create_task_container,
     get_approval,
     get_db,
+    insert_approval,
     list_approvals,
     log_activity,
+    mark_approval_auto_approved,
     update_approval,
 )
 
+# Imported as MODULES, not as names. Both were previously reached by
+# function-local `from ... import name` statements inside forven.db; binding the
+# module keeps the same late lookup, so tests that patch e.g.
+# forven.control_plane.smart_approval.apply_smart_decision still intercept the
+# call.
+from forven.control_plane import approval_modes, smart_approval
 from forven.control_plane.models import (
     ApprovalDecisionBody,
     ApprovalHandoffBody,
@@ -634,6 +643,99 @@ def _apply_regime_champion_promotion(
         raise HTTPException(status_code=400, detail=f"Failed to apply champion promotion: {exc}") from exc
 
     return result
+
+
+def create_approval(
+    approval_type: str,
+    target_type: str = "strategy",
+    target_id: str | None = None,
+    requested_status: str | None = None,
+    status: str = "pending_approval",
+    actor: str | None = None,
+    reason: str | None = None,
+    payload: object | None = None,
+    feedback: str | None = None,
+    decision: str | None = None,
+    error: str | None = None,
+    owner: str = "ceo",
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Create an approval request and return its ID.
+
+    Phase 5 / P5-T04: also writes ``expires_at`` based on per-category default
+    deadlines from approval-mode settings, and triggers smart classification
+    if the category is in ``smart`` mode (best-effort — failures don't block
+    the insert).
+
+    This is the WORKFLOW entry point. It used to live in ``forven.db`` and
+    reached back up into this module (and approval_modes / smart_approval /
+    models) through function-local imports; the storage layer decided approvals
+    and called the HTTP-layer handler. It now sits where it belongs, writing
+    through the ``forven.db.insert_approval`` storage primitive.
+    ``forven.db.create_approval`` remains as a deprecated shim that delegates
+    here so existing importers keep working.
+    """
+    norm_type = approval_type.strip().lower()
+
+    # Phase 5: compute expires_at from deadline settings.
+    expires_at = None
+    try:
+        hours = approval_modes.get_deadline_hours(norm_type)
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    except Exception:
+        expires_at = None
+
+    approval_id = insert_approval(
+        norm_type,
+        target_type=target_type,
+        target_id=target_id,
+        requested_status=requested_status,
+        status=status,
+        actor=actor,
+        reason=reason,
+        payload=payload,
+        feedback=feedback,
+        decision=decision,
+        error=error,
+        owner=owner,
+        expires_at=expires_at,
+        conn=conn,
+    )
+
+    # Phase 5: apply smart-approval mode best-effort. Errors don't bubble.
+    #
+    # Only run auto-apply when create_approval owns the transaction (conn is
+    # None, so the insert above is already committed). When a caller passes its
+    # own conn the row is still uncommitted and the caller may be holding the
+    # WAL write lock across a larger transaction -- e.g. transition_stage's
+    # promotion gate, which reaches here via policy._queue_challenger_dethrone.
+    # Auto-apply opens *separate* connections (apply_smart_decision /
+    # post_approve_approval) whose writes would block on that held lock up to
+    # the 60s busy_timeout. Defer to the caller: it commits, and any auto-apply
+    # happens later outside the lock.
+    if conn is None:
+        try:
+            mode = approval_modes.get_mode(norm_type)
+            if mode == "smart":
+                smart_approval.apply_smart_decision(approval_id, "smart")
+            elif mode == "off" and approval_modes.is_off_allowed(norm_type):
+                # Direct auto-approve with no classifier — only for safe categories.
+                try:
+                    post_approve_approval(
+                        int(approval_id),
+                        ApprovalDecisionBody(
+                            actor="system:approval_mode_off",
+                            feedback=f"Auto-approved (mode=off) for safe category {norm_type}",
+                        ),
+                    )
+                    mark_approval_auto_approved(int(approval_id))
+                except Exception:
+                    pass
+        except Exception:
+            # Mode-application failure must never block the approval insert.
+            pass
+
+    return approval_id
 
 
 def get_approvals_list(
