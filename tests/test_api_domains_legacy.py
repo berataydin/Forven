@@ -1,70 +1,55 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, WebSocket
+import pytest
+from fastapi import WebSocket
 from fastapi.testclient import TestClient
 
-from forven.routers.legacy import router as legacy_router
+from forven.api import app
 
 
-def test_legacy_forven_get_routes_dashboard(monkeypatch):
+# API-05: these tests used to mount a bare ``FastAPI()`` with only the legacy
+# router included. That app has NO middleware, so the `/api/forven/*` HTTP routes
+# matched there and the suite certified nine handlers that production could never
+# reach — ForvenV1CompatMiddleware rewrites the path to `/api/*` before routing.
+# Everything below now drives the real ``forven.api:app`` so the middleware is in
+# the loop, which is the only way these assertions mean anything.
+@pytest.fixture
+def client(forven_db):
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_legacy_prefix_is_rewritten_to_the_canonical_route(client, monkeypatch):
+    """`/api/forven/<x>` reaches the CANONICAL handler, not a legacy shim."""
     monkeypatch.setattr(
-        "forven.api_domains.legacy.control_plane_status.get_dashboard",
+        "forven.control_plane.status.get_dashboard",
         lambda require_account_connection=True: {"execution_mode": "paper", "daemon_running": True},
     )
-
-    app = FastAPI()
-    app.include_router(legacy_router)
-    client = TestClient(app)
 
     response = client.get("/api/forven/dashboard")
 
     assert response.status_code == 200
     assert response.json()["execution_mode"] == "paper"
+    # The middleware — not a per-route helper — stamps the sunset headers.
     assert response.headers["Deprecation"] == "true"
     assert "Sunset" in response.headers
+    assert response.headers["X-Forven-Legacy-Route"] == "/api/forven/dashboard"
 
 
-def test_legacy_model_policy_route_delegates(monkeypatch):
-    captured: dict[str, object] = {}
+def test_legacy_http_routes_are_gone_from_the_router():
+    """The nine unreachable `/api/forven/*` HTTP routes must not come back."""
+    from forven.api import iter_effective_routes
 
-    def _fake_put_legacy_model_policy(body):
-        captured["provider_priority"] = body.provider_priority
-        return {"ok": True}
-
-    monkeypatch.setattr("forven.routers.legacy.legacy_domain.put_legacy_model_policy", _fake_put_legacy_model_policy)
-
-    app = FastAPI()
-    app.include_router(legacy_router)
-    client = TestClient(app)
-
-    response = client.put("/api/forven/model-policy", json={"provider_priority": ["openai", "minimax"]})
-
-    assert response.status_code == 200
-    assert captured["provider_priority"] == ["openai", "minimax"]
-    assert response.headers["Deprecation"] == "true"
+    legacy_http = sorted(
+        f"{method} {path}"
+        for method, path in iter_effective_routes(app.routes)
+        if path.startswith("/api/forven/") and method != "WEBSOCKET"
+    )
+    assert legacy_http == [], f"unreachable legacy HTTP routes re-registered: {legacy_http}"
 
 
-def test_legacy_agent_patch_route_delegates(monkeypatch):
-    captured: dict[str, object] = {}
+def test_legacy_websocket_route_survives_the_middleware(client, monkeypatch):
+    """WS handshakes are a `websocket` scope, so the rewrite never sees them."""
 
-    def _fake_patch(agent_id: str, body):
-        captured["agent_id"] = agent_id
-        captured["name"] = body.name
-        return {"ok": True}
-
-    monkeypatch.setattr("forven.routers.legacy.legacy_domain.legacy_patch_agent", _fake_patch)
-
-    app = FastAPI()
-    app.include_router(legacy_router)
-    client = TestClient(app)
-
-    response = client.patch("/api/forven/agents/brain", json={"name": "Brain 2"})
-
-    assert response.status_code == 200
-    assert captured == {"agent_id": "brain", "name": "Brain 2"}
-
-
-def test_legacy_websocket_mount_delegates(monkeypatch):
     async def _fake_legacy_websocket_endpoint(ws: WebSocket):
         await ws.accept()
         await ws.send_text("legacy-ok")
@@ -74,10 +59,6 @@ def test_legacy_websocket_mount_delegates(monkeypatch):
         "forven.routers.legacy.legacy_domain.legacy_websocket_endpoint",
         _fake_legacy_websocket_endpoint,
     )
-
-    app = FastAPI()
-    app.include_router(legacy_router)
-    client = TestClient(app)
 
     with client.websocket_connect("/api/forven/ws/live") as websocket:
         assert websocket.receive_text() == "legacy-ok"

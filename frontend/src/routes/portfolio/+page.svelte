@@ -23,6 +23,12 @@
 	let basket: BasketSummary | null = null;
 	let allocation: PortfolioAllocationResponse | null = null;
 	let live: BasketLiveStatus | null = null;
+	// FE-04: "we could not read the live status" is NOT "live is off". The read
+	// used to `.catch(() => null)` into `live`, which rendered the reassuring
+	// "Not armed — paper only" badge and re-exposed the ARM form — telling the
+	// operator capital was idle at the exact moment it might have been armed and
+	// reconciling. Keep the last-good status and flag it as unknown instead.
+	let liveStatusStale = false;
 	let armWallet = '';
 	let armCapital = 500;
 	let armPhrase = '';
@@ -101,12 +107,22 @@
 			const [b, a, lv] = await Promise.all([
 				getPortfolioBasket(),
 				getPortfolioAllocation(),
-				getBasketLive().catch(() => null),
+				getBasketLive().then(
+					(value) => ({ ok: true as const, value }),
+					() => ({ ok: false as const, value: null }),
+				),
 			]);
 			basket = b;
 			allocation = a;
-			live = lv;
-			if (lv && !lv.armed) loadWalletOptions();
+			if (lv.ok) {
+				live = lv.value;
+				liveStatusStale = false;
+				if (lv.value && !lv.value.armed) loadWalletOptions();
+			} else {
+				// FE-04: leave `live` on its last-good value; the UI renders an
+				// explicit UNKNOWN state and withholds the ARM form.
+				liveStatusStale = true;
+			}
 			error = '';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -683,12 +699,21 @@
 			</div>
 
 			<!-- ─────────────── live execution (real money, behind arming) ─────────────── -->
-			<div class={`border p-3 space-y-3 ${live?.armed ? 'border-red-800 bg-[#0a0505]' : 'border-[#222] bg-[#070707]'}`}>
+			<div class={`border p-3 space-y-3 ${live?.armed ? 'border-red-800 bg-[#0a0505]' : liveStatusStale ? 'border-yellow-900 bg-[#0d0b05]' : 'border-[#222] bg-[#070707]'}`}>
 				<div class="flex items-center justify-between">
 					<div>
 						<h3 class="text-xs font-bold uppercase tracking-wider text-white">
 							Live execution
-							{#if live?.armed}
+							<!-- FE-04: unknown is its own state. It must never render as "off". -->
+							{#if liveStatusStale}
+								<span class="ml-2 text-[10px] px-2 py-0.5 border border-yellow-700 text-yellow-400">
+									STATUS UNKNOWN — last known: {live?.armed
+										? `ARMED ($${Number(live.capital_usd ?? 0).toLocaleString()} in “${live.wallet_label}”)`
+										: live
+											? 'not armed'
+											: 'never read'}
+								</span>
+							{:else if live?.armed}
 								<span class="ml-2 text-[10px] px-2 py-0.5 border border-red-700 text-red-400">ARMED — ${Number(live.capital_usd ?? 0).toLocaleString()} in wallet “{live.wallet_label}”</span>
 							{:else}
 								<span class="ml-2 text-[10px] px-2 py-0.5 border border-[#333] text-[#666]">Not armed — paper only</span>
@@ -736,6 +761,15 @@
 							<button class="text-[11px] text-[#666] hover:text-[#888]" on:click={() => (confirmingFlatten = false)}>cancel</button>
 						{/if}
 					</div>
+				{:else if liveStatusStale}
+					<!-- FE-04: the ARM form stays hidden while the status is unknown —
+					     arming on top of an already-armed wallet is the failure mode this
+					     display bug used to invite. -->
+					<p class="text-[11px] text-yellow-200/90">
+						The live-execution status could not be read on the last refresh, so arming is
+						withheld. Whatever is armed on the venue is still running. Fix connectivity and let
+						the page refresh before touching real capital.
+					</p>
 				{:else}
 					<div class="grid grid-cols-1 md:grid-cols-4 gap-2 items-end text-[11px]">
 						<label class="space-y-1">

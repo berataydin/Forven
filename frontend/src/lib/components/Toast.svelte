@@ -92,9 +92,28 @@
 	});
 
 	const snoozeOptions = getSnoozeOptions();
+
+	// FE-02: the snooze indicator now lives OUTSIDE the toast-list guard, so it can
+	// be on screen with no toasts behind it. `$snoozeUntil > Date.now()` only
+	// re-evaluates when a store changes, which would leave a permanent
+	// "Snoozed for 0m" strip once the window elapsed — tick a clock so the strip
+	// clears itself.
+	let now = Date.now();
+	const nowTimer = typeof window === 'undefined'
+		? null
+		: setInterval(() => (now = Date.now()), 15_000);
+	onDestroy(() => {
+		if (nowTimer !== null) clearInterval(nowTimer);
+	});
+
+	$: snoozeActive = $snoozeUntil > now;
 </script>
 
-{#if $toasts.length > 0}
+<!-- FE-02: rendered whenever there is EITHER a toast to show or an active snooze.
+     Previously the whole block hung off `$toasts.length > 0`, so snoozing (which
+     cleared every toast) also hid its own Resume control — the operator had no
+     way back and no indication that alerts were being suppressed. -->
+{#if $toasts.length > 0 || snoozeActive}
 	<div class="flex flex-col items-end gap-2 pointer-events-none">
 		{#each $toasts as t (t.id)}
 			<div
@@ -154,14 +173,14 @@
 		{/each}
 
 		<!-- Snooze Controls -->
-		{#if $snoozeUntil > Date.now()}
-			<!-- Snooze Active Indicator -->
+		{#if snoozeActive}
+			<!-- Snooze Active Indicator — always reachable while a snooze is running. -->
 			<div class="pointer-events-auto bg-[#050505] border border-[#333] px-3 py-2 flex items-center gap-2">
 				<svg class="w-3 h-3 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
 					<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd" />
 				</svg>
 				<span class="text-[10px] text-[#888]">
-					Snoozed for {formatSnoozeRemaining($snoozeUntil - Date.now())}
+					Snoozed for {formatSnoozeRemaining($snoozeUntil - now)} · errors still shown
 				</span>
 				<button
 					class="text-[10px] text-[#666] hover:text-white ml-2"

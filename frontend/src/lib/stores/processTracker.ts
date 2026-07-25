@@ -9,6 +9,7 @@
 import { writable, derived, get } from 'svelte/store';
 import { getJob, getJobs, getScan, listScans, getTournament, listTournaments } from '$lib/api';
 import type { Job, Scan, Tournament } from '$lib/api';
+import { createPoller, type Poller } from '$lib/utils/polling';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -108,8 +109,11 @@ const SNOOZE_OPTIONS = [
 
 export function snoozeNotifications(durationMs: number) {
 	snoozeUntil.set(Date.now() + durationMs);
-	// Also clear any existing toasts when snoozing
-	toasts.set([]);
+	// FE-02: clear the chatter, KEEP the errors. Snooze used to `toasts.set([])`
+	// and addToast then dropped every replacement, so a failed GO-LIVE promotion
+	// produced literally zero feedback anywhere in the UI. Snooze means "stop
+	// telling me about routine completions", never "hide failures".
+	toasts.update((t) => t.filter((x) => x.type === 'error'));
 }
 
 export function clearSnooze() {
@@ -148,9 +152,10 @@ export function addToast(
 	href?: string,
 	duration = 5000
 ): string | null {
-	// Check if notifications are snoozed
+	// Check if notifications are snoozed. FE-02: errors are exempt — they are the
+	// one class the operator cannot afford to have silently dropped.
 	const snoozeEnd = get(snoozeUntil);
-	if (Date.now() < snoozeEnd) {
+	if (type !== 'error' && Date.now() < snoozeEnd) {
 		return null; // Silently drop the toast
 	}
 	const id = `toast-${++toastCounter}-${Date.now()}`;
@@ -207,11 +212,25 @@ export function untrackProcess(id: string, type: ProcessType) {
 const STALE_MS = 30 * 60 * 1000; // 30 min
 const MAX_ACTIVE_POLLS = 4; // Reduced from 8 to limit concurrent requests
 const MAX_BOOTSTRAP_TRACKED_PER_TYPE = 5;
+// FE-09: the interval between fallback polls of tracked processes. Long enough
+// not to add load next to the WS-triggered polls, short enough that a job whose
+// terminal WS event never arrives still resolves within a few seconds.
+const FALLBACK_POLL_MS = 8000;
 let pollInFlight = false;
 let wsEventHandler: ((event: Event) => void) | null = null;
 let wsPollTimer: ReturnType<typeof setTimeout> | null = null;
+// FE-09: this module's docstring promised "a single polling loop", but the only
+// trigger was a whitelisted websocket event. A job whose terminal event was
+// dropped (socket down, event not in the whitelist, backend restart mid-run) sat
+// in 'running' forever, its badge never cleared and its completion/failure toast
+// never fired. Back the loop with a real interval while anything is active.
+let fallbackPoller: Poller | null = null;
 
 function ensurePolling() {
+	if (!fallbackPoller) {
+		fallbackPoller = createPoller(pollOnce, FALLBACK_POLL_MS);
+		fallbackPoller.start();
+	}
 	if (typeof window !== 'undefined' && !wsEventHandler) {
 		wsEventHandler = (event: Event) => {
 			const detail = (event as CustomEvent<Record<string, unknown>>).detail ?? {};
@@ -243,6 +262,12 @@ function scheduleWsPoll() {
 }
 
 function stopPolling() {
+	// FE-09: torn down by pollOnce once nothing is active, and re-armed by the
+	// next trackProcess() — the loop only runs while it has something to watch.
+	if (fallbackPoller) {
+		fallbackPoller.stop();
+		fallbackPoller = null;
+	}
 	if (wsPollTimer !== null) {
 		clearTimeout(wsPollTimer);
 		wsPollTimer = null;

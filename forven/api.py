@@ -854,19 +854,59 @@ if _frontend_dir and os.path.isdir(_frontend_dir):
 # on include order — exactly how a dead duplicate POST /api/backtesting/run lurked
 # undetected. Surface it loudly at construction time rather than shipping a route
 # whose behavior depends on import order.
+def iter_effective_routes(routes, prefix: str = ""):
+    """Yield ``(method, path)`` for every route a request can actually reach.
+
+    API-04: on the FastAPI we pin (0.138.0) ``app.routes`` is NOT the flat list it
+    looks like. Since 0.13x, ``include_router`` appends a single internal
+    ``fastapi.routing._IncludedRouter`` wrapper (routing.py:1518) holding
+    ``original_router`` + ``include_context``, instead of flattening the child
+    APIRoutes into ``app.router.routes``; the wrapper's own ``path``/``methods``
+    are None. Measured on this app: ``app.routes`` is 41 ``_IncludedRouter`` + 4
+    built-in docs ``Route`` + the 1 directly-decorated ``APIRoute``, so the old
+    guard's ``getattr(route, "path"/"methods")`` loop saw 9 (method, path) pairs —
+    the docs routes and POST /api/shutdown — and NONE of the 479 real ones. It
+    could not fire. Same root cause as the ``path == "/"`` filter that let
+    routers/status.py:root() shadow the packaged SPA index (fixed in 2711c779);
+    this walks the wrappers instead of assuming the flattening.
+
+    (Older FastAPIs — 0.133 and earlier — really did flatten, and there
+    ``_IncludedRouter``/``original_router`` do not exist at all. That is why this
+    is duck-typed on ``original_router`` / ``include_context.prefix`` rather than
+    isinstance-checked: it yields the same set either way, so an upgrade or a
+    downgrade cannot silently disarm the guard. The branch is live, not dead, on
+    the installed version.)
+
+    Mounts (StaticFiles) are skipped: they own a subtree, not a method+path.
+    """
+    for route in routes:
+        original_router = getattr(route, "original_router", None)
+        if original_router is not None:
+            include_prefix = getattr(getattr(route, "include_context", None), "prefix", "") or ""
+            yield from iter_effective_routes(original_router.routes, prefix + include_prefix)
+            continue
+        path = getattr(route, "path", None)
+        if path is None:
+            continue
+        full_path = f"{prefix}{path}"
+        methods = getattr(route, "methods", None)
+        if methods:
+            for method in methods:
+                yield (method, full_path)
+        elif type(route).__name__ in {"APIWebSocketRoute", "WebSocketRoute"}:
+            # WS routes carry no methods; a duplicated WS path shadows just as
+            # silently as a duplicated HTTP one.
+            yield ("WEBSOCKET", full_path)
+
+
 def _assert_no_duplicate_routes(app_) -> None:
     seen: dict[tuple[str, str], int] = {}
     dupes: set[str] = set()
-    for route in app_.routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        if not path or not methods:
-            continue
-        for method in methods:
-            key = (method, path)
-            seen[key] = seen.get(key, 0) + 1
-            if seen[key] > 1:
-                dupes.add(f"{method} {path}")
+    for method, path in iter_effective_routes(app_.routes):
+        key = (method, path)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            dupes.add(f"{method} {path}")
     if dupes:
         raise RuntimeError(
             "Duplicate route registration(s) detected — two handlers share a "

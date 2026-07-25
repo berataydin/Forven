@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from forven import api_core as core
 from forven.api_domains import trading as trading_domain
@@ -12,8 +12,14 @@ def read_open_trades(verify_exchange: bool | None = None, stale_grace_seconds: i
     return trading_domain.read_open_trades(verify_exchange=verify_exchange, stale_grace_seconds=stale_grace_seconds)
 
 
+# API-09 (second half): same unbounded-`limit` class as GET /api/logs.
+# db.get_recent_trades interpolates this straight into "LIMIT ?" and SQLite reads
+# a NEGATIVE limit as "no limit", so `?limit=-1` streamed the ENTIRE trades ledger
+# — every fill, size and PnL — out of a single unauthenticated-by-default GET.
+# FastAPI now 422s anything outside [1, 1000] before the handler runs. The only
+# caller (frontend getForvenRecentTrades, default 20) is well inside the bound.
 @router.get("/api/trades/recent")
-def read_recent_trades(limit: int = 20):
+def read_recent_trades(limit: int = Query(default=20, ge=1, le=1000)):
     return trading_domain.read_recent_trades(limit=limit)
 
 

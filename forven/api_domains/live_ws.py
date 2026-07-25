@@ -165,6 +165,9 @@ async def websocket_endpoint(ws: WebSocket):
     # SECURITY (audit 2026-06-22, L3): WS handshakes bypass ApiKeyMiddleware
     # (non-http scope), so authorize here. Fail-open when no key is set (default
     # localhost); enforce the key once one is configured (e.g. exposed bind).
+    # ws-no-origin-check: require_api_access_ws ALSO rejects a cross-site Origin
+    # now — CsrfOriginMiddleware likewise never sees this scope, and a WS upgrade
+    # has no preflight, so a browsed page could otherwise stream live positions.
     from forven.api_security import require_api_access_ws
 
     if not await require_api_access_ws(ws):

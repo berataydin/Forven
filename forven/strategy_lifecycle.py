@@ -1294,55 +1294,103 @@ def read_lifecycle_strategies(
     limit: int = 500,
     offset: int = 0,
 ):
+    # API-01: filters and the page window belong in SQL. This used to call
+    # get_strategies() — SELECT s.* over the WHOLE strategies table — and then
+    # filter/slice in Python. On the live 3.0GB DB that is 7,665 rows (~74MB
+    # materialised and discarded) plus ~1.3s of GIL-held work on the single API
+    # worker, for a page that renders 50 of them. Same indexed pattern as
+    # get_strategy_container below.
     query_status = _to_core_status(state)
-    rows = get_strategies(status=query_status)
 
     symbol_filter = symbol.strip().lower() if isinstance(symbol, str) else None
     name_filter = name.strip().lower() if isinstance(name, str) else None
     source_filter = source.strip().lower() if isinstance(source, str) else None
     source_ref_filter = source_ref.strip().lower() if isinstance(source_ref, str) else None
 
-    filtered: list[dict] = []
-    for row in rows:
-        row_source = str(row.get("source") or "core").strip().lower()
-        if source_filter and source_filter != row_source:
-            continue
+    clauses: list[str] = []
+    params: list[object] = []
+    if query_status is not None:
+        clauses.append("(s.status = ? OR s.stage = ?)")
+        params.extend([query_status, query_status])
+    if source_filter:
+        # `NULL`/`''` source reads as 'core' — mirrors `row.get("source") or "core"`.
+        clauses.append("LOWER(TRIM(COALESCE(NULLIF(s.source, ''), 'core'))) = ?")
+        params.append(source_filter)
+    if symbol_filter:
+        clauses.append("INSTR(LOWER(COALESCE(s.symbol, '')), ?) > 0")
+        params.append(symbol_filter)
+    if name_filter:
+        clauses.append("INSTR(LOWER(COALESCE(s.name, '')), ?) > 0")
+        params.append(name_filter)
+    if source_ref_filter:
+        clauses.append(
+            "INSTR(LOWER(COALESCE(NULLIF(s.source_ref, ''), s.id, '')), ?) > 0"
+        )
+        params.append(source_ref_filter)
 
-        symbol_value = (row.get("symbol") or "").lower()
-        if symbol_filter and symbol_filter not in symbol_value:
-            continue
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    # Preserve the previous slice semantics exactly: offset clamps at 0, limit 0
+    # yields nothing, and a NEGATIVE limit means "no ceiling" — which is also how
+    # SQLite reads a negative LIMIT, so it maps one-for-one.
+    sql_offset = max(int(offset), 0)
+    sql_limit = int(limit) if int(limit) >= 0 else -1
 
-        name_value = (row.get("name") or "").lower()
-        if name_filter and name_filter not in name_value:
-            continue
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT s.*, h.display_id AS hypothesis_display_id"
+            " FROM strategies s LEFT JOIN hypotheses h ON h.id = s.hypothesis_id"
+            f"{where} ORDER BY s.updated_at DESC LIMIT ? OFFSET ?",
+            (*params, sql_limit, sql_offset),
+        ).fetchall()
 
-        row_source_ref = str(row.get("source_ref") or row.get("id") or "").lower()
-        if source_ref_filter and source_ref_filter not in row_source_ref:
-            continue
-
-        filtered.append(_row_to_lifecycle_strategy(row))
-
-    start = max(int(offset), 0)
-    end = max(start, start + max(int(limit), 0)) if int(limit) >= 0 else None
-    return sanitize_json_floats(filtered[start:end])
+    payloads: list[dict] = []
+    for raw in rows:
+        row = dict(raw)
+        # get_strategies() canonicalised this before handing rows over; the
+        # lifecycle state mapping depends on it.
+        row["stage"] = normalize_stage(row.get("stage") or row.get("status"))
+        payloads.append(_row_to_lifecycle_strategy(row))
+    return sanitize_json_floats(payloads)
 
 
 def read_lifecycle_strategy(strategy_id: str):
+    # API-01: single-record GET. This used to load the ENTIRE strategies table
+    # (get_strategies()) and scan it in Python for one id — ~1.3s of GIL-held
+    # work and ~74MB churned per request on the live DB. Resolve by index
+    # instead, using the same id-or-display_id predicate get_strategy_container
+    # already uses (exact id wins over a display_id collision).
     target = strategy_id.strip()
-    rows = get_strategies()
-    for row in rows:
-        row_id = str(row.get("id", "")).strip()
-        row_display_id = str(row.get("display_id", "")).strip()
-        if target in {row_id, row_display_id}:
-            events = [_normalize_lifecycle_event_row(event) for event in get_strategy_events(row_id, limit=500)]
-            payload = _row_to_lifecycle_strategy(row)
-            payload["has_backtest_results"] = bool(row.get("has_backtest_results"))
-            return {
-                "strategy": payload,
-                "events": events,
-                "policy_evaluations": [],
-            }
-    raise HTTPException(status_code=404, detail=f"strategy not found: {target}")
+    with get_db() as conn:
+        raw = conn.execute(
+            """
+            SELECT s.*, h.display_id AS hypothesis_display_id
+            FROM strategies s
+            LEFT JOIN hypotheses h ON h.id = s.hypothesis_id
+            WHERE LOWER(TRIM(s.id)) = LOWER(TRIM(?))
+               OR LOWER(TRIM(COALESCE(s.display_id, ''))) = LOWER(TRIM(?))
+            ORDER BY CASE WHEN LOWER(TRIM(s.id)) = LOWER(TRIM(?)) THEN 0 ELSE 1 END,
+                     s.updated_at DESC
+            LIMIT 1
+            """,
+            (target, target, target),
+        ).fetchone()
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"strategy not found: {target}")
+
+    row = dict(raw)
+    row["stage"] = normalize_stage(row.get("stage") or row.get("status"))
+    row_id = str(row.get("id") or "").strip()
+    events = [_normalize_lifecycle_event_row(event) for event in get_strategy_events(row_id, limit=500)]
+    payload = _row_to_lifecycle_strategy(row)
+    # Unchanged: `strategies` has no has_backtest_results column, so this is the
+    # same False the old get_strategies() path produced. get_strategy_container
+    # is the endpoint that computes it for real.
+    payload["has_backtest_results"] = bool(row.get("has_backtest_results"))
+    return {
+        "strategy": payload,
+        "events": events,
+        "policy_evaluations": [],
+    }
 
 
 def get_strategy_container(

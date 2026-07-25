@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
 
 from forven.api_security import require_operator_access
 from forven.control_plane import ops as control_plane_ops
@@ -11,6 +14,24 @@ from forven.control_plane.models import (
 )
 
 router = APIRouter(tags=["ops"], dependencies=[Depends(require_operator_access)])
+
+
+class FactoryResetBody(BaseModel):
+    """API-10: typed confirmation for the destructive data wipe.
+
+    This endpoint used to take a bare ``dict`` — any JSON object at all, including
+    ``{}``, erased tables. Its neighbours (ConfirmBody, RecoveryRollbackBody)
+    already require an explicit confirmation field, so match that convention with
+    a phrase no accidental/replayed call carries.
+
+    ``keep=None`` still means "use each category's default_keep" and ``keep=[]``
+    still means "wipe everything" — that None-vs-empty distinction is load-bearing
+    (see control_plane.ops.post_factory_reset) so it is preserved verbatim.
+    """
+
+    confirm_phrase: Literal["FACTORY RESET"]
+    keep: list[str] | None = Field(default=None, max_length=64)
+    allow_credentials_wipe: bool = False
 
 
 # Sync `def` on purpose: the harness places real testnet orders and polls the
@@ -194,8 +215,12 @@ def post_system_mode(body: SystemModeBody):
     return control_plane_ops.update_system_mode(body.mode)
 
 
+# API-09: bound `limit` at the route boundary. control_plane.ops.get_logs
+# interpolates it straight into "LIMIT ?", and SQLite reads a NEGATIVE limit as
+# "no limit" — so `?limit=-1` used to stream the entire activity_log. FastAPI now
+# 422s anything outside [1, 1000] before the handler runs.
 @router.get("/api/logs")
-def get_logs(limit: int = 50):
+def get_logs(limit: int = Query(default=50, ge=1, le=1000)):
     return control_plane_ops.get_logs(limit=limit)
 
 
@@ -205,8 +230,10 @@ def get_factory_reset_categories():
 
 
 @router.post("/api/system/factory-reset")
-def post_factory_reset(body: dict):
-    return control_plane_ops.post_factory_reset(body)
+def post_factory_reset(body: FactoryResetBody):
+    # model_dump(exclude_unset) would drop `keep=None`, and the handler needs the
+    # key present to tell "not specified" from "explicit []" — dump everything.
+    return control_plane_ops.post_factory_reset(body.model_dump())
 
 
 @router.get("/api/scheduler")

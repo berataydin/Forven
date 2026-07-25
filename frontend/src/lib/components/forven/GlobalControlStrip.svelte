@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { forvenWsConnected } from '$lib/stores/forvenWebSocket';
 	import {
 		forvenDashboard,
@@ -34,6 +34,8 @@
 	let actionBusy = false;
 	let modalOpen = false;
 	let modalAction: ModalAction = null;
+	// FE-05: focus target when the confirm dialog opens.
+	let cancelButton: HTMLButtonElement | null = null;
 	let executionMode: ExecutionMode = 'paper';
 	let modeSwitchTarget: ExecutionMode = 'live';
 	let pausedManualCounts: PausedManualCounts = emptyPausedManualCounts();
@@ -158,6 +160,20 @@
 		actionError = '';
 		modalAction = action;
 		modalOpen = true;
+		// FE-05: land focus on Cancel, not on whatever the page had focused —
+		// otherwise a stray Enter after opening the Emergency Halt confirm
+		// re-triggers the button behind the dialog.
+		void tick().then(() => cancelButton?.focus());
+	}
+
+	// FE-05: Escape must cancel. The dialog previously had no keyboard exit at
+	// all, and its scrim did not even take clicks.
+	function handleModalKeydown(event: KeyboardEvent) {
+		if (!modalOpen) return;
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			closeModal();
+		}
 	}
 
 	function requestSystemMode(target: SystemMode) {
@@ -224,6 +240,10 @@
 		realtime = null;
 	});
 </script>
+
+<!-- FE-05: Escape cancels the confirm dialog. Must live at the top level —
+     `<svelte:window>` cannot be nested inside a block. -->
+<svelte:window on:keydown={handleModalKeydown} />
 
 {#if systemMode === 'manual'}
 	<div class="bg-yellow-500/5 border-b border-yellow-900 px-4 py-1 text-[11px] uppercase tracking-wider text-yellow-400 font-bold flex flex-wrap items-center justify-between gap-2">
@@ -361,18 +381,36 @@
 	</div>
 {/if}
 
+<!-- FE-05: this confirm gates Emergency Halt (closes every open position at
+     market) and the paper->live mode switch, but its scrim carried
+     `pointer-events-none` — so it was a picture of a modal, not a modal. Clicks
+     landed on the controls BEHIND it, including the very buttons it was asking
+     about, and it trapped neither focus nor Escape. Scrim now takes pointer
+     events, the dialog is announced as modal, Escape cancels, and focus starts on
+     Cancel so a stray Enter can never confirm a destructive action. -->
 {#if modalOpen && modalAction}
 	<!-- svelte-ignore a11y-click-events-have-key-events -->
 	<!-- svelte-ignore a11y-no-static-element-interactions -->
-	<div class="fixed inset-0 z-[10010] bg-black/80 flex items-center justify-center p-4 pointer-events-none" on:click={() => closeModal()}>
-		<div class="w-full max-w-md border border-[#222] bg-[#050505] p-4 space-y-3 pointer-events-auto" on:click|stopPropagation>
-			<h3 class={`text-sm font-bold uppercase tracking-wider ${modalDanger ? 'text-red-400' : 'text-white'}`}>{modalTitle}</h3>
+	<div class="fixed inset-0 z-[10010] bg-black/80 flex items-center justify-center p-4" on:click={() => closeModal()}>
+		<div
+			class="w-full max-w-md border border-[#222] bg-[#050505] p-4 space-y-3"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="global-control-modal-title"
+			tabindex="-1"
+			on:click|stopPropagation
+		>
+			<h3 id="global-control-modal-title" class={`text-sm font-bold uppercase tracking-wider ${modalDanger ? 'text-red-400' : 'text-white'}`}>{modalTitle}</h3>
 			<p class="text-xs text-[#888] leading-relaxed">{modalMessage}</p>
 			{#if actionError}
 				<div class="text-xs border border-red-900 bg-red-500/5 text-red-400 px-2 py-1">{actionError}</div>
 			{/if}
 			<div class="flex justify-end gap-2 pt-1">
-				<button class="px-3 py-1.5 text-xs border border-[#333] text-[#888] hover:text-white hover:border-[#555] transition-colors" on:click={() => closeModal()}>
+				<button
+					bind:this={cancelButton}
+					class="px-3 py-1.5 text-xs border border-[#333] text-[#888] hover:text-white hover:border-[#555] transition-colors"
+					on:click={() => closeModal()}
+				>
 					Cancel
 				</button>
 				<button

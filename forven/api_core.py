@@ -192,10 +192,100 @@ def _bootstrap_scheduler_jobs(force: bool = False):
         _SCHEDULER_BOOTSTRAP_DONE = True
 
 
+def mainnet_arming_snapshot() -> dict:
+    """Whether REAL-MONEY order placement is armed on this process.
+
+    OPS-4: ``FORVEN_ALLOW_MAINNET`` is the single switch between "every mainnet
+    order is refused" and "orders spend real funds", and it was read exactly once
+    deep inside forven.exchange.hyperliquid._assert_execution_allowed — never
+    surfaced anywhere an operator looks. This is the read-only accessor every
+    status surface should use.
+
+    Delegates to the exchange module's ``mainnet_arming_state`` so there is ONE
+    definition of armed; the env-var fallback only exists so a status endpoint
+    can never be taken down by an exchange-module import error.
+    """
+    try:
+        from forven.exchange.hyperliquid import mainnet_arming_state
+
+        return dict(mainnet_arming_state())
+    except Exception as exc:  # noqa: BLE001 — status surfaces must not hard-fail
+        log.debug("mainnet_arming_state unavailable (%s); reading the env var", exc)
+        armed = str(os.environ.get("FORVEN_ALLOW_MAINNET") or "").strip().lower() in {
+            "1", "true", "yes", "on", "y",
+        }
+        return {
+            "flag": "FORVEN_ALLOW_MAINNET",
+            "armed": armed,
+            "permits": (
+                "REAL-MONEY orders on the Hyperliquid MAINNET endpoint"
+                if armed
+                else "testnet orders only — any mainnet-resolving order is refused"
+            ),
+            "source": "env_fallback",
+        }
+
+
+# API-08: the uvicorn request loop, captured once at startup. WebSocket
+# connections are owned by THIS loop, so a threadpool handler (any sync `def`
+# endpoint, any background thread) can never broadcast to them itself —
+# `asyncio.run(ws_manager.broadcast(...))` spins up a brand-new loop, the send on
+# a foreign-loop socket raises, and the old `except Exception: pass` around it
+# swallowed the failure so the event just vanished. Cross into the real loop via
+# call_soon_threadsafe, or skip and say so.
+_API_EVENT_LOOP = None
+
+
+def dispatch_ws_broadcast(message: dict) -> bool:
+    """Schedule a ws_manager broadcast from ANY thread. True if it was queued.
+
+    API-08. Safe to call from the request loop (schedules inline) or from a
+    threadpool/background thread (hops to the captured API loop). When no API
+    loop is running — tests, CLI entrypoints, a torn-down app — this logs and
+    returns False rather than pretending the message was delivered.
+    """
+    import asyncio as _asyncio
+
+    from forven.api_domains.live_ws import ws_manager
+
+    try:
+        running = _asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is not None and running.is_running():
+        running.create_task(ws_manager.broadcast(message))
+        return True
+
+    loop = _API_EVENT_LOOP
+    if loop is None or loop.is_closed() or not loop.is_running():
+        log.debug(
+            "No running API event loop — skipping WS broadcast %r",
+            message.get("type"),
+        )
+        return False
+    try:
+        # Build the coroutine INSIDE the loop: if the loop dies between the
+        # check above and the callback, no orphaned coroutine is left unawaited.
+        loop.call_soon_threadsafe(lambda: loop.create_task(ws_manager.broadcast(message)))
+        return True
+    except RuntimeError as exc:
+        log.warning("WS broadcast %r not delivered: %s", message.get("type"), exc)
+        return False
+
+
 async def _on_startup():
     import time as _time
     _BOOTSTRAP_MAX_RETRIES = 3
     _BOOTSTRAP_RETRY_DELAY = 5.0
+    # API-08: capture the loop uvicorn serves requests on, so threadpool handlers
+    # have somewhere legitimate to hand WS broadcasts.
+    global _API_EVENT_LOOP
+    try:
+        import asyncio as _asyncio
+
+        _API_EVENT_LOOP = _asyncio.get_running_loop()
+    except RuntimeError:
+        _API_EVENT_LOOP = None
     try:
         from forven.db import recover_dangling_runtime_tasks
         from forven.system_mode_policy import reconcile_manual_mode_backlog
@@ -2325,6 +2415,16 @@ def _coerce_bounded_int(value, default: int, lower: int, upper: int) -> int:
 
 
 def _coerce_float(value, default: float) -> float:
+    """Strict float coercion: anything float() rejects keeps the previous value.
+
+    API-03/ARCH-02: a SECOND `_coerce_float` — the lenient legacy-metadata parser
+    now named `_coerce_legacy_metadata_float` — used to be defined further down
+    this module, so Python bound the last definition and every risk/pipeline
+    settings coercion above silently used the permissive one. A fat-fingered
+    "1,5" became 15.0 and "20 to 40" became 30.0 where the author expected
+    float() to raise and the safe stored value to survive. Keep this the
+    module-wide helper; the lenient parser is only for backtest metadata.
+    """
     if value is None:
         return default
     try:
@@ -2482,6 +2582,186 @@ _NOTIF_TOGGLE_PREF_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+# ── API-02: schema + sane bounds for the capital-bearing settings sections ───
+# Full editability of every gate threshold is a DELIBERATE project stance — these
+# specs take NO knob away from the operator. What they add is:
+#   (a) a hard refusal of numbers outside the range the enforcement code can
+#       actually honour. `max_drawdown_pct` was already clamped downstream into
+#       [0.01, 0.30]; `max_risk_per_trade_pct`, `max_daily_loss_pct` and the
+#       `live_hard_max_*` per-order ceilings had NOTHING, so a typo persisted
+#       verbatim straight into forven.exchange.risk.
+#   (b) a loud 422 on payload keys no handler reads, instead of the silent drop
+#       that produces the recurring "the setting does not stick" bug class.
+# Only sections whose accepted keys can be enumerated exactly appear here; every
+# other section keeps the previous permissive behaviour rather than risk 422-ing
+# a legitimate save.
+_SETTINGS_SECTION_KNOWN_KEYS: dict[str, frozenset[str]] = {
+    "initial-capital": frozenset({"initial_capital"}),
+    "trading-mode": frozenset({"trading_mode"}),
+    "risk": frozenset({
+        # per-trade / daily / drawdown limits
+        "max_risk_per_trade_pct", "max_position_size_pct", "max_daily_loss_pct",
+        "max_daily_loss", "max_drawdown_pct", "max_concurrent_positions",
+        "paper_max_concurrent_positions", "cooldown_after_loss_hours",
+        # direction books + margin mode
+        "live_books_enabled", "hyperliquid_long_book_address",
+        "hyperliquid_short_book_address", "hyperliquid_use_cross_margin",
+        "live_equity_include_master",
+        # liquidation proximity alerts
+        "liq_distance_warn_pct", "liq_distance_critical_pct",
+        # PORT-1 / SIZE-CAP-1 / BOOK-BUDGET-1 / CORR-1 live portfolio budget
+        "live_portfolio_budget_enabled", "live_max_total_open_risk_pct",
+        "live_max_asset_exposure_pct", "live_max_group_exposure_pct",
+        "live_hard_max_per_trade_risk_pct", "live_hard_max_order_notional_pct",
+        "live_max_book_notional_pct", "live_correlation_budget_enabled",
+        "live_max_effective_exposure_pct", "live_correlation_window_bars",
+        "live_correlation_missing_default",
+        # RETRY-STORM-1 failed-open brake
+        "live_failed_open_cooldown_minutes", "live_failed_open_max_attempts",
+        "live_failed_open_window_hours",
+        # PORT-LAYER-1 allocator
+        "portfolio_layer_enabled", "portfolio_allocator_enabled",
+        "portfolio_allocator_live", "portfolio_lookback_days",
+        "portfolio_target_book_vol_pct", "portfolio_min_risk_multiplier",
+        "portfolio_max_risk_multiplier",
+        # PORT-LAYER-2 / BASKET-2 funding-carry basket
+        "basket_funding_carry_enabled", "basket_rebalance_hours", "basket_n_legs",
+        "basket_gross_leverage", "basket_universe_min_bars", "basket_rank_buffer",
+        # LIVE-LOOP-1 paper->live graduation recommender
+        "live_graduation_recommender_enabled", "graduation_min_soak_days",
+        "graduation_min_paper_trades", "graduation_min_measured_trades",
+        "graduation_base_arm_usd", "graduation_max_arm_usd",
+        "graduation_daily_limit", "graduation_deny_cooldown_days",
+        "graduation_skew_lookback_days",
+        # LIQ-1 order-time liquidity guard
+        "live_liquidity_guard_enabled", "live_min_daily_volume_usd",
+        "live_max_spread_bps", "live_book_depth_window_bps",
+        "live_max_book_participation_pct", "live_max_price_impact_bps",
+        # regime gating (strict + REGIME-GATE-1 direction x regime)
+        "strict_regime_gating", "regime_min_confidence",
+        "allow_unknown_regime_strategies", "regime_gate_mode",
+        "regime_gate_block_long", "regime_gate_block_short",
+        "regime_gate_min_confidence",
+        # promotion-safety gates + paper test mode
+        "allow_unsupported_backtest_risk_controls", "canonical_requires_forward_proof",
+        "relaxed_trade_filters_enabled", "paper_test_mode_enabled",
+        "paper_test_high_activity_enabled", "paper_test_bypass_gates_enabled",
+        "paper_test_local_execution_only",
+    }),
+}
+
+# (minimum, maximum) inclusive. Deliberately generous — the job is to reject
+# nonsense (negative risk, a 5000% per-trade ceiling, a confidence of 12), not to
+# second-guess the operator inside the physically meaningful range.
+_SETTINGS_SECTION_NUMERIC_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
+    "initial-capital": {"initial_capital": (0.0, 1e12)},
+    "risk": {
+        "max_risk_per_trade_pct": (0.0001, 100.0),
+        "max_position_size_pct": (0.0001, 100.0),
+        "max_daily_loss_pct": (0.0001, 100.0),
+        "max_daily_loss": (0.0, 1e12),
+        "max_drawdown_pct": (0.0001, 100.0),
+        "max_concurrent_positions": (0.0, 1000.0),
+        "paper_max_concurrent_positions": (0.0, 1000.0),
+        "cooldown_after_loss_hours": (0.0, 8760.0),
+        "liq_distance_warn_pct": (0.0, 100.0),
+        "liq_distance_critical_pct": (0.0, 100.0),
+        "live_max_total_open_risk_pct": (0.0001, 100.0),
+        "live_max_asset_exposure_pct": (0.0001, 10000.0),
+        "live_max_group_exposure_pct": (0.0001, 10000.0),
+        "live_hard_max_per_trade_risk_pct": (0.0001, 100.0),
+        "live_hard_max_order_notional_pct": (0.0001, 10000.0),
+        "live_max_book_notional_pct": (0.0001, 10000.0),
+        "live_max_effective_exposure_pct": (0.0001, 10000.0),
+        "live_correlation_window_bars": (1.0, 1e6),
+        "live_correlation_missing_default": (0.0, 1.0),
+        "live_failed_open_cooldown_minutes": (0.0, 10080.0),
+        "live_failed_open_max_attempts": (1.0, 1000.0),
+        "live_failed_open_window_hours": (0.0, 8760.0),
+        "portfolio_lookback_days": (1.0, 3650.0),
+        "portfolio_target_book_vol_pct": (0.0, 1000.0),
+        "portfolio_min_risk_multiplier": (0.0, 100.0),
+        "portfolio_max_risk_multiplier": (0.0, 100.0),
+        "basket_rebalance_hours": (0.0, 8760.0),
+        "basket_n_legs": (1.0, 100.0),
+        "basket_gross_leverage": (0.0, 100.0),
+        "basket_universe_min_bars": (0.0, 1e7),
+        "basket_rank_buffer": (0.0, 100.0),
+        "graduation_min_soak_days": (0.0, 3650.0),
+        "graduation_min_paper_trades": (0.0, 1e5),
+        "graduation_min_measured_trades": (0.0, 1e5),
+        "graduation_base_arm_usd": (0.0, 1e7),
+        "graduation_max_arm_usd": (0.0, 1e7),
+        "graduation_daily_limit": (0.0, 1000.0),
+        "graduation_deny_cooldown_days": (0.0, 3650.0),
+        "graduation_skew_lookback_days": (1.0, 3650.0),
+        "live_min_daily_volume_usd": (0.0, 1e15),
+        "live_max_spread_bps": (0.0001, 10000.0),
+        "live_book_depth_window_bps": (0.0001, 10000.0),
+        "live_max_book_participation_pct": (0.0001, 100.0),
+        "live_max_price_impact_bps": (0.0001, 10000.0),
+        "regime_min_confidence": (0.0, 1.0),
+        "regime_gate_min_confidence": (0.0, 1.0),
+    },
+}
+
+
+def _validate_settings_section_payload(section: str, payload: dict) -> None:
+    """Reject unknown keys and out-of-range numbers BEFORE anything is persisted.
+
+    API-02. Raises 422 so the Settings save bar surfaces the actual refusal (it
+    renders the backend detail verbatim). A key absent from the payload is
+    untouched as before; an explicit ``null`` still means "keep the stored
+    value", which is what the coercers already did.
+    """
+    known = _SETTINGS_SECTION_KNOWN_KEYS.get(section)
+    if known is not None:
+        unknown = sorted(str(key) for key in payload if key not in known)
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"settings section '{section}' has no handler for: "
+                    f"{', '.join(unknown)} — refusing the write rather than "
+                    "silently dropping it"
+                ),
+            )
+
+    for key, (low, high) in (_SETTINGS_SECTION_NUMERIC_BOUNDS.get(section) or {}).items():
+        if key not in payload:
+            continue
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        # A bool here is never a legitimate limit — `float(True)` would quietly
+        # become a 1% ceiling, which is exactly the class of silent misconfig
+        # this guard exists to stop.
+        if isinstance(raw, bool):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{section}.{key} must be a number, got a boolean",
+            )
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{section}.{key} must be a number, got {raw!r}",
+            ) from None
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{section}.{key} must be a finite number, got {raw!r}",
+            )
+        if not (low <= parsed <= high):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{section}.{key} must be between {low:g} and {high:g}, got {parsed:g}"
+                ),
+            )
+
+
 def _apply_settings_section(section: str, payload: dict, actor: str = "ui") -> dict:
     """Apply a settings-section edit and persist it atomically.
 
@@ -2507,6 +2787,10 @@ def _apply_settings_section(section: str, payload: dict, actor: str = "ui") -> d
     section = str(section or "").strip().lower()
     if section in {"pipeline", "api-keys", "test-discord", "reset"}:
         raise HTTPException(status_code=404, detail=f"settings section not supported: {section}")
+
+    # API-02: validate BEFORE the first mutation so a rejected write leaves the
+    # blob (and therefore live enforcement) exactly as it was.
+    _validate_settings_section_payload(section, payload)
 
     if section == "exchange":
         exchange = str(payload.get("exchange", "")).strip().lower()
@@ -4440,8 +4724,16 @@ def _backtest_trash_table(conn):
         )
 
 
-def _coerce_float(value, default: float | None = 0.0) -> float | None:
-    """Safely parse common float-like values from legacy metadata."""
+def _coerce_legacy_metadata_float(value, default: float | None = 0.0) -> float | None:
+    """Safely parse common float-like values from legacy metadata.
+
+    API-03/ARCH-02: this used to be called `_coerce_float`, shadowing the strict
+    helper defined near the settings writers. Its salvage heuristics ("52.1%",
+    "-0.536 to -1.463", thousands separators) are right for archived backtest
+    metadata and WRONG for operator-typed risk limits, so it now carries a name
+    that says where it belongs. Only the backtest summary/detail normalizers
+    below this point may use it.
+    """
     fallback_none = default is None
     if value is None:
         return None if fallback_none else float(default)
@@ -4556,7 +4848,7 @@ def _normalize_equity_points(value) -> list[dict]:
             eq = row.get("balance")
         if ts in (None, "") or eq in (None, ""):
             continue
-        points.append({"timestamp": str(ts), "equity": _coerce_float(eq)})
+        points.append({"timestamp": str(ts), "equity": _coerce_legacy_metadata_float(eq)})
 
     # Keep payload size bounded for very dense curves.
     max_points = 5000
@@ -4594,14 +4886,14 @@ def _normalize_trade_rows(value) -> list[dict]:
         if exit_price in (None, ""):
             exit_price = entry_price
 
-        ep = _coerce_float(entry_price)
-        xp = _coerce_float(exit_price)
+        ep = _coerce_legacy_metadata_float(entry_price)
+        xp = _coerce_legacy_metadata_float(exit_price)
         raw_pnl = row.get("pnl", row.get("pnl_usd", None))
-        stored_pnl = _coerce_float(raw_pnl, 0.0)
+        stored_pnl = _coerce_legacy_metadata_float(raw_pnl, 0.0)
         raw_pnl_pct = row.get("pnl_pct")
         raw_return_pct = row.get("return_pct")
         raw_return = row.get("return")
-        stored_return_pct = _coerce_float(raw_return_pct, 0.0)
+        stored_return_pct = _coerce_legacy_metadata_float(raw_return_pct, 0.0)
 
         # Pull the portfolio-return ratio (decimal form, e.g. 0.0132 = +1.32%).
         # Engine rows use `pnl_pct` as a ratio. Persisted artifact rows use
@@ -4617,7 +4909,7 @@ def _normalize_trade_rows(value) -> list[dict]:
             and abs(stored_pnl - stored_return_pct) < 1e-6
         )
         if raw_pnl_pct not in (None, ""):
-            ratio = _coerce_float(raw_pnl_pct, 0.0)
+            ratio = _coerce_legacy_metadata_float(raw_pnl_pct, 0.0)
             display_return_pct = ratio * 100.0
         elif raw_return_pct not in (None, ""):
             if stored_pnl_equals_return_pct:
@@ -4627,7 +4919,7 @@ def _normalize_trade_rows(value) -> list[dict]:
                 display_return_pct = stored_return_pct
                 ratio = display_return_pct / 100.0
         elif raw_return not in (None, ""):
-            ratio = _coerce_float(raw_return, 0.0)
+            ratio = _coerce_legacy_metadata_float(raw_return, 0.0)
             display_return_pct = ratio * 100.0
         else:
             ratio = 0.0
@@ -4654,15 +4946,15 @@ def _normalize_trade_rows(value) -> list[dict]:
             "entry_price": ep,
             "exit_time": str(exit_time),
             "exit_price": xp,
-            "size": _coerce_float(row.get("size", row.get("quantity", 0))),
+            "size": _coerce_legacy_metadata_float(row.get("size", row.get("quantity", 0))),
             "pnl": dollar_pnl,
             "return_pct": display_return_pct,
         }
         equity = max(0.0, equity * (1.0 + ratio))
         if row.get("mae") not in (None, ""):
-            trade["mae"] = _coerce_float(row.get("mae"))
+            trade["mae"] = _coerce_legacy_metadata_float(row.get("mae"))
         if row.get("mfe") not in (None, ""):
-            trade["mfe"] = _coerce_float(row.get("mfe"))
+            trade["mfe"] = _coerce_legacy_metadata_float(row.get("mfe"))
         if row.get("direction") not in (None, ""):
             trade["direction"] = str(row["direction"])
         if row.get("bars_held") not in (None, ""):
@@ -4670,7 +4962,7 @@ def _normalize_trade_rows(value) -> list[dict]:
         if row.get("exit_reason") not in (None, ""):
             trade["exit_reason"] = str(row["exit_reason"])
         if row.get("size_fraction") not in (None, ""):
-            trade["size_fraction"] = _coerce_float(row.get("size_fraction"))
+            trade["size_fraction"] = _coerce_legacy_metadata_float(row.get("size_fraction"))
         if row.get("regime") not in (None, ""):
             trade["regime"] = str(row["regime"])
         trades.append(trade)
@@ -4695,11 +4987,11 @@ def _normalize_chart_bars(value) -> list[dict]:
         bars.append(
             {
                 "timestamp": str(timestamp),
-                "open": _coerce_float(open_),
-                "high": _coerce_float(high),
-                "low": _coerce_float(low),
-                "close": _coerce_float(close),
-                "volume": _coerce_float(volume),
+                "open": _coerce_legacy_metadata_float(open_),
+                "high": _coerce_legacy_metadata_float(high),
+                "low": _coerce_legacy_metadata_float(low),
+                "close": _coerce_legacy_metadata_float(close),
+                "volume": _coerce_legacy_metadata_float(volume),
             }
         )
     return bars
@@ -4718,7 +5010,7 @@ def _normalize_chart_markers(value) -> list[dict]:
             continue
         marker = {
             "timestamp": str(timestamp),
-            "price": _coerce_float(price),
+            "price": _coerce_legacy_metadata_float(price),
         }
         label = str(row.get("label") or "").strip()
         if label:
@@ -4746,7 +5038,7 @@ def _normalize_chart_indicator_points(value) -> list[dict]:
         points.append(
             {
                 "timestamp": str(timestamp),
-                "value": _coerce_float(indicator_value),
+                "value": _coerce_legacy_metadata_float(indicator_value),
             }
         )
     return points
@@ -4936,8 +5228,8 @@ def _coerce_iso_datetime(value, fallback: str) -> str:
 
 
 def _build_synthetic_equity_curve(summary: dict, config: dict) -> list[dict]:
-    total_return_pct = _coerce_float(summary.get("total_return"), 0.0)
-    initial = _coerce_float((config or {}).get("initial_capital"), 10000.0)
+    total_return_pct = _coerce_legacy_metadata_float(summary.get("total_return"), 0.0)
+    initial = _coerce_legacy_metadata_float((config or {}).get("initial_capital"), 10000.0)
     if initial <= 0:
         initial = 10000.0
 
@@ -4945,7 +5237,7 @@ def _build_synthetic_equity_curve(summary: dict, config: dict) -> list[dict]:
     if end_equity <= 0:
         end_equity = max(1.0, initial * 0.01)
 
-    max_dd_pct = abs(_coerce_float(summary.get("max_drawdown"), 0.0))
+    max_dd_pct = abs(_coerce_legacy_metadata_float(summary.get("max_drawdown"), 0.0))
     trough_factor = max(0.05, min(0.95, 1.0 - (max_dd_pct / 100.0)))
     trough_equity = min(initial, end_equity) * trough_factor
 
@@ -5027,7 +5319,7 @@ def _build_sqlite_backtest_detail(result_id: str) -> dict | None:
         for k in (key,) + alt_keys:
             v = metrics_raw.get(k)
             if v is not None and v != "":
-                return _coerce_float(v, default)
+                return _coerce_legacy_metadata_float(v, default)
         return default
 
     total_return = _mf("total_return_pct", "total_return")
@@ -5064,18 +5356,18 @@ def _build_sqlite_backtest_detail(result_id: str) -> dict | None:
     ):
         v = metrics_raw.get(k)
         if v is not None and k not in metrics_out:
-            metrics_out[k] = _coerce_float(v)
+            metrics_out[k] = _coerce_legacy_metadata_float(v)
     metrics_out["status"] = status
     if error_detail:
         metrics_out["error"] = error_detail
     if metrics_raw.get("best_fitness") is not None:
-        metrics_out["best_fitness"] = _coerce_float(metrics_raw.get("best_fitness"))
+        metrics_out["best_fitness"] = _coerce_legacy_metadata_float(metrics_raw.get("best_fitness"))
     elif config_raw.get("best_fitness") is not None:
-        metrics_out["best_fitness"] = _coerce_float(config_raw.get("best_fitness"))
+        metrics_out["best_fitness"] = _coerce_legacy_metadata_float(config_raw.get("best_fitness"))
     if metrics_raw.get("n_trials") is not None:
-        metrics_out["n_trials"] = int(_coerce_float(metrics_raw.get("n_trials"), 0) or 0)
+        metrics_out["n_trials"] = int(_coerce_legacy_metadata_float(metrics_raw.get("n_trials"), 0) or 0)
     elif config_raw.get("n_trials") is not None:
-        metrics_out["n_trials"] = int(_coerce_float(config_raw.get("n_trials"), 0) or 0)
+        metrics_out["n_trials"] = int(_coerce_legacy_metadata_float(config_raw.get("n_trials"), 0) or 0)
     objective = config_raw.get("objective", metrics_raw.get("objective"))
     if objective is not None:
         metrics_out["objective"] = objective
@@ -5148,8 +5440,8 @@ def _build_file_only_backtest_detail(result_id: str) -> dict | None:
         gains = 0.0
         losses = 0.0
         for trade in trades:
-            ret = _coerce_float(trade.get("return_pct"), 0.0)
-            pnl = _coerce_float(trade.get("pnl"), 0.0)
+            ret = _coerce_legacy_metadata_float(trade.get("return_pct"), 0.0)
+            pnl = _coerce_legacy_metadata_float(trade.get("pnl"), 0.0)
             if ret > 0:
                 wins += 1
             if pnl > 0:
@@ -5171,15 +5463,15 @@ def _build_file_only_backtest_detail(result_id: str) -> dict | None:
     if isinstance(equity_curve, list) and equity_curve:
         start = str(equity_curve[0].get("timestamp") or "")
         end = str(equity_curve[-1].get("timestamp") or "")
-        start_equity = _coerce_float(equity_curve[0].get("equity"), 0.0)
-        end_equity = _coerce_float(equity_curve[-1].get("equity"), start_equity)
+        start_equity = _coerce_legacy_metadata_float(equity_curve[0].get("equity"), 0.0)
+        end_equity = _coerce_legacy_metadata_float(equity_curve[-1].get("equity"), start_equity)
         if start_equity > 0:
             total_return = ((end_equity / start_equity) - 1.0) * 100.0
 
         peak = 0.0
         max_dd = 0.0
         for point in equity_curve:
-            eq = _coerce_float(point.get("equity"), 0.0)
+            eq = _coerce_legacy_metadata_float(point.get("equity"), 0.0)
             if eq > peak:
                 peak = eq
             if peak > 0:
@@ -5341,11 +5633,11 @@ def _sqlite_backtest_summaries(
         for key in keys:
             value = metrics.get(key)
             if value not in (None, ""):
-                return _coerce_float(value, default)
+                return _coerce_legacy_metadata_float(value, default)
         return default
 
     def _ratio_to_percent(value: object) -> float:
-        parsed = _coerce_float(value, 0.0)
+        parsed = _coerce_legacy_metadata_float(value, 0.0)
         if parsed is None:
             return 0.0
         return float(parsed) * 100.0 if -1.0 <= float(parsed) <= 1.0 else float(parsed)
@@ -5540,7 +5832,7 @@ def _coerce_backtest_summary_payload(record: object) -> dict | None:
     if "metadata" in record and isinstance(record.get("metadata"), dict):
         return _normalize_backtest_summary({"id": rid, "metadata": record.get("metadata") or {}})
 
-    total_trades = int(_coerce_float(record.get("total_trades"), 0.0) or 0)
+    total_trades = int(_coerce_legacy_metadata_float(record.get("total_trades"), 0.0) or 0)
     verdict = str(record.get("verdict") or "").strip()
     if not verdict:
         verdict = "Insufficient Data" if total_trades < 2 else "Promising"
@@ -5562,15 +5854,15 @@ def _coerce_backtest_summary_payload(record: object) -> dict | None:
         "created_at": str(record.get("created_at") or record.get("recorded_at") or "1970-01-01T00:00:00+00:00"),
         "start": str(record.get("start") or record.get("start_date") or record.get("created_at") or ""),
         "end": str(record.get("end") or record.get("end_date") or record.get("created_at") or ""),
-        "total_return": _coerce_float(record.get("total_return"), 0.0),
+        "total_return": _coerce_legacy_metadata_float(record.get("total_return"), 0.0),
         "monthly_return_pct": _filter_sentinel(_coerce_optional_float(record.get("monthly_return_pct"))),
         "annualized_return_pct": _filter_sentinel(_coerce_optional_float(record.get("annualized_return_pct"))),
         "backtest_months": _filter_sentinel(_coerce_optional_float(record.get("backtest_months"))),
-        "sharpe_ratio": _coerce_float(record.get("sharpe_ratio"), 0.0),
-        "max_drawdown": _coerce_float(record.get("max_drawdown"), 0.0),
-        "win_rate": _coerce_float(record.get("win_rate"), 0.0),
+        "sharpe_ratio": _coerce_legacy_metadata_float(record.get("sharpe_ratio"), 0.0),
+        "max_drawdown": _coerce_legacy_metadata_float(record.get("max_drawdown"), 0.0),
+        "win_rate": _coerce_legacy_metadata_float(record.get("win_rate"), 0.0),
         "total_trades": total_trades,
-        "profit_factor": _coerce_float(record.get("profit_factor"), 0.0),
+        "profit_factor": _coerce_legacy_metadata_float(record.get("profit_factor"), 0.0),
         "result_type": str(record.get("result_type") or "backtest"),
         "verdict": verdict,
     }
@@ -5825,9 +6117,9 @@ def _normalize_backtest_summary(record: dict) -> dict:
     def _meta_float(*keys: str, default=None):
         for key in keys:
             if key in meta and meta.get(key) not in (None, ""):
-                return _coerce_float(meta.get(key))
+                return _coerce_legacy_metadata_float(meta.get(key))
             if key in config_meta and config_meta.get(key) not in (None, ""):
-                return _coerce_float(config_meta.get(key))
+                return _coerce_legacy_metadata_float(config_meta.get(key))
         return default
 
     def _ratio_to_percent_points(value):
@@ -6036,9 +6328,9 @@ def _normalize_backtest_detail(record: dict) -> dict:
     def _meta_float(*keys: str, default=None):
         for key in keys:
             if key in meta and meta.get(key) not in (None, ""):
-                return _coerce_float(meta.get(key))
+                return _coerce_legacy_metadata_float(meta.get(key))
             if key in config and config.get(key) not in (None, ""):
-                return _coerce_float(config.get(key))
+                return _coerce_legacy_metadata_float(config.get(key))
         return default
 
     metrics = {
@@ -6113,15 +6405,15 @@ def _normalize_backtest_detail(record: dict) -> dict:
                     continue
                 is_metrics = split.get("in_sample") if isinstance(split.get("in_sample"), dict) else {}
                 oos_metrics = split.get("out_of_sample") if isinstance(split.get("out_of_sample"), dict) else {}
-                fold_number = int(_coerce_float(split.get("split", idx + 1), idx + 1) or (idx + 1))
+                fold_number = int(_coerce_legacy_metadata_float(split.get("split", idx + 1), idx + 1) or (idx + 1))
                 fold = {
                     "fold_index": max(0, fold_number - 1),
                     "train_start": str(split.get("train_start") or summary.get("start") or summary.get("created_at")),
                     "train_end": str(split.get("train_end") or summary.get("end") or summary.get("created_at")),
                     "test_start": str(split.get("test_start") or summary.get("start") or summary.get("created_at")),
                     "test_end": str(split.get("test_end") or summary.get("end") or summary.get("created_at")),
-                    "train_metric": _coerce_float(is_metrics.get("sharpe", is_metrics.get("objective", 0.0))),
-                    "test_metric": _coerce_float(oos_metrics.get("sharpe", oos_metrics.get("objective", 0.0))),
+                    "train_metric": _coerce_legacy_metadata_float(is_metrics.get("sharpe", is_metrics.get("objective", 0.0))),
+                    "test_metric": _coerce_legacy_metadata_float(oos_metrics.get("sharpe", oos_metrics.get("objective", 0.0))),
                 }
                 if isinstance(split.get("best_params"), dict) and split.get("best_params"):
                     fold["best_params"] = split.get("best_params")
@@ -6776,6 +7068,12 @@ def get_settings():
             payload[_toggle] = all(bool(_prefs.get(_pk, True)) for _pk in _pref_keys)
     except Exception:
         pass
+    # OPS-4: the real-money arming flag is an ENV var, not a stored setting, so it
+    # never appeared next to the trading-mode controls it silently overrules. A
+    # live-armed instance read identically to a testnet-only one.
+    _arming = mainnet_arming_snapshot()
+    payload["mainnet_armed"] = bool(_arming.get("armed"))
+    payload["mainnet_arming"] = _arming
     return payload
 
 
@@ -8612,20 +8910,14 @@ def _try_research_recovery_on_edit(strategy_id: str):
 
         # WebSocket broadcast if available
         if result.get("promoted"):
-            try:
-                from forven.api_domains.live_ws import ws_manager
-                import asyncio
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                msg = {"type": "certification_change", "strategy_id": strategy_id, "promoted": True}
-                if loop and loop.is_running():
-                    loop.create_task(ws_manager.broadcast(msg))
-                else:
-                    asyncio.run(ws_manager.broadcast(msg))
-            except Exception:
-                pass
+            # API-08: this runs in the threadpool (sync handler), so the old
+            # `asyncio.run(ws_manager.broadcast(...))` fallback drove sockets owned
+            # by the uvicorn loop from a throwaway loop — and the bare
+            # `except Exception: pass` around it meant the resulting failure was
+            # invisible: the certification_change event silently never arrived.
+            dispatch_ws_broadcast(
+                {"type": "certification_change", "strategy_id": strategy_id, "promoted": True}
+            )
     except Exception:
         import logging
         logging.getLogger("forven.api_core").warning(
@@ -8984,8 +9276,8 @@ def get_backtesting_outcomes():
     sharpe_values: list[float] = []
     for rec in records:
         meta = rec.get("metadata") or {}
-        total_return = _coerce_float(meta.get("total_return"))
-        sharpe = _coerce_float(meta.get("sharpe"))
+        total_return = _coerce_legacy_metadata_float(meta.get("total_return"))
+        sharpe = _coerce_legacy_metadata_float(meta.get("sharpe"))
         total_returns.append(total_return)
         sharpe_values.append(sharpe)
         if total_return >= 0:
@@ -9899,15 +10191,15 @@ def _build_backtest_document(
     asset: str,
     metrics: dict,
 ) -> str:
-    sharpe = _coerce_float(metrics.get("sharpe"), 0.0)
-    total_return = _coerce_float(metrics.get("total_return_pct"), 0.0)
+    sharpe = _coerce_legacy_metadata_float(metrics.get("sharpe"), 0.0)
+    total_return = _coerce_legacy_metadata_float(metrics.get("total_return_pct"), 0.0)
     if abs(total_return) <= 1.0:
         total_return *= 100.0
-    win_rate = _coerce_float(metrics.get("win_rate"), 0.0)
+    win_rate = _coerce_legacy_metadata_float(metrics.get("win_rate"), 0.0)
     if abs(win_rate) <= 1.0:
         win_rate *= 100.0
-    profit_factor = _coerce_float(metrics.get("profit_factor"), 0.0)
-    max_drawdown = _coerce_float(metrics.get("max_drawdown_pct"), 0.0)
+    profit_factor = _coerce_legacy_metadata_float(metrics.get("profit_factor"), 0.0)
+    max_drawdown = _coerce_legacy_metadata_float(metrics.get("max_drawdown_pct"), 0.0)
     if abs(max_drawdown) <= 1.0:
         max_drawdown *= 100.0
     return (
@@ -9945,25 +10237,25 @@ def _normalize_trade_artifact_rows(raw_rows: object) -> list[dict]:
         # Engine emits `pnl_pct` as a ratio (0.0132 = +1.32%). Prefer the raw
         # ratio when present; treat a pre-existing `return_pct` field as the
         # same ratio shape for back-compat.
-        ratio = _coerce_float(row.get("pnl_pct"), None)
+        ratio = _coerce_legacy_metadata_float(row.get("pnl_pct"), None)
         if ratio is None:
-            ratio = _coerce_float(row.get("return_pct"), None)
+            ratio = _coerce_legacy_metadata_float(row.get("return_pct"), None)
         if ratio is None:
             ratio = 0.0
-        pnl_raw = _coerce_float(row.get("pnl"), None)
+        pnl_raw = _coerce_legacy_metadata_float(row.get("pnl"), None)
         if pnl_raw is None:
             pnl_raw = equity * ratio
         trade_row: dict = {
             "entry_time": str(row.get("entry_time") or row.get("entry_ts") or ""),
-            "entry_price": _coerce_float(row.get("entry_price"), 0.0),
+            "entry_price": _coerce_legacy_metadata_float(row.get("entry_price"), 0.0),
             "exit_time": str(row.get("exit_time") or row.get("exit_ts") or row.get("entry_time") or ""),
-            "exit_price": _coerce_float(row.get("exit_price"), 0.0),
-            "size": _coerce_float(row.get("size"), 1.0),
-            "pnl": _coerce_float(pnl_raw, 0.0),
-            "return_pct": _coerce_float(ratio * 100.0, 0.0),
+            "exit_price": _coerce_legacy_metadata_float(row.get("exit_price"), 0.0),
+            "size": _coerce_legacy_metadata_float(row.get("size"), 1.0),
+            "pnl": _coerce_legacy_metadata_float(pnl_raw, 0.0),
+            "return_pct": _coerce_legacy_metadata_float(ratio * 100.0, 0.0),
             # Preserve the raw engine ratio so the read-side normalizer keeps the
             # exact per-trade return rather than re-deriving it from price.
-            "pnl_pct": _coerce_float(row.get("pnl_pct"), ratio),
+            "pnl_pct": _coerce_legacy_metadata_float(row.get("pnl_pct"), ratio),
         }
         # Carry through descriptive fields (only when present) so the result
         # viewer can show direction / hold time / MAE-MFE and the manual
@@ -9975,10 +10267,10 @@ def _normalize_trade_artifact_rows(raw_rows: object) -> list[dict]:
             if row.get(key) not in (None, ""):
                 trade_row[key] = str(row[key])
         if row.get("bars_held") not in (None, ""):
-            trade_row["bars_held"] = int(_coerce_float(row.get("bars_held"), 0.0))
+            trade_row["bars_held"] = int(_coerce_legacy_metadata_float(row.get("bars_held"), 0.0))
         for key in ("mae", "mfe", "size_fraction"):
             if row.get(key) not in (None, ""):
-                trade_row[key] = _coerce_float(row.get(key))
+                trade_row[key] = _coerce_legacy_metadata_float(row.get(key))
         normalized.append(trade_row)
         equity = max(0.0, equity * (1.0 + ratio))
     return normalized
@@ -10130,10 +10422,10 @@ def _persist_completed_backtest_run(
     if not isinstance(oos_metrics, dict):
         oos_metrics = {}
 
-    total_return_pct = _coerce_float(metrics.get("total_return_pct"), 0.0)
-    sharpe = _coerce_float(metrics.get("sharpe"), 0.0)
-    max_drawdown = _coerce_float(metrics.get("max_drawdown_pct"), 0.0)
-    total_trades = int(_coerce_float(metrics.get("total_trades"), 0.0) or 0)
+    total_return_pct = _coerce_legacy_metadata_float(metrics.get("total_return_pct"), 0.0)
+    sharpe = _coerce_legacy_metadata_float(metrics.get("sharpe"), 0.0)
+    max_drawdown = _coerce_legacy_metadata_float(metrics.get("max_drawdown_pct"), 0.0)
+    total_trades = int(_coerce_legacy_metadata_float(metrics.get("total_trades"), 0.0) or 0)
 
     evaluation_monthly_return = _coerce_optional_float(oos_metrics.get("monthly_return_pct"))
     evaluation_annualized_return = _coerce_optional_float(oos_metrics.get("annualized_return_pct"))
@@ -10912,7 +11204,7 @@ def _is_canonical_backtest_submit(
     if str(body.trade_mode or "").strip() or body.allow_shorting is not None:
         return False
     if body.leverage is not None:
-        stored_leverage = _coerce_float(execution_params.get("leverage"), None)
+        stored_leverage = _coerce_legacy_metadata_float(execution_params.get("leverage"), None)
         if stored_leverage is None or stored_leverage <= 0:
             stored_leverage = float(settings.get("default_leverage", 1.0) or 1.0)
         if abs(float(body.leverage) - float(stored_leverage)) > 1e-9:
@@ -11029,9 +11321,9 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
     except Exception:
         pass
 
-    leverage_value = _coerce_float(body.leverage, None)
+    leverage_value = _coerce_legacy_metadata_float(body.leverage, None)
     if leverage_value is None:
-        leverage_value = _coerce_float(execution_params.get("leverage"), None)
+        leverage_value = _coerce_legacy_metadata_float(execution_params.get("leverage"), None)
     if leverage_value is None or leverage_value <= 0:
         # Operator-configurable default (1x) shared with paper/selection for parity.
         leverage_value = float(get_settings().get("default_leverage", 1.0) or 1.0)
@@ -11119,10 +11411,10 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
     if not isinstance(oos_metrics, dict):
         oos_metrics = {}
 
-    total_return_pct = _coerce_float(metrics.get("total_return_pct"), 0.0)
-    sharpe = _coerce_float(metrics.get("sharpe"), 0.0)
-    max_drawdown = _coerce_float(metrics.get("max_drawdown_pct"), 0.0)
-    total_trades = int(_coerce_float(metrics.get("total_trades"), 0.0) or 0)
+    total_return_pct = _coerce_legacy_metadata_float(metrics.get("total_return_pct"), 0.0)
+    sharpe = _coerce_legacy_metadata_float(metrics.get("sharpe"), 0.0)
+    max_drawdown = _coerce_legacy_metadata_float(metrics.get("max_drawdown_pct"), 0.0)
+    total_trades = int(_coerce_legacy_metadata_float(metrics.get("total_trades"), 0.0) or 0)
 
     evaluation_monthly_return = _coerce_optional_float(oos_metrics.get("monthly_return_pct"))
     evaluation_annualized_return = _coerce_optional_float(oos_metrics.get("annualized_return_pct"))
@@ -11539,8 +11831,8 @@ def post_optimization_submit(body: OptimizationSubmitBody):
             best_execution_controls = opt_result.get("best_execution_controls", {})
             best_execution_profile = opt_result.get("best_execution_profile", {})
             best_metrics = opt_result.get("best_metrics", {})
-            best_fitness = _coerce_float(opt_result.get("best_fitness"), 0.0)
-            best_objective_value = _coerce_float(opt_result.get("best_objective_value"), best_fitness)
+            best_fitness = _coerce_legacy_metadata_float(opt_result.get("best_fitness"), 0.0)
+            best_objective_value = _coerce_legacy_metadata_float(opt_result.get("best_objective_value"), best_fitness)
 
             optimization_start = str(body_start or best_metrics.get("start_date") or best_metrics.get("start") or opt_start_placeholder).strip()
             optimization_end = str(body_end or best_metrics.get("end_date") or best_metrics.get("end") or opt_end_placeholder).strip()
@@ -11982,9 +12274,9 @@ def post_backtesting_run(body: dict):
                 # Run the backtest at the strategy's OWN declared leverage (captured here,
                 # before certification may drop the key), not a fixed 3x assumption. An
                 # explicit body leverage still wins; engine falls back to 3.0 if neither set.
-                _bt_leverage = _coerce_float(body.get("leverage"), None)
+                _bt_leverage = _coerce_legacy_metadata_float(body.get("leverage"), None)
                 if _bt_leverage is None:
-                    _bt_leverage = _coerce_float(merged_params.get("leverage"), None)
+                    _bt_leverage = _coerce_legacy_metadata_float(merged_params.get("leverage"), None)
                 strategy_type = _resolve_backtesting_strategy_type(
                     explicit_type=body.get("strategy_type")
                     or (resolve_execution_strategy_type(strategy_row) if strategy_row else None),

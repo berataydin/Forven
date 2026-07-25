@@ -21,6 +21,13 @@
 	let resetBusy = false;
 	let haltBusy = false;
 	let realtime: RealtimeRefreshController | null = null;
+	// FE-01/FE-03: per-source freshness. `*Stale` = that read failed on the most
+	// recent poll (we may still be rendering its last-good payload);
+	// `lastTelemetryAt` = the last time BOTH landed, rendered as a visible stamp so
+	// a frozen page is obvious instead of looking like a calm one.
+	let dashboardStale = false;
+	let riskStale = false;
+	let lastTelemetryAt: Date | null = null;
 
 	$: limits = risk?.limits ?? {};
 	$: portfolio = (scope === 'paper' ? risk?.portfolio_paper : risk?.portfolio) ?? {};
@@ -97,9 +104,20 @@
 			].filter((cb) => cb.state)
 		: [];
 
-	// Distinguish "no telemetry yet" from a genuine all-zero/safe reading. Both
-	// upstream calls populate `dashboard`/`risk`; if neither resolved we have no data.
-	$: hasRiskData = dashboard !== null || risk !== null;
+	// FE-01: the gauges need BOTH sources. Drawdown/daily-loss come from
+	// /api/dashboard, but every LIMIT they are graded against (`risk.limits`) and
+	// the portfolio risk figure come from /api/risk. With `||` here, a failed
+	// /api/risk while /api/dashboard succeeded rendered three confident 0.00%
+	// gauges against fabricated default limits and NO error banner — the page
+	// claimed "no drawdown, no risk" precisely when it had stopped knowing.
+	$: hasRiskData = dashboard !== null && risk !== null;
+	// A source that failed on the LAST poll while we still hold its previous
+	// payload: the numbers on screen are real but no longer current. Never
+	// substitute zeros for this — say so instead.
+	$: telemetryStale = dashboardStale || riskStale;
+	$: staleSources = [dashboardStale ? 'dashboard' : '', riskStale ? 'risk' : '']
+		.filter(Boolean)
+		.join(' + ');
 
 	$: gauges = [
 		{ label: 'Drawdown', value: currentDrawdown, max: Number(limits.max_drawdown ?? 0.1) },
@@ -162,15 +180,25 @@
 
 		if (dashboardResult.status === 'fulfilled') {
 			dashboard = dashboardResult.value;
+			dashboardStale = false;
+		} else {
+			dashboardStale = true;
 		}
 
 		if (riskResult.status === 'fulfilled') {
 			risk = riskResult.value;
+			riskStale = false;
+		} else {
+			riskStale = true;
 		}
 
 		if (dashboardResult.status === 'rejected' && riskResult.status === 'rejected') {
 			error = 'Risk telemetry unavailable.';
 		}
+
+		// FE-03: only stamp when BOTH reads landed — the gauges are a joint
+		// product, so a half-fresh page is a stale page.
+		if (!dashboardStale && !riskStale) lastTelemetryAt = new Date();
 
 		loading = false;
 	}
@@ -296,9 +324,15 @@
 			/* ignore */
 		}
 		void loadRiskData();
+		// FE-03: keep the interval poller running EVEN while the websocket is
+		// connected. Drawdown, equity and daily PnL move with the mark, and mark
+		// movement emits none of the whitelisted WS events — with the default
+		// (poll only while WS is offline) these gauges froze for hours on a
+		// healthy socket, which is exactly when an operator trusts them most.
 		realtime = createRealtimeRefresh(loadRiskData, {
 			fallbackMs: 20_000,
 			wsDebounceMs: 1200,
+			pollWhenWsOfflineOnly: false,
 		});
 		realtime.start();
 	});
@@ -416,6 +450,21 @@
 		</div>
 	{/if}
 
+	<!-- FE-01/FE-03: staleness strip + explicit "as of" stamp. A risk page that
+	     silently stops updating is worse than one that admits it. -->
+	<div class="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+		<span class="text-[#666]">
+			Telemetry as of
+			<span class="text-[#888]">{lastTelemetryAt ? lastTelemetryAt.toLocaleTimeString() : '—'}</span>
+		</span>
+		{#if telemetryStale}
+			<span class="border border-[#3a2f1a] bg-[#161208] px-2 py-1 text-yellow-200">
+				STALE — the {staleSources} read failed on the last refresh; figures shown are the
+				last known values, not current ones.
+			</span>
+		{/if}
+	</div>
+
 	{#if circuitBreakers.length > 0}
 		<div class="flex flex-wrap items-center gap-2">
 			<span class="text-[10px] uppercase tracking-wider text-[#666]">Circuit Breakers</span>
@@ -510,7 +559,9 @@
 	</div>
 	{:else if !loading}
 		<div class="border border-[#3a2f1a] bg-[#161208] p-4 text-sm text-yellow-200">
-			Risk telemetry is unavailable. Gauges and limits cannot be displayed — the values below are not safe-zero readings.
+			Risk telemetry is incomplete{staleSources ? ` (${staleSources} unavailable)` : ''}. Gauges and
+			limits are hidden on purpose — rendering them from a partial read would show 0.00% where the
+			true value is simply unknown.
 		</div>
 	{/if}
 
