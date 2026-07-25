@@ -15,7 +15,6 @@ from typing import Any
 import httpx
 from fastapi import HTTPException, Request, WebSocket, WebSocketDisconnect  # noqa: F401
 from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel, Field
 
 from forven.ai import normalize_provider_and_model
 from forven.codex_responses import is_openai_oauth_token
@@ -59,10 +58,162 @@ from forven.scheduler import (
     seed_forven_jobs,
 )
 from forven.secret_storage import decrypt_secret, encrypt_secret
-from forven.throughput_policy import THROUGHPUT_DEFAULTS
 from forven import strategy_lifecycle as lifecycle_service
 from forven.workspace import read_workspace, write_workspace
 from forven.util import generate_pkce, generate_state, normalize_stage
+
+# ARCH-06 step 1: the provider registry + model-discovery block (~900 lines)
+# now lives in forven.providers.discovery. These re-exports are a COMPATIBILITY
+# SHIM, not a convenience import — `forven.api_core` is the name every existing
+# importer (and several tests, which reach for the private helpers by name)
+# already binds to, so every symbol that used to be defined here is still
+# reachable here. Do not prune them without grepping forven/, tests/ and
+# scripts/ first.
+from forven.providers import discovery as _model_discovery  # noqa: F401
+from forven.providers.discovery import (  # noqa: F401
+    _AGENT_MODEL_CATALOG,
+    _AGENT_MODEL_LIST_CACHE,
+    _AGENT_MODEL_LIST_CACHE_TTL_SECONDS,
+    _AUTH_PROVIDER_ENV_VARS,
+    _AUTH_TEST_ENDPOINT_OVERRIDES,
+    _AUTH_TEST_HEADER_OVERRIDES,
+    _DEFAULT_AGENT_MODEL_KEYS,
+    _LOCAL_PROVIDER_DEFAULT_BASE_URLS,
+    _MODEL_DISCOVERY_ALT_ENDPOINTS,
+    _MODEL_DISCOVERY_HEADERS,
+    _MODEL_PROVIDER_DISPLAY_NAMES,
+    _SUPPORTED_AUTH_PROVIDERS,
+    _ZAI_CANDIDATE_ENDPOINTS,
+    _agent_model_option_key,
+    _coerce_discovered_model_record,
+    _collect_discovery_models,
+    _default_agent_model_keys,
+    _detect_zai_endpoint,
+    _discovery_model_should_belong,
+    _extract_discovery_models,
+    _get_provider_base_url,
+    _get_provider_discovery_token,
+    _looks_like_anthropic_discovery_model,
+    _looks_like_cerebras_discovery_model,
+    _looks_like_deepseek_discovery_model,
+    _looks_like_gemini_discovery_model,
+    _looks_like_groq_discovery_model,
+    _looks_like_lmstudio_discovery_model,
+    _looks_like_minimax_discovery_model,
+    _looks_like_mistral_discovery_model,
+    _looks_like_nvidia_discovery_model,
+    _looks_like_opencode_discovery_model,
+    _looks_like_openai_discovery_model,
+    _looks_like_xai_discovery_model,
+    _looks_like_zai_discovery_model,
+    _merge_model_records,
+    _normalize_local_base_url,
+    _normalize_model_id,
+    _prettify_gemma_id,
+    _provider_requires_token,
+    _provider_supports_oauth,
+)
+
+# ARCH-06 step 2: the POST-body Pydantic models moved to forven.api_models.
+# Same compatibility-shim rule as above — routers reference them as
+# `core.XBody`, tests import them from `forven.api_core`, and evolution.py /
+# gauntlet/tasks.py / phantom_recovery.py construct them directly.
+from forven.api_models import (  # noqa: F401
+    AgentDiscordTestBody,
+    AuthProviderOAuthCompleteBody,
+    AuthProviderOAuthStartBody,
+    AuthProviderProfileBody,
+    BacktestPreviewBody,
+    BacktestSubmitBody,
+    BacktestingRunBody,
+    BrainChatBody,
+    BrainChatHistoryEntry,
+    ForceCloseTradeBody,
+    LegacyAgentCreateBody,
+    LegacyAgentDocumentBody,
+    LegacyAgentModelBody,
+    LegacyAgentUpdateBody,
+    ManualStrategyBody,
+    MarkTradeFailedBody,
+    ModelPolicyUpdateBody,
+    NlToSpecBody,
+    OptimizationSubmitBody,
+    PaperAdjustLevelBody,
+    PaperAutoManagementBody,
+    PaperClosePositionBody,
+    PaperOpenPositionBody,
+    PaperPartialCloseBody,
+    PipelineSettingsUpdateBody,
+    PreviewChartBody,
+    SendToForgeBody,
+    SettingsApiKeyBody,
+    SettingsTestRemoteEngineBody,
+)
+
+# ARCH-06 step 3 (partial): the DECLARATIVE half of the settings subsystem —
+# defaults, pure normalizers/coercers, the API-02 section schema + validator and
+# the audit differ — moved to forven.settings_apply. The KV-touching half
+# (_load/_save_settings_payload, the secrets/api-key/pipeline loaders and
+# _apply_settings_section) deliberately stayed here; see the module docstring of
+# forven.settings_apply for why moving it would silently detach the atomicity
+# tests from the code they gate.
+from forven.settings_apply import (  # noqa: F401
+    DEFAULT_BACKTEST_DURATION_DAYS,
+    _AUDIT_IGNORE_KEYS,
+    _DEFAULT_API_KEY_SOURCES,
+    _DEFAULT_GRAVEYARD_STRATEGY_LIMIT,
+    _DEFAULT_PIPELINE_SETTINGS,
+    _DEFAULT_SETTINGS_PAYLOAD,
+    _GRAVEYARD_STRATEGY_STATUSES,
+    _PIPELINE_STAGE_WIP_CAPS,
+    _PIPELINE_WIP_CAP_UNLIMITED_VALUES,
+    _SETTINGS_API_KEYS_STORAGE_KEY,
+    _SETTINGS_MUTATION_LOCK,
+    _SETTINGS_PIPELINE_STORAGE_KEY,
+    _SETTINGS_SECRET_STORAGE_KEY,
+    _SETTINGS_SECTION_KNOWN_KEYS,
+    _SETTINGS_SECTION_NUMERIC_BOUNDS,
+    _SETTINGS_STORAGE_KEY,
+    _append_settings_audit,
+    _coerce_agent_model_keys,
+    _coerce_bool,
+    _coerce_bounded_int,
+    _coerce_float,
+    _coerce_optional_int,
+    _deep_merge_dicts,
+    _default_data_engine_settings_payload,
+    _default_pipeline_settings_payload,
+    _default_research_settings_payload,
+    _default_settings_payload,
+    _diff_settings_section,
+    _merge_data_engine_settings_payload,
+    _merge_research_settings_payload,
+    _normalize_agent_model_key,
+    _normalize_graveyard_strategy_limit_mode,
+    _normalize_graveyard_strategy_limit_payload,
+    _normalize_graveyard_strategy_limit_value,
+    _normalize_pipeline_wip_cap_mode,
+    _normalize_pipeline_wip_cap_payload,
+    _normalize_pipeline_wip_cap_value,
+    _pipeline_wip_cap_kv_items,
+    _validate_settings_section_payload,
+)
+
+
+def _discover_provider_models(provider: str, force_refresh: bool = False) -> tuple[list[dict], str | None]:
+    """Shim over forven.providers.discovery._discover_provider_models (ARCH-06).
+
+    Not a plain re-export: the token getter is threaded through explicitly so
+    that `monkeypatch.setattr(api_core, "_get_provider_discovery_token", ...)`
+    still changes what discovery uses. Tests do exactly that to prove a ChatGPT
+    OAuth token is never probed against api.openai.com/v1/models (it 401s), and
+    a bare re-export would have silently stopped honouring the patch.
+    """
+    return _model_discovery._discover_provider_models(
+        provider,
+        force_refresh,
+        token_getter=_get_provider_discovery_token,
+    )
 
 log = logging.getLogger("forven.api")
 _BACKTEST_RESULTS_REMOTE_API_ENV = "FORVEN_BACKTEST_RESULTS_REMOTE_API"
@@ -339,6 +490,22 @@ async def _on_startup():
                     "Scheduler bootstrap attempt %d/%d failed: %s — retrying in %.0fs",
                     attempt + 1, _BOOTSTRAP_MAX_RETRIES, exc, _BOOTSTRAP_RETRY_DELAY,
                 )
+                # TEST-9: the ONE sanctioned blocking sleep in this module. It
+                # runs inside the startup hook, before uvicorn serves a single
+                # request, so there is no request loop to starve — and the retry
+                # must actually delay (an await here would let the app begin
+                # serving with no scheduler jobs).
+                #
+                # This line WANTS a trailing per-line ASYNC251 suppression so the
+                # whole-file exemption in pyproject.toml can be dropped. It does
+                # not have one yet because the suppression and the pyproject entry
+                # must land in the SAME commit as a third edit:
+                # tests/test_harden_infra.py::test_test9_api_core_blocking_sleep_stays_a_single_known_instance
+                # re-runs ruff with `lint.per-file-ignores = {}` and asserts
+                # exactly ONE ASYNC251 hit here. A suppression removes that hit, so
+                # adding it alone turns the pin test red. api_core.py is also now
+                # clean under F841 (ARCH-07), so BOTH entries of the
+                # "forven/api_core.py" per-file-ignores line can go at once.
                 _time.sleep(_BOOTSTRAP_RETRY_DELAY)
             else:
                 log.critical(
@@ -380,844 +547,12 @@ def _parse_int_query(value: str | None, default: int = 0) -> int:
         return default
 
 
-_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"]
-_AUTH_PROVIDER_ENV_VARS = {
-    "openai": "OPENAI_API_KEY",
-    "minimax": "MINIMAX_API_KEY",
-    "lmstudio": "LMSTUDIO_API_KEY",
-    "zai": "ZAI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "cerebras": "CEREBRAS_API_KEY",
-    "mistral": "MISTRAL_API_KEY",
-    "xai": "XAI_API_KEY",
-    "together": "TOGETHER_API_KEY",
-    "nvidia": "NVIDIA_API_KEY",
-    "opencode-zen": "OPENCODE_ZEN_API_KEY",
-    "opencode-go": "OPENCODE_GO_API_KEY",
-}
 _AUTH_OAUTH_SESSIONS: dict[str, dict[str, dict[str, object]]] = {}
 _AUTH_OAUTH_CALLBACKS: dict[str, dict[str, str]] = {}
 _AUTH_OAUTH_RESULTS: dict[str, dict[str, dict[str, object]]] = {}
 _AUTH_OAUTH_SESSION_TTL_SECONDS = 15 * 60
 _OPENAI_LOOPBACK_PORT = 1455
 _OPENAI_OAUTH_LISTENER_TTL_SECONDS = 5 * 60
-_AGENT_MODEL_LIST_CACHE_TTL_SECONDS = 30 * 60
-_AGENT_MODEL_LIST_CACHE: dict[str, dict[str, object]] = {}
-_MODEL_DISCOVERY_ALT_ENDPOINTS = {
-    "openai": ["https://api.openai.com/v1/models"],
-    "minimax": [
-        "https://api.minimax.io/anthropic/v1/models",
-        "https://api.minimax.io/v1/models",
-        "https://api.minimax.io/v1/models/list",
-        "https://api.minimax.io/api/paas/v3/model/list",
-        "https://api.minimax.io/api/v1/models",
-        "https://api.minimaxi.com/v1/models",
-        "https://open.bigmodel.cn/api/paas/v3/model/list",
-    ],
-    "zai": [
-        "https://api.z.ai/api/paas/v4/models",
-        "https://open.bigmodel.cn/api/paas/v4/models",
-    ],
-    "groq": ["https://api.groq.com/openai/v1/models"],
-    "gemini": ["https://generativelanguage.googleapis.com/v1beta/openai/models"],
-    # Anthropic paginates /v1/models (default 20); ask for the full list so new
-    # releases (e.g. newer Opus/Sonnet) surface without a catalog edit.
-    "anthropic": ["https://api.anthropic.com/v1/models?limit=1000"],
-    # DeepSeek is OpenAI-compatible; try the /v1 path first, then the bare path.
-    "deepseek": [
-        "https://api.deepseek.com/v1/models",
-        "https://api.deepseek.com/models",
-    ],
-    "cerebras": ["https://api.cerebras.ai/v1/models"],
-    "mistral": ["https://api.mistral.ai/v1/models"],
-    "xai": ["https://api.x.ai/v1/models"],
-    # NVIDIA NIM is OpenAI-compatible; /v1/models lists the whole catalog
-    # (chat + embeddings + rerankers), filtered to chat by the belong-rule.
-    "nvidia": ["https://integrate.api.nvidia.com/v1/models"],
-    # OpenCode Zen exposes an OpenAI-compatible /models route (curated catalog).
-    # OpenCode GO has NO /models endpoint (chat-completions only), so it is not
-    # listed here — its models are curated in _AGENT_MODEL_CATALOG instead.
-    "opencode-zen": ["https://opencode.ai/zen/v1/models"],
-    # Together is a large gateway; its models are curated in the catalog rather
-    # than discovered, to avoid flooding the picker.
-}
-_MODEL_DISCOVERY_HEADERS = {
-    "openai": {
-        "Authorization": "Bearer {token}",
-    },
-    "minimax": {
-        "Authorization": "Bearer {token}",
-        "x-api-key": "{token}",
-    },
-    "zai": {
-        "Authorization": "Bearer {token}",
-    },
-    "groq": {
-        "Authorization": "Bearer {token}",
-    },
-    "gemini": {
-        "Authorization": "Bearer {token}",
-    },
-    "anthropic": {
-        "x-api-key": "{token}",
-        "anthropic-version": "2023-06-01",
-    },
-    "deepseek": {
-        "Authorization": "Bearer {token}",
-    },
-    "cerebras": {
-        "Authorization": "Bearer {token}",
-    },
-    "mistral": {
-        "Authorization": "Bearer {token}",
-    },
-    "xai": {
-        "Authorization": "Bearer {token}",
-    },
-    "nvidia": {
-        "Authorization": "Bearer {token}",
-    },
-    "opencode-zen": {
-        "Authorization": "Bearer {token}",
-    },
-}
-
-# Endpoints used by the connection "Test" to verify a key is actually valid
-# (not just present). Defaults to the model-discovery endpoints/headers above;
-# overrides here cover providers whose /models route is unauthenticated and so
-# can't distinguish a good key from a bad one (e.g. OpenRouter).
-_AUTH_TEST_ENDPOINT_OVERRIDES = {
-    "openrouter": ["https://openrouter.ai/api/v1/key"],
-    # Together isn't model-discovered; verify the key against its /models route.
-    "together": ["https://api.together.xyz/v1/models"],
-}
-_AUTH_TEST_HEADER_OVERRIDES = {
-    "openrouter": {"Authorization": "Bearer {token}"},
-    "together": {"Authorization": "Bearer {token}"},
-}
-_MODEL_PROVIDER_DISPLAY_NAMES = {
-    "openai": "OpenAI",
-    "minimax": "MiniMax",
-    "lmstudio": "LM Studio",
-    "zai": "Z.AI",
-    "openrouter": "OpenRouter",
-    "anthropic": "Anthropic",
-    "deepseek": "DeepSeek",
-    "groq": "Groq",
-    "gemini": "Google Gemini",
-    "cerebras": "Cerebras",
-    "mistral": "Mistral",
-    "xai": "xAI (Grok)",
-    "together": "Together AI",
-    "nvidia": "NVIDIA NIM",
-    "opencode-zen": "OpenCode Zen",
-    "opencode-go": "OpenCode GO",
-}
-_LOCAL_PROVIDER_DEFAULT_BASE_URLS = {
-    "lmstudio": "http://127.0.0.1:1234",
-    "zai": "",
-}
-
-_AGENT_MODEL_CATALOG = [
-    {"provider": "openai", "model_id": "gpt-3.5-turbo", "label": "OpenAI GPT-3.5 Turbo"},
-    {"provider": "openai", "model_id": "gpt-3.5-turbo-0125", "label": "OpenAI GPT-3.5 Turbo (0125)"},
-    {"provider": "openai", "model_id": "gpt-4.1", "label": "OpenAI GPT-4.1"},
-    {"provider": "openai", "model_id": "gpt-4.1-mini", "label": "OpenAI GPT-4.1 Mini"},
-    {"provider": "openai", "model_id": "gpt-4.1-nano", "label": "OpenAI GPT-4.1 Nano"},
-    {"provider": "openai", "model_id": "gpt-4-turbo", "label": "OpenAI GPT-4 Turbo"},
-    {"provider": "openai", "model_id": "gpt-4-0125-preview", "label": "OpenAI GPT-4 (0125 Preview)"},
-    {"provider": "openai", "model_id": "gpt-4-vision-preview", "label": "OpenAI GPT-4 Vision Preview"},
-    {"provider": "openai", "model_id": "gpt-4o", "label": "OpenAI GPT-4o"},
-    {"provider": "openai", "model_id": "gpt-4o-mini", "label": "OpenAI GPT-4o Mini"},
-    {"provider": "openai", "model_id": "gpt-5", "label": "OpenAI GPT-5"},
-    {"provider": "openai", "model_id": "gpt-5.2", "label": "OpenAI GPT-5.2"},
-    {"provider": "openai", "model_id": "gpt-5.2-mini", "label": "OpenAI GPT-5.2 Mini"},
-    {"provider": "openai", "model_id": "gpt-5.4", "label": "OpenAI GPT-5.4"},
-    {"provider": "openai", "model_id": "gpt-5.4-mini", "label": "OpenAI GPT-5.4 Mini"},
-    {"provider": "openai", "model_id": "gpt-5.5", "label": "OpenAI GPT-5.5"},
-    {"provider": "openai", "model_id": "o1", "label": "OpenAI O1"},
-    {"provider": "openai", "model_id": "o1-mini", "label": "OpenAI O1 Mini"},
-    {"provider": "openai", "model_id": "o1-preview", "label": "OpenAI O1 Preview"},
-    {"provider": "openai", "model_id": "codex-5.3-ultra", "label": "OpenAI Codex 5.3 Ultra"},
-    {"provider": "openai", "model_id": "codex-5.3-extra-high", "label": "OpenAI Codex 5.3 Extra High"},
-    {"provider": "openai", "model_id": "codex-5.3", "label": "OpenAI Codex 5.3"},
-    {"provider": "minimax", "model_id": "MiniMax-M2.7", "label": "MiniMax M2.7"},
-    {"provider": "minimax", "model_id": "MiniMax-M2.7-highspeed", "label": "MiniMax M2.7 Highspeed"},
-    {"provider": "minimax", "model_id": "MiniMax-M2.5", "label": "MiniMax M2.5"},
-    {"provider": "minimax", "model_id": "MiniMax-M2.5-highspeed", "label": "MiniMax M2.5 Highspeed"},
-    {"provider": "minimax", "model_id": "MiniMax-M2.1", "label": "MiniMax M2.1"},
-    {"provider": "minimax", "model_id": "MiniMax-M2.1-highspeed", "label": "MiniMax M2.1 Highspeed"},
-    {"provider": "minimax", "model_id": "MiniMax-M2", "label": "MiniMax M2"},
-    {"provider": "lmstudio", "model_id": "local-model", "label": "LM Studio Local Model"},
-    {"provider": "zai", "model_id": "glm-5.1", "label": "Z.AI GLM-5.1"},
-    {"provider": "zai", "model_id": "glm-5", "label": "Z.AI GLM-5"},
-    {"provider": "zai", "model_id": "glm-5-turbo", "label": "Z.AI GLM-5 Turbo"},
-    {"provider": "zai", "model_id": "glm-5v-turbo", "label": "Z.AI GLM-5V Turbo"},
-    {"provider": "zai", "model_id": "glm-4.7", "label": "Z.AI GLM-4.7"},
-    {"provider": "zai", "model_id": "glm-4.7-flash", "label": "Z.AI GLM-4.7 Flash"},
-    {"provider": "zai", "model_id": "glm-4.7-flashx", "label": "Z.AI GLM-4.7 FlashX"},
-    {"provider": "zai", "model_id": "glm-4.6", "label": "Z.AI GLM-4.6"},
-    {"provider": "zai", "model_id": "glm-4.6v", "label": "Z.AI GLM-4.6V"},
-    {"provider": "zai", "model_id": "glm-4.5", "label": "Z.AI GLM-4.5"},
-    {"provider": "zai", "model_id": "glm-4.5-air", "label": "Z.AI GLM-4.5 Air"},
-    {"provider": "zai", "model_id": "glm-4.5-flash", "label": "Z.AI GLM-4.5 Flash"},
-    {"provider": "zai", "model_id": "glm-4.5v", "label": "Z.AI GLM-4.5V"},
-    {"provider": "anthropic", "model_id": "claude-opus-4-7", "label": "Anthropic Claude Opus 4.7"},
-    {"provider": "anthropic", "model_id": "claude-sonnet-4-6", "label": "Anthropic Claude Sonnet 4.6"},
-    {"provider": "anthropic", "model_id": "claude-haiku-4-5-20251001", "label": "Anthropic Claude Haiku 4.5"},
-    {"provider": "anthropic", "model_id": "claude-3-5-sonnet-20241022", "label": "Anthropic Claude 3.5 Sonnet"},
-    {"provider": "anthropic", "model_id": "claude-3-5-haiku-20241022", "label": "Anthropic Claude 3.5 Haiku"},
-    {"provider": "deepseek", "model_id": "deepseek-chat", "label": "DeepSeek Chat"},
-    {"provider": "deepseek", "model_id": "deepseek-reasoner", "label": "DeepSeek Reasoner"},
-    {"provider": "groq", "model_id": "llama-3.3-70b-versatile", "label": "Groq Llama 3.3 70B Versatile"},
-    {"provider": "groq", "model_id": "llama-3.1-8b-instant", "label": "Groq Llama 3.1 8B Instant"},
-    {"provider": "groq", "model_id": "openai/gpt-oss-120b", "label": "Groq GPT-OSS 120B"},
-    {"provider": "groq", "model_id": "openai/gpt-oss-20b", "label": "Groq GPT-OSS 20B"},
-    {"provider": "groq", "model_id": "moonshotai/kimi-k2-instruct", "label": "Groq Kimi K2 Instruct"},
-    {"provider": "groq", "model_id": "qwen/qwen3-32b", "label": "Groq Qwen3 32B"},
-    {"provider": "gemini", "model_id": "gemini-2.5-pro", "label": "Google Gemini 2.5 Pro"},
-    {"provider": "gemini", "model_id": "gemini-2.5-flash", "label": "Google Gemini 2.5 Flash"},
-    {"provider": "gemini", "model_id": "gemini-2.5-flash-lite", "label": "Google Gemini 2.5 Flash Lite"},
-    {"provider": "gemini", "model_id": "gemini-2.0-flash", "label": "Google Gemini 2.0 Flash"},
-    {"provider": "gemini", "model_id": "gemini-1.5-flash", "label": "Google Gemini 1.5 Flash"},
-    # Google's open Gemma models — same endpoint/key as Gemini, but far more
-    # generous free-tier daily quota. Great for simple completions (e.g. the
-    # no-code strategy builder); note Gemma does NOT support tool-calling, so
-    # it's unsuited to the agent tool-loop slots.
-    {"provider": "gemini", "model_id": "gemma-3-27b-it", "label": "Google Gemma 3 27B"},
-    {"provider": "gemini", "model_id": "gemma-3-12b-it", "label": "Google Gemma 3 12B"},
-    {"provider": "gemini", "model_id": "gemma-3-4b-it", "label": "Google Gemma 3 4B"},
-    {"provider": "gemini", "model_id": "gemma-3-1b-it", "label": "Google Gemma 3 1B"},
-    # Cerebras / Mistral / xAI are also live-discovered; these seed sensible
-    # defaults + a fallback when discovery is unavailable.
-    {"provider": "cerebras", "model_id": "llama-3.3-70b", "label": "Cerebras Llama 3.3 70B"},
-    {"provider": "cerebras", "model_id": "llama3.1-8b", "label": "Cerebras Llama 3.1 8B"},
-    {"provider": "cerebras", "model_id": "qwen-3-32b", "label": "Cerebras Qwen 3 32B"},
-    {"provider": "cerebras", "model_id": "gpt-oss-120b", "label": "Cerebras GPT-OSS 120B"},
-    {"provider": "mistral", "model_id": "mistral-large-latest", "label": "Mistral Large"},
-    {"provider": "mistral", "model_id": "mistral-medium-latest", "label": "Mistral Medium"},
-    {"provider": "mistral", "model_id": "mistral-small-latest", "label": "Mistral Small"},
-    {"provider": "mistral", "model_id": "magistral-small-latest", "label": "Mistral Magistral Small"},
-    {"provider": "mistral", "model_id": "codestral-latest", "label": "Mistral Codestral"},
-    {"provider": "mistral", "model_id": "open-mistral-nemo", "label": "Mistral Nemo"},
-    {"provider": "xai", "model_id": "grok-4", "label": "xAI Grok 4"},
-    {"provider": "xai", "model_id": "grok-3", "label": "xAI Grok 3"},
-    {"provider": "xai", "model_id": "grok-3-mini", "label": "xAI Grok 3 Mini"},
-    {"provider": "xai", "model_id": "grok-code-fast-1", "label": "xAI Grok Code Fast"},
-    # Together is a broad gateway; a curated set of popular tool-capable models.
-    {"provider": "together", "model_id": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "label": "Together Llama 3.3 70B Turbo"},
-    {"provider": "together", "model_id": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo", "label": "Together Llama 3.1 8B Turbo"},
-    {"provider": "together", "model_id": "Qwen/Qwen2.5-72B-Instruct-Turbo", "label": "Together Qwen 2.5 72B Turbo"},
-    {"provider": "together", "model_id": "deepseek-ai/DeepSeek-V3", "label": "Together DeepSeek V3"},
-    {"provider": "together", "model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1", "label": "Together Mixtral 8x7B"},
-    # NVIDIA NIM (build.nvidia.com) — curated tool-capable chat models across the
-    # top open-source families. The live /v1/models list is also discovered; these
-    # are reliable, function-calling instruct/reasoning models (vendor/model ids
-    # passed through unchanged). Ids verified against the live catalog.
-    # Meta Llama
-    {"provider": "nvidia", "model_id": "meta/llama-3.3-70b-instruct", "label": "NVIDIA Llama 3.3 70B Instruct"},
-    {"provider": "nvidia", "model_id": "meta/llama-4-maverick-17b-128e-instruct", "label": "NVIDIA Llama 4 Maverick 17B×128E"},
-    {"provider": "nvidia", "model_id": "meta/llama-3.1-70b-instruct", "label": "NVIDIA Llama 3.1 70B Instruct"},
-    {"provider": "nvidia", "model_id": "meta/llama-3.1-8b-instruct", "label": "NVIDIA Llama 3.1 8B Instruct (fast/cheap)"},
-    # NVIDIA Nemotron (NVIDIA-tuned, strong tool-calling)
-    {"provider": "nvidia", "model_id": "nvidia/llama-3.1-nemotron-ultra-253b-v1", "label": "NVIDIA Nemotron Ultra 253B"},
-    {"provider": "nvidia", "model_id": "nvidia/nemotron-3-super-120b-a12b", "label": "NVIDIA Nemotron 3 Super 120B"},
-    {"provider": "nvidia", "model_id": "nvidia/llama-3.3-nemotron-super-49b-v1.5", "label": "NVIDIA Nemotron Super 49B v1.5"},
-    {"provider": "nvidia", "model_id": "nvidia/llama-3.1-nemotron-70b-instruct", "label": "NVIDIA Nemotron 70B Instruct"},
-    # Qwen
-    {"provider": "nvidia", "model_id": "qwen/qwen3.5-397b-a17b", "label": "NVIDIA Qwen3.5 397B"},
-    {"provider": "nvidia", "model_id": "qwen/qwen3-next-80b-a3b-instruct", "label": "NVIDIA Qwen3-Next 80B"},
-    # DeepSeek
-    {"provider": "nvidia", "model_id": "deepseek-ai/deepseek-v4-pro", "label": "NVIDIA DeepSeek V4 Pro"},
-    {"provider": "nvidia", "model_id": "deepseek-ai/deepseek-v4-flash", "label": "NVIDIA DeepSeek V4 Flash"},
-    # MiniMax
-    {"provider": "nvidia", "model_id": "minimaxai/minimax-m3", "label": "NVIDIA MiniMax M3"},
-    {"provider": "nvidia", "model_id": "minimaxai/minimax-m2.7", "label": "NVIDIA MiniMax M2.7"},
-    # Moonshot Kimi
-    {"provider": "nvidia", "model_id": "moonshotai/kimi-k2.6", "label": "NVIDIA Kimi K2.6"},
-    # Zhipu GLM
-    {"provider": "nvidia", "model_id": "z-ai/glm-5.1", "label": "NVIDIA GLM-5.1"},
-    # Mistral
-    {"provider": "nvidia", "model_id": "mistralai/mistral-large-3-675b-instruct-2512", "label": "NVIDIA Mistral Large 3 675B"},
-    {"provider": "nvidia", "model_id": "mistralai/mixtral-8x22b-v0.1", "label": "NVIDIA Mixtral 8x22B"},
-    # OpenAI open-weight
-    {"provider": "nvidia", "model_id": "openai/gpt-oss-120b", "label": "NVIDIA GPT-OSS 120B"},
-    {"provider": "nvidia", "model_id": "openai/gpt-oss-20b", "label": "NVIDIA GPT-OSS 20B"},
-    # OpenCode Zen: live-discovered via /v1/models; these seed sensible defaults
-    # and a fallback when discovery is unavailable.
-    {"provider": "opencode-zen", "model_id": "grok-code", "label": "OpenCode Zen Grok Code Fast"},
-    {"provider": "opencode-zen", "model_id": "big-pickle", "label": "OpenCode Zen Big Pickle"},
-    {"provider": "opencode-zen", "model_id": "claude-sonnet-4-5", "label": "OpenCode Zen Claude Sonnet 4.5"},
-    {"provider": "opencode-zen", "model_id": "gpt-5", "label": "OpenCode Zen GPT-5"},
-    {"provider": "opencode-zen", "model_id": "qwen3-coder", "label": "OpenCode Zen Qwen3 Coder"},
-    {"provider": "opencode-zen", "model_id": "kimi-k2", "label": "OpenCode Zen Kimi K2"},
-    # OpenCode GO: flat-rate subscription with NO /models discovery, so the full
-    # tool-capable catalog is curated here from the GO docs.
-    {"provider": "opencode-go", "model_id": "glm-5.2", "label": "OpenCode GO GLM-5.2"},
-    {"provider": "opencode-go", "model_id": "glm-5.1", "label": "OpenCode GO GLM-5.1"},
-    {"provider": "opencode-go", "model_id": "kimi-k2.7", "label": "OpenCode GO Kimi K2.7 Code"},
-    {"provider": "opencode-go", "model_id": "kimi-k2.6", "label": "OpenCode GO Kimi K2.6"},
-    {"provider": "opencode-go", "model_id": "deepseek-v4-pro", "label": "OpenCode GO DeepSeek V4 Pro"},
-    {"provider": "opencode-go", "model_id": "deepseek-v4-flash", "label": "OpenCode GO DeepSeek V4 Flash"},
-    {"provider": "opencode-go", "model_id": "minimax-m3", "label": "OpenCode GO MiniMax M3"},
-    {"provider": "opencode-go", "model_id": "minimax-m2.7", "label": "OpenCode GO MiniMax M2.7"},
-    {"provider": "opencode-go", "model_id": "mimo-v2.5-pro", "label": "OpenCode GO MiMo V2.5 Pro"},
-    {"provider": "opencode-go", "model_id": "mimo-v2.5", "label": "OpenCode GO MiMo V2.5"},
-    {"provider": "opencode-go", "model_id": "qwen3.7-max", "label": "OpenCode GO Qwen3.7 Max"},
-    {"provider": "opencode-go", "model_id": "qwen3.7-plus", "label": "OpenCode GO Qwen3.7 Plus"},
-    # OpenRouter: free tool-capable models are auto-discovered; these curated
-    # entries are reliable fallbacks (always selectable even if discovery fails).
-    {"provider": "openrouter", "model_id": "openrouter/free", "label": "OpenRouter Auto (free, tool-capable router)"},
-    {"provider": "openrouter", "model_id": "nvidia/nemotron-3-ultra-550b-a55b", "label": "OpenRouter Nemotron 3 Ultra 550B (paid)"},
-    {"provider": "openrouter", "model_id": "openai/gpt-4o-mini", "label": "OpenRouter GPT-4o Mini (paid)"},
-]
-
-
-def _normalize_model_id(value: object) -> str:
-    normalized = str(value or "").strip()
-    # Gemini's OpenAI-compatible /models endpoint returns ids like
-    # "models/gemini-2.5-flash"; the chat endpoint wants the bare id.
-    if normalized.startswith("models/"):
-        normalized = normalized[len("models/"):]
-    return normalized
-
-
-def _prettify_gemma_id(model_id: str) -> str:
-    """"gemma-3-27b-it" -> "Gemma 3 27B" (drop the -it instruction-tuned suffix)."""
-    core = model_id[:-3] if model_id.lower().endswith("-it") else model_id
-    words = [
-        (tok.upper() if any(c.isdigit() for c in tok) else tok.capitalize())
-        for tok in core.split("-")
-        if tok
-    ]
-    return " ".join(words) or model_id
-
-
-def _coerce_discovered_model_record(model_id: str, provider: str, label: str | None = None) -> dict:
-    normalized_model_id = _normalize_model_id(model_id)
-    if not normalized_model_id:
-        return {}
-    provider_name = _MODEL_PROVIDER_DISPLAY_NAMES.get(provider, provider.capitalize())
-    resolved_label = (label or "").strip() or normalized_model_id
-    if resolved_label.lower() == normalized_model_id.lower():
-        # Gemma is served under the "gemini" provider but must NOT be labelled
-        # "Google Gemini gemma-…" — brand it as Gemma so the picker is truthful.
-        if provider == "gemini" and normalized_model_id.lower().startswith("gemma"):
-            resolved_label = f"Google {_prettify_gemma_id(normalized_model_id)}"
-        else:
-            resolved_label = f"{provider_name} {resolved_label}"
-    return {
-        "provider": provider,
-        "model_id": normalized_model_id,
-        "label": resolved_label,
-    }
-
-
-def _looks_like_openai_discovery_model(model: str) -> bool:
-    """Identify OpenAI CHAT/reasoning models from the /v1/models list.
-
-    Exclusion-first so genuinely new chat models auto-appear without a code
-    change: drop the non-chat modalities OpenAI also serves (embeddings, audio,
-    image, moderation, etc.), then accept the chat/reasoning families — gpt-*,
-    chatgpt-*, codex-*, and the WHOLE o-series (o1, o3, o4-mini, future o5...),
-    not just o1.
-    """
-    lowered = model.lower().strip()
-    if not lowered:
-        return False
-    if any(
-        tag in lowered
-        for tag in (
-            "embedding", "whisper", "tts", "audio", "realtime", "transcribe",
-            "dall-e", "image", "moderation", "search", "similarity",
-        )
-    ):
-        return False
-    if lowered.startswith(("gpt-", "chatgpt-", "codex-")):
-        return True
-    # o-series: 'o' followed by a digit (o1, o3, o4-mini, o5, ...).
-    if len(lowered) >= 2 and lowered[0] == "o" and lowered[1].isdigit():
-        return True
-    return False
-
-
-def _looks_like_minimax_discovery_model(model: str) -> bool:
-    lowered = model.lower()
-    if not lowered:
-        return False
-    if lowered.startswith("minimax"):
-        return True
-    return "minimax" in lowered
-
-
-def _looks_like_lmstudio_discovery_model(model: str) -> bool:
-    return bool(str(model or "").strip())
-
-
-def _looks_like_zai_discovery_model(model: str) -> bool:
-    lowered = model.lower()
-    return lowered.startswith("glm-")
-
-
-def _looks_like_anthropic_discovery_model(model: str) -> bool:
-    lowered = model.lower().strip()
-    return lowered.startswith("claude-") or "claude" in lowered
-
-
-def _looks_like_deepseek_discovery_model(model: str) -> bool:
-    lowered = model.lower().strip()
-    return lowered.startswith("deepseek")
-
-
-def _looks_like_cerebras_discovery_model(model: str) -> bool:
-    # Cerebras serves only chat models via /v1/models; accept any non-empty id.
-    return bool(str(model or "").strip())
-
-
-def _looks_like_mistral_discovery_model(model: str) -> bool:
-    lowered = model.lower().strip()
-    if not lowered:
-        return False
-    # Drop non-chat models Mistral also lists (embeddings, moderation, OCR).
-    if any(tag in lowered for tag in ("embed", "moderation", "ocr")):
-        return False
-    return True
-
-
-def _looks_like_opencode_discovery_model(model: str) -> bool:
-    # OpenCode Zen's /models route lists only curated chat/coding models;
-    # accept any non-empty id.
-    return bool(str(model or "").strip())
-
-
-def _looks_like_nvidia_discovery_model(model: str) -> bool:
-    lowered = model.lower().strip()
-    if not lowered:
-        return False
-    # NVIDIA NIM's catalog spans many modalities; drop the non-chat families
-    # (embeddings, rerankers, OCR/parse, vision-only, speech, safety) so the
-    # agent picker only offers tool-capable instruct/chat/reasoning models.
-    if any(tag in lowered for tag in (
-        "embed", "embedqa", "rerank", "ocr", "parse", "vila", "vlm", "clip",
-        "diffusion", "riva", "asr", "-tts", "text-to-speech", "speech",
-        "retrieval", "nemoguard", "guard", "vision", "-ranking",
-    )):
-        return False
-    return True
-
-
-def _looks_like_xai_discovery_model(model: str) -> bool:
-    lowered = model.lower().strip()
-    # Keep generative grok chat models; drop image-generation variants.
-    return lowered.startswith("grok") and "image" not in lowered
-
-
-def _looks_like_groq_discovery_model(model: str) -> bool:
-    raw = str(model or "").strip()
-    if not raw:
-        return False
-    # Groq's /models payload carries both a callable id (lowercase slug, e.g.
-    # "llama-3.3-70b-versatile") and a human display name ("Llama 3.3 70B").
-    # Only the id is callable, so reject anything with spaces or uppercase.
-    if any(ch.isspace() or ch.isupper() for ch in raw):
-        return False
-    # Exclude non-chat models (speech-to-text, text-to-speech, moderation).
-    if any(tag in raw for tag in ("whisper", "tts", "guard", "orpheus", "safety")):
-        return False
-    return True
-
-
-def _looks_like_gemini_discovery_model(model: str) -> bool:
-    lowered = model.lower().strip()  # "models/" prefix already stripped upstream
-    # Google's OpenAI-compatible endpoint serves BOTH Gemini and the open Gemma
-    # models under the same URL/key. Gemma ids look like "gemma-3-27b-it" and get
-    # far more generous free-tier daily quota than Gemini Flash, so surface them
-    # too instead of filtering them out.
-    if not (lowered.startswith("gemini-") or lowered.startswith("gemma-")):
-        return False
-    # The compat /models also lists non-text modalities; keep chat models only.
-    if any(
-        tag in lowered
-        for tag in (
-            "embedding", "image", "tts", "aqa", "computer-use",
-            "native-audio", "live", "robotics",
-        )
-    ):
-        return False
-    return True
-
-
-def _discovery_model_should_belong(provider: str, model_id: str) -> bool:
-    if not model_id:
-        return False
-    if provider == "openai":
-        return _looks_like_openai_discovery_model(model_id)
-    if provider == "minimax":
-        return _looks_like_minimax_discovery_model(model_id)
-    if provider == "lmstudio":
-        return _looks_like_lmstudio_discovery_model(model_id)
-    if provider == "zai":
-        return _looks_like_zai_discovery_model(model_id)
-    if provider == "anthropic":
-        return _looks_like_anthropic_discovery_model(model_id)
-    if provider == "deepseek":
-        return _looks_like_deepseek_discovery_model(model_id)
-    if provider == "groq":
-        return _looks_like_groq_discovery_model(model_id)
-    if provider == "gemini":
-        return _looks_like_gemini_discovery_model(model_id)
-    if provider == "cerebras":
-        return _looks_like_cerebras_discovery_model(model_id)
-    if provider == "mistral":
-        return _looks_like_mistral_discovery_model(model_id)
-    if provider == "xai":
-        return _looks_like_xai_discovery_model(model_id)
-    if provider == "nvidia":
-        return _looks_like_nvidia_discovery_model(model_id)
-    if provider == "opencode-zen":
-        return _looks_like_opencode_discovery_model(model_id)
-    return False
-
-
-def _collect_discovery_models(payload: object, provider: str, depth: int = 0) -> list[str]:
-    if depth > 4:
-        return []
-
-    if isinstance(payload, str):
-        normalized = _normalize_model_id(payload)
-        if not normalized or not _discovery_model_should_belong(provider, normalized):
-            return []
-        return [normalized]
-
-    if isinstance(payload, list):
-        values: list[str] = []
-        for item in payload:
-            values.extend(_collect_discovery_models(item, provider, depth + 1))
-        return values
-
-    if not isinstance(payload, dict):
-        return []
-
-    collected: list[str] = []
-    for key in ("id", "model", "model_id", "name"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            normalized = _normalize_model_id(value)
-            if normalized and _discovery_model_should_belong(provider, normalized):
-                collected.append(normalized)
-
-    nested_keys = ("data", "models", "result", "results", "items", "entries")
-    for key in nested_keys:
-        nested = payload.get(key)
-        if nested is not None:
-            collected.extend(_collect_discovery_models(nested, provider, depth + 1))
-
-    return collected
-
-
-def _extract_discovery_models(payload: object, provider: str) -> list[str]:
-    raw_models = _collect_discovery_models(payload, provider)
-    if not raw_models:
-        return []
-    return sorted(set(raw_models))
-
-
-def _get_provider_discovery_token(provider: str) -> tuple[str, bool]:
-    try:
-        return get_token(provider), True
-    except Exception:
-        env_key = _AUTH_PROVIDER_ENV_VARS.get(provider)
-        if not env_key:
-            raise
-        env_token = str(os.environ.get(env_key, "")).strip()
-        if not env_token:
-            raise
-        return env_token, False
-
-
-def _merge_model_records(provider: str, discovered: list[dict], fallback: list[dict]) -> list[dict]:
-    merged: dict[str, dict] = {}
-
-    for item in discovered:
-        normalized_model = _coerce_discovered_model_record(item.get("model_id", ""), provider, item.get("label", ""))
-        if not normalized_model:
-            continue
-        merged[_agent_model_option_key(provider, normalized_model["model_id"])] = normalized_model
-
-    for item in fallback:
-        normalized_model = _coerce_discovered_model_record(item.get("model_id", ""), provider, item.get("label", ""))
-        if not normalized_model:
-            continue
-        merged.setdefault(_agent_model_option_key(provider, normalized_model["model_id"]), normalized_model)
-
-    return list(merged.values())
-
-
-_ZAI_CANDIDATE_ENDPOINTS = [
-    {"id": "global", "base_url": "https://api.z.ai/api/paas/v4"},
-    {"id": "cn", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
-    {"id": "coding-global", "base_url": "https://api.z.ai/api/coding/paas/v4"},
-    {"id": "coding-cn", "base_url": "https://open.bigmodel.cn/api/coding/paas/v4"},
-]
-
-
-def _detect_zai_endpoint(token: str, preferred_model: str = "glm-5.1") -> dict:
-    """Probe Z.AI candidate endpoints and return the first that responds."""
-    for candidate in _ZAI_CANDIDATE_ENDPOINTS:
-        base_url = candidate["base_url"]
-        endpoint_id = candidate["id"]
-        # Non-inference probe: GET /models validates the endpoint + key WITHOUT
-        # issuing a paid completion against a not-yet-connected (provider, model),
-        # matching the other discovery/verification probes.
-        url = f"{base_url}/models"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        try:
-            with httpx.Client(timeout=15) as client:
-                resp = client.get(url, headers=headers)
-                resp.raise_for_status()
-                resp.json()
-            return {
-                "ok": True,
-                "base_url": base_url,
-                "endpoint_id": endpoint_id,
-                "model_id": preferred_model,
-                "note": f"Detected {endpoint_id} endpoint",
-            }
-        except Exception as exc:
-            log.debug("zai endpoint probe failed for %s: %s", endpoint_id, exc)
-            continue
-
-    return {
-        "ok": False,
-        "base_url": None,
-        "endpoint_id": None,
-        "model_id": None,
-        "note": None,
-        "error": "No Z.AI endpoint responded. Check your API key.",
-    }
-
-
-def _discover_provider_models(provider: str, force_refresh: bool = False) -> tuple[list[dict], str | None]:
-    now = int(time.time())
-    cache_entry = _AGENT_MODEL_LIST_CACHE.get(provider)
-    if cache_entry:
-        cache_timestamp = int(cache_entry.get("fetched_at", 0))
-        if not force_refresh and now - cache_timestamp < _AGENT_MODEL_LIST_CACHE_TTL_SECONDS:
-            cached = cache_entry.get("models", [])
-            return list(cached) if isinstance(cached, list) else [], str(cache_entry.get("error") or None)
-
-    fallback = [
-        entry for entry in _AGENT_MODEL_CATALOG
-        if entry.get("provider") == provider
-    ]
-
-    source = "compat-fallback"
-    discovered: list[str] = []
-    discovery_error: str | None = None
-
-    if provider == "lmstudio":
-        profile = get_profile(provider) or {}
-        base_url = _get_provider_base_url(provider, profile)
-        if not base_url:
-            _AGENT_MODEL_LIST_CACHE[provider] = {
-                "fetched_at": now,
-                "models": fallback,
-                "error": "provider profile not configured: lmstudio",
-                "source": source,
-            }
-            return fallback, "provider profile not configured: lmstudio"
-
-        token = str(profile.get("access") or profile.get("token") or profile.get("api_key") or "").strip()
-        headers = {}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        try:
-            with httpx.Client(timeout=20) as client:
-                response = client.get(f"{base_url}/v1/models", headers=headers)
-                response.raise_for_status()
-                payload = response.json()
-        except Exception as exc:
-            _AGENT_MODEL_LIST_CACHE[provider] = {
-                "fetched_at": now,
-                "models": fallback,
-                "error": str(exc),
-                "source": source,
-            }
-            return fallback, str(exc)
-
-        discovered = _extract_discovery_models(payload, provider)
-        if not discovered:
-            discovery_error = "provider returned no models"
-            discovered = [item["model_id"] for item in fallback]
-        else:
-            source = "provider-api"
-
-        merged = _merge_model_records(
-            provider,
-            [{"model_id": model_id, "label": model_id} for model_id in discovered],
-            fallback,
-        )
-        _AGENT_MODEL_LIST_CACHE[provider] = {
-            "fetched_at": now,
-            "models": merged,
-            "error": discovery_error,
-            "source": source,
-        }
-        return merged, discovery_error
-
-    if provider == "openrouter":
-        # OpenRouter is a gateway over 400+ models — listing them all would
-        # flood the picker. Surface only the FREE, tool-capable models (the
-        # useful set for Forven's agent loop), auto-updating as the free roster
-        # rotates. Curated paid fallbacks live in the catalog and merge in.
-        try:
-            token = get_token("openrouter")
-        except Exception:
-            token = ""
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        try:
-            with httpx.Client(timeout=20) as client:
-                response = client.get("https://openrouter.ai/api/v1/models", headers=headers)
-                response.raise_for_status()
-                payload = response.json()
-        except Exception as exc:
-            _AGENT_MODEL_LIST_CACHE[provider] = {
-                "fetched_at": now, "models": fallback, "error": str(exc), "source": source,
-            }
-            return fallback, str(exc)
-
-        def _is_zero_price(value: object) -> bool:
-            try:
-                return float(value or 0) == 0.0
-            except (TypeError, ValueError):
-                return False
-
-        discovered_records: list[dict] = []
-        for model in (payload.get("data") or []):
-            model_id = str(model.get("id") or "").strip()
-            if not model_id:
-                continue
-            if "tools" not in (model.get("supported_parameters") or []):
-                continue
-            pricing = model.get("pricing") or {}
-            if not (_is_zero_price(pricing.get("prompt")) and _is_zero_price(pricing.get("completion"))):
-                continue
-            label = str(model.get("name") or model_id).strip()
-            discovered_records.append({"model_id": model_id, "label": label})
-
-        if discovered_records:
-            source = "provider-api"
-        else:
-            discovery_error = "no free tool-capable models returned"
-
-        merged = _merge_model_records(provider, discovered_records, fallback)
-        _AGENT_MODEL_LIST_CACHE[provider] = {
-            "fetched_at": now, "models": merged, "error": discovery_error, "source": source,
-        }
-        return merged, discovery_error
-
-    headers_template = _MODEL_DISCOVERY_HEADERS.get(provider, {})
-    if not headers_template:
-        _AGENT_MODEL_LIST_CACHE[provider] = {
-            "fetched_at": now,
-            "models": fallback,
-            "error": None,
-            "source": source,
-        }
-        return fallback, None
-
-    try:
-        token, used_configured_profile = _get_provider_discovery_token(provider)
-    except Exception as exc:
-        _AGENT_MODEL_LIST_CACHE[provider] = {
-            "fetched_at": now,
-            "models": fallback,
-            "error": str(exc),
-            "source": "compat-fallback",
-        }
-        return fallback, str(exc)
-
-    if used_configured_profile:
-        source = "provider-api"
-
-    # A ChatGPT OAuth token authenticates against the Codex backend, not the
-    # platform ``/v1/models`` endpoint (which 401s for it). Probing there would
-    # discard the curated codex catalog behind a scary auth error, so skip the
-    # probe and serve the curated list directly.
-    if provider == "openai" and is_openai_oauth_token(token):
-        _AGENT_MODEL_LIST_CACHE[provider] = {
-            "fetched_at": now, "models": fallback, "error": None, "source": "codex-oauth",
-        }
-        return fallback, None
-
-    header = {
-        key: value.format(token=token)
-        for key, value in headers_template.items()
-    }
-
-    last_error: str | None = None
-    for endpoint in _MODEL_DISCOVERY_ALT_ENDPOINTS.get(provider, []):
-        try:
-            with httpx.Client(timeout=20) as client:
-                response = client.get(endpoint, headers=header)
-                response.raise_for_status()
-                payload = response.json()
-        except Exception as exc:
-            last_error = str(exc)
-            continue
-
-        normalized = _extract_discovery_models(payload, provider)
-
-        if normalized:
-            discovered = sorted(set(normalized))
-            source = "provider-api"
-            discovery_error = None
-            break
-        discovery_error = "provider returned no models"
-
-    if not discovered:
-        discovered = [item["model_id"] for item in fallback]
-        discovery_error = last_error or discovery_error
-
-    merged = _merge_model_records(
-        provider,
-        [{"model_id": model_id, "label": model_id} for model_id in discovered],
-        fallback,
-    )
-
-    _AGENT_MODEL_LIST_CACHE[provider] = {
-        "fetched_at": now,
-        "models": merged,
-        "error": discovery_error,
-        "source": source,
-    }
-    return merged, discovery_error
-
-
-def _agent_model_option_key(provider: str, model_id: str) -> str:
-    return f"{provider}:{model_id}"
-
-
-def _default_agent_model_keys() -> list[str]:
-    seen: set[str] = set()
-    keys: list[str] = []
-    for entry in _AGENT_MODEL_CATALOG:
-        key = _agent_model_option_key(str(entry["provider"]), str(entry["model_id"]).strip())
-        if key in seen:
-            continue
-        seen.add(key)
-        keys.append(key)
-    return keys
-
-
-_DEFAULT_AGENT_MODEL_KEYS = _default_agent_model_keys()
 
 
 def _legacy_agent_model_options(force_refresh: bool = False) -> dict:
@@ -1334,35 +669,6 @@ def _status_from_expiry(expires_ms: int | None) -> tuple[str, str | None]:
         return "active", f"{hours}h remaining"
     minutes = rem // 60000
     return "active", f"{minutes}m remaining"
-
-
-def _provider_supports_oauth(provider: str) -> bool:
-    return provider in {"openai", "minimax"}
-
-
-def _provider_requires_token(provider: str) -> bool:
-    return provider != "lmstudio"
-
-
-def _normalize_local_base_url(provider: str, value: object | None, use_default: bool = True) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        if use_default:
-            return str(_LOCAL_PROVIDER_DEFAULT_BASE_URLS.get(provider, "")).strip()
-        return ""
-    return raw.rstrip("/")
-
-
-def _get_provider_base_url(
-    provider: str,
-    profile: dict | None = None,
-    include_default: bool = False,
-) -> str | None:
-    if provider not in _LOCAL_PROVIDER_DEFAULT_BASE_URLS:
-        return None
-    current = profile if isinstance(profile, dict) else get_profile(provider) or {}
-    base_url = _normalize_local_base_url(provider, current.get("base_url"), use_default=include_default)
-    return base_url or None
 
 
 def _build_auth_provider_payload(provider: str) -> dict:
@@ -1757,495 +1063,6 @@ def _coerce_optional_float(value: object) -> float | None:
         return None
 
 
-_SETTINGS_STORAGE_KEY = "forven:settings"
-_SETTINGS_SECRET_STORAGE_KEY = "forven:settings:secrets"
-_SETTINGS_API_KEYS_STORAGE_KEY = "forven:settings:api-keys"
-_SETTINGS_PIPELINE_STORAGE_KEY = "forven:pipeline:settings"
-
-# Serializes the FULL read->apply->diff->audit->save sequence of a settings
-# mutation. Settings are the control plane (trading mode, risk caps, gate
-# thresholds); a mutation loads the current blob, mutates it, diffs old-vs-new
-# for the audit log, and writes several KV keys. Two concurrent PUTs without
-# serialization race that read-modify-write: one edit is lost entirely and the
-# audit diff can attribute one request's changes to the other's actor. A
-# process-level lock (single-process app, uvicorn workers=1) makes each mutation
-# atomic against every other mutation so both edits land and each audit entry
-# reflects exactly its own request. Held only around the in-memory
-# apply+diff+persist critical section — post-save side-effect hooks (scheduler
-# overrides, daemon-state cleanup) run outside it.
-_SETTINGS_MUTATION_LOCK = threading.RLock()
-
-# Single source of truth for the default backtest window (calendar days). This ONE
-# setting governs every automatic backtest that doesn't carry an explicit start/end:
-# quick-screen, gauntlet timeframe-sweep/optimization/confirmation, walk-forward,
-# the cost-stress rerun, and the evolution/crucible validation matrix. Every fallback
-# below references this so a missing key can never silently shrink the window (the old
-# scattered 365/30 fallbacks did exactly that, contradicting the saved 730 default).
-DEFAULT_BACKTEST_DURATION_DAYS = 730
-
-_DEFAULT_SETTINGS_PAYLOAD = {
-    "exchange": "hyperliquid",
-    "trading_mode": "paper",
-    "initial_capital": 10000,
-    "hyperliquid_wallet": "",
-    "hyperliquid_api_address": "",
-    "hyperliquid_has_key": False,
-    "hyperliquid_testnet": True,
-    "max_position_size_pct": 10,
-    "max_risk_per_trade_pct": 10,
-    "recovery_emergency_stop_max_pct": 5,
-    "max_daily_loss": 200,
-    "max_daily_loss_pct": 2,
-    "max_drawdown_pct": 30,
-    "min_risk_reward_ratio": 0,
-    "risk_fee_bps": 4.5,
-    "risk_slippage_bps": 2.0,
-    "max_concurrent_positions": 5,
-    "paper_max_concurrent_positions": 0,
-    "live_books_enabled": False,
-    "hyperliquid_long_book_address": "",
-    "hyperliquid_short_book_address": "",
-    "hyperliquid_use_cross_margin": False,
-    "liq_distance_warn_pct": 15,
-    "liq_distance_critical_pct": 7,
-    "cooldown_after_loss_hours": 0,
-    "strategy_name": "Momentum Breakout",
-    "strategy_symbol": "BTC/USDT",
-    "strategy_timeframe": "1h",
-    "strategy_parameters": {},
-    "agent_model_keys": _DEFAULT_AGENT_MODEL_KEYS,
-    "backup_ai_provider": "none",
-    "backup_ai_model": "",
-    "discord_bot_token_configured": False,
-    "discord_webhook_configured": False,
-    "notification_level": "all",
-    "notify_on_entry": True,
-    "notify_on_exit": True,
-    "notify_daily_summary": True,
-    "notify_health_reports": True,
-    "notify_errors": True,
-    "scanner_execution_enabled": True,
-    "relaxed_trade_filters_enabled": False,
-    "strict_regime_gating": True,
-    "regime_min_confidence": 0.3,
-    "allow_unknown_regime_strategies": False,
-    "regime_gate_mode": "observe",
-    "regime_gate_block_long": "TREND_DOWN,HIGH_VOL",
-    "regime_gate_block_short": "",
-    "regime_gate_min_confidence": 0.6,
-    "self_healing_enabled": True,
-    "auto_restart_on_crash": True,
-    "maintenance_start_hour": None,
-    "maintenance_end_hour": None,
-    "data_refresh_seconds": 60,
-    "throughput_auto_scheduler_control": True,
-    "adaptive_pipeline_throughput_enabled": False,
-    "pipeline_target_clear_hours": 6,
-    # Throughput knobs (shared single-source defaults; the scheduler fallbacks
-    # and the "balanced" throughput preset reference the same constants).
-    "ideation_interval_minutes": THROUGHPUT_DEFAULTS["ideation_interval_minutes"],
-    "coding_interval_minutes": THROUGHPUT_DEFAULTS["coding_interval_minutes"],
-    "testing_interval_minutes": THROUGHPUT_DEFAULTS["testing_interval_minutes"],
-    "graduation_interval_minutes": THROUGHPUT_DEFAULTS["graduation_interval_minutes"],
-    "scanner_signal_interval_minutes": 5,
-    "scanner_execution_interval_minutes": 5,
-    "scanner_allow_direct_market_fetch": True,
-    # Market-data exchange for paper data/prices/chart. 'binance' (the lead exchange,
-    # default) makes paper trade on the SAME real series the backtest validates on;
-    # 'hyperliquid' reverts to the HL feed. Execution stays in-app regardless.
-    "market_data_source": "binance",
-    "daemon_candle_cache_refresh_seconds": 90,
-    "paper_test_mode_enabled": False,
-    "paper_test_high_activity_enabled": False,
-    "paper_test_bypass_gates_enabled": False,
-    "paper_test_local_execution_only": False,
-    "pipeline_assignments_per_cycle": 3,
-    "pipeline_drain_mode": True,
-    "backtest_matrix_workers": 4,
-    # Process-wide cap on concurrent backtest SUBPROCESSES (memory ceiling all the
-    # parallel pipeline levers queue on). See forven/strategies/concurrency.py.
-    "backtest_subprocess_budget": THROUGHPUT_DEFAULTS["backtest_subprocess_budget"],
-    # Gauntlet workflows advanced concurrently per tick (1 = serial drain).
-    "gauntlet_drain_workers": THROUGHPUT_DEFAULTS["gauntlet_drain_workers"],
-    "pipeline_saturation_threshold": 100,
-    "pipeline_resume_threshold": 60,
-    "pipeline_drain_max_seconds": 300,
-    "pipeline_gate_failure_archive_attempts": 3,
-    "gauntlet_auto_quick_screen_enabled": True,
-    "gauntlet_quick_screen_max_attempts": 3,
-    "gauntlet_step_stale_minutes": 30,
-    "agent_task_claim_limit": THROUGHPUT_DEFAULTS["agent_task_claim_limit"],
-    "brain_task_claim_limit": 12,
-    # Soft cap on the pending brain_invoke queue before the scheduler prunes
-    # (generic pings first, routine dispatches preserved; a hard ceiling backstops).
-    "brain_queue_max_pending": 15,
-    "code_strategy_requires_approval": False,
-    "auto_approve_code_edits": False,
-    "auto_approve_promotions": False,
-    # GO-LIVE-1: even with auto_approve_promotions/promotion_mode=auto, a
-    # paper→live promotion requires an explicit operator confirmation with a
-    # notional ceiling — unless this is deliberately flipped on (dangerous).
-    "allow_auto_live_promotion": False,
-    # When a challenger materially beats an incumbent occupying a capital slot,
-    # auto-apply the dethrone so the slot frees without operator action. Default
-    # ON for autonomous operation — reversible (the incumbent is demoted
-    # paper->gauntlet, not archived). See policy._maybe_auto_apply_dethrone.
-    "auto_approve_dethrone": True,
-    # When a hypothesis graduates and its per-cell-best becomes canonical, enqueue
-    # the gauntlet paper-promotion gate for it (the robustness/required-test floor
-    # still applies — it is NOT a direct transition). Default OFF: graduation stays
-    # a label until the operator opts in. See hypothesis_graduation.graduate_hypothesis.
-    "canonical_auto_deploy_enabled": False,
-    # When True, capital slots hold ONE strategy per symbol/timeframe: the duplicate
-    # tournament, paper slot-guard, capital-slot dedupe, and paper WIP cap all apply.
-    # Default OFF: every strategy that passes the gauntlet is promoted to paper with
-    # no per-slot competition and no cap. See policy._paper_slot_competition_enabled.
-    "paper_slot_competition_enabled": False,
-    "task_stale_recovery_minutes": 10,
-    "health_checks_enabled": True,
-    "rolling_backtest_days": 30,
-    "walkforward_months": 6,
-    "walkforward_folds": 5,
-    "regime_detection_enabled": True,
-    "alert_on_degradation_pct": 20,
-    "backtest_fee_bps": 4.5,
-    "backtest_slippage_bps": 2.0,
-    # Fallback leverage when a strategy declares no `leverage` param. ONE default
-    # shared by the gauntlet confirmation/robustness backtests, the execution-profile
-    # selection, and the live/paper scanner so leverage-sensitive sizing matches
-    # (the parity invariant). 1x = unlevered; operator-editable.
-    "default_leverage": 1.0,
-    "backtest_timeframe": "1h",
-    "backtest_symbol": "BTC/USDT",
-    # DEFAULT backtest window (calendar days, ending now). Used directly by ad-hoc /
-    # manual backtests, and as the fallback any PER-STAGE window below inherits when it
-    # is left at 0. 730d so slower timeframes (4h) reach a meaningful trade sample and
-    # the WFA OOS folds span >1 market regime. Settings > Lab > "Default backtest window".
-    "backtest_duration_days": DEFAULT_BACKTEST_DURATION_DAYS,
-    # PER-STAGE backtest windows (calendar days). Each automated pipeline stage that
-    # runs a backtest has its OWN tunable window so e.g. quick-screen can be short while
-    # walk-forward spans years. Resolved via stage_backtest_duration_days(). Default 0 =
-    # "inherit the Default backtest window" above — so out of the box every stage tracks
-    # whatever backtest_duration_days is set to (behaviour-preserving). Set a positive
-    # number of days to give that stage its own independent horizon.
-    "quick_screen_duration_days": 0,
-    "timeframe_sweep_duration_days": 0,
-    "optimization_duration_days": 0,
-    "confirmation_duration_days": 0,
-    "walk_forward_duration_days": 0,
-    "cost_stress_duration_days": 0,
-    "evolution_duration_days": 0,
-    # When enabled, backtests deduct cumulative perp funding from each trade's
-    # PnL and refuse to promote strategies whose funding data was incomplete.
-    "backtest_include_funding": True,
-    "walkforward_cv_method": "rolling",
-    "walkforward_train_ratio": 0.7,
-    "walkforward_purge_gap": 0,
-    "walkforward_embargo_pct": 0,
-    "walkforward_objective": "sharpe_ratio",
-    "walkforward_n_trials": 50,
-    "remote_engine_enabled": False,
-    "remote_engine_url": "http://127.0.0.1:9050",
-    "remote_engine_data_root": "",
-    "setup_wizard_completed_at": None,
-    # Strict mode for the agent run_shell command guard (forven.sandbox.shell_guard).
-    # Off by default; run_shell itself is also disabled by default. When True,
-    # non-critical findings (high/medium/low) fail closed instead of warn-allow.
-    # Backend-only — there is no UI control for this.
-    "sandbox_shell_guard_strict": False,
-    # Per-turn tool-round cap for the in-app assistant chat AND deepdive
-    # sessions (each round = one full model call whose input grows with every
-    # prior round, and with actions enabled each round can create real pipeline
-    # objects). On hitting the cap the turn now lands softly (forced no-tools
-    # final answer) instead of erroring. Bounded 2-40 at read time.
-    "assistant_max_tool_rounds": 12,
-    "updated_at": _now(),
-}
-
-# Only Polygon is wired to a consumer (forven.config.get_polygon_api_key ->
-# polygon_client / data layer). The Tiingo/FRED/CoinGecko/Alpaca key fields were
-# never read by any code, so they were removed from the Settings UI and dropped
-# here too. Any previously-stored keys still round-trip via get_settings_api_keys'
-# fallback loop, so nothing is lost.
-_DEFAULT_API_KEY_SOURCES = ("polygon",)
-
-_PIPELINE_STAGE_WIP_CAPS = {
-    "paper": {
-        "mode_key": "paper_wip_cap_mode",
-        "cap_key": "paper_wip_cap",
-        "default": 20,
-    },
-}
-_PIPELINE_WIP_CAP_UNLIMITED_VALUES = {"", "0", "none", "null", "unlimited", "off", "disabled"}
-_DEFAULT_GRAVEYARD_STRATEGY_LIMIT = 500
-_GRAVEYARD_STRATEGY_STATUSES = {"archived", "rejected", "backtest_failed", "graveyard", "trash"}
-
-_DEFAULT_PIPELINE_SETTINGS = {
-    "version": 1,
-    "autopilot_enabled": True,
-    "autopilot_worker_concurrency": 4,
-    "autopilot_generation_batch_size": 50,
-    "autopilot_scan_symbol": "BTC/USDT",
-    "autopilot_scan_timeframe": "1h",
-    "autopilot_scan_symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
-    "autopilot_scan_timeframes": ["1h", "4h", "1d"],
-    "autopilot_indicator_groups": ["trend", "momentum", "volatility"],
-    "promotion_mode": "auto",
-    # DB maintenance retention windows (days). 0 disables pruning for that table.
-    # Consumed by forven.maintenance.run_db_maintenance via this same payload.
-    "retention_backtest_trash_days": 14,
-    "retention_activity_log_days": 90,
-    "retention_scanner_results_days": 30,
-    "retention_gate_rejections_days": 30,
-    "maintenance_vacuum_enabled": False,
-    "min_backtest_trades": 30,
-    "min_sharpe_ratio": 0.5,
-    "max_drawdown_pct": 40,
-    "min_profit_factor": 1.0,
-    # Aligned with the canonical gate store (forven:pipeline_thresholds /
-    # DEFAULT_PIPELINE_CONFIG.paper_trading) so the optional readiness-gate
-    # layer can't diverge from the active paper->live gate if its gate_*_enabled
-    # toggles are ever turned on. The active gate reads pipeline_thresholds.
-    "min_paper_days": 14,
-    "max_paper_divergence_pct": 30,
-    "min_paper_trades": 50,
-    "min_paper_sharpe": 0.5,
-    "paper_wip_cap_mode": "capped",
-    "paper_wip_cap": 20,
-    "graveyard_strategy_limit_mode": "capped",
-    "graveyard_strategy_limit": _DEFAULT_GRAVEYARD_STRATEGY_LIMIT,
-    "validation_recent_window_enabled": False,
-    "validation_recent_window_months": 12,
-    "validation_cost_stress_enabled": False,
-    "validation_cost_stress_fee_multiplier": 2.0,
-    "validation_cost_stress_slippage_multiplier": 2.0,
-    "validation_min_recent_sharpe": 0.0,
-    "validation_max_recent_drawdown_pct": 70.0,
-    "validation_min_cost_stress_sharpe": -0.25,
-    "validation_max_cost_stress_drawdown_pct": 85.0,
-    "gate_min_trades_enabled": False,
-    "gate_min_trades_required": False,
-    "gate_min_sharpe_enabled": False,
-    "gate_min_sharpe_required": False,
-    "gate_max_drawdown_enabled": False,
-    "gate_max_drawdown_required": False,
-    "gate_min_profit_factor_enabled": False,
-    "gate_min_profit_factor_required": False,
-    "gate_min_paper_days_enabled": False,
-    "gate_min_paper_days_required": False,
-    "gate_min_paper_trades_enabled": False,
-    "gate_min_paper_trades_required": False,
-    "gate_min_paper_sharpe_enabled": False,
-    "gate_min_paper_sharpe_required": False,
-    "gate_max_paper_divergence_enabled": False,
-    "gate_max_paper_divergence_required": False,
-    "gate_recent_window_enabled": False,
-    "gate_recent_window_required": False,
-    "gate_cost_stress_enabled": False,
-    "gate_cost_stress_required": False,
-    "failed_retention_hours": 72,
-    "autopilot_nuke_noise_enabled": False,
-    "autopilot_nuke_noise_dry_run": True,
-    "autopilot_survivor_min_tier": "strong",
-    "ranking_top_n": 10,
-    "ranking_metric": "sharpe_ratio",
-    "created_by": "system",
-    # --- Gauntlet Promotion Readiness Gates ---
-    # Multi-timeframe sweep: require backtests across N distinct timeframes
-    "gate_multi_tf_sweep_enabled": True,
-    "gate_multi_tf_sweep_required": True,
-    "gate_multi_tf_min_timeframes": 3,
-    "gate_sweep_timeframes": ["15m", "1h", "4h", "1d"],
-    # Optimization evidence belongs inside the gauntlet before robustness tests.
-    "gate_optimization_required_enabled": True,
-    "gate_optimization_required_required": True,
-    # Optimized params are applied to the strategy container before robustness tests.
-    "gate_params_applied_enabled": True,
-    "gate_params_applied_required": True,
-    # Confirmation backtest validates the optimized defaults before robustness starts.
-    "gate_confirmation_backtest_enabled": True,
-    "gate_confirmation_backtest_required": True,
-    # Artifact ordering/freshness ensure robustness tests are run on optimized defaults.
-    "gate_artifact_ordering_enabled": True,
-    "gate_artifact_ordering_required": True,
-    "gate_validation_freshness_enabled": True,
-    "gate_validation_freshness_required": True,
-    # Real artifact rows: require actual backtest_results rows, not just verdict blobs
-    "gate_require_artifact_rows_enabled": True,
-    "gate_require_artifact_rows_required": True,
-    # --- Paper-to-Live Gates ---
-    # Paper trading metric checks (informational readiness display)
-    "paper_live_gate_paper_duration_enabled": True,
-    "paper_live_gate_paper_duration_required": True,
-    "paper_live_gate_paper_trades_enabled": True,
-    "paper_live_gate_paper_trades_required": True,
-    "paper_live_gate_paper_return_enabled": True,
-    "paper_live_gate_paper_return_required": True,
-    "paper_live_gate_paper_drawdown_enabled": True,
-    "paper_live_gate_paper_drawdown_required": True,
-    # Optimization must be completed before graduating from paper to live
-    "paper_live_gate_optimization_enabled": False,
-    "paper_live_gate_optimization_required": False,
-    # Optimized params must be applied to strategy before going live
-    "paper_live_gate_params_applied_enabled": False,
-    "paper_live_gate_params_applied_required": False,
-    # Confirmation backtest with optimized params before going live
-    "paper_live_gate_confirmation_backtest_enabled": False,
-    "paper_live_gate_confirmation_backtest_required": False,
-}
-
-
-def _default_settings_payload() -> dict:
-    payload = dict(_DEFAULT_SETTINGS_PAYLOAD)
-    payload["updated_at"] = _now()
-    payload["strategy_parameters"] = {}
-    payload["research_settings"] = _default_research_settings_payload()
-    payload["data_engine_settings"] = _default_data_engine_settings_payload()
-    return payload
-
-
-def _default_data_engine_settings_payload() -> dict:
-    from forven.dataeng.settings import default_data_engine_settings_payload
-
-    return default_data_engine_settings_payload()
-
-
-def _merge_data_engine_settings_payload(value) -> dict:
-    from forven.dataeng.settings import merge_data_engine_settings_payload
-
-    return merge_data_engine_settings_payload(value)
-
-
-def _deep_merge_dicts(base: dict, incoming: dict) -> dict:
-    """Recursively merge ``incoming`` over ``base`` without mutating either.
-
-    Nested dicts merge key-by-key (incoming leaves win); every other type is
-    replaced wholesale. Used by section handlers that accept PARTIAL nested
-    payloads (the settings UI sends only the edited leaves), so editing one
-    nested leaf can never reset its stored siblings back to defaults.
-    """
-    merged = dict(base)
-    for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _default_research_settings_payload() -> dict:
-    from forven.research_contract import default_research_settings
-
-    return default_research_settings()
-
-
-def _merge_research_settings_payload(value) -> dict:
-    defaults = _default_research_settings_payload()
-    if not isinstance(value, dict):
-        return defaults
-
-    def _merge_nested(default_value, current_value):
-        if isinstance(default_value, dict):
-            merged_nested = dict(default_value)
-            if isinstance(current_value, dict):
-                for nested_key, nested_value in current_value.items():
-                    if nested_key in merged_nested:
-                        merged_nested[nested_key] = _merge_nested(merged_nested[nested_key], nested_value)
-                    else:
-                        merged_nested[nested_key] = nested_value
-            return merged_nested
-        if isinstance(default_value, list):
-            return list(current_value) if isinstance(current_value, list) else list(default_value)
-        return current_value if current_value is not None else default_value
-
-    merged: dict = {}
-    for key, default_value in defaults.items():
-        current_value = value.get(key)
-        merged[key] = _merge_nested(default_value, current_value)
-
-    for key, current_value in value.items():
-        if key not in merged:
-            merged[key] = current_value
-    return merged
-
-
-def _default_pipeline_settings_payload() -> dict:
-    payload = dict(_DEFAULT_PIPELINE_SETTINGS)
-    payload["created_at"] = _now()
-    payload["created_by"] = "system"
-    return payload
-
-
-def _normalize_pipeline_wip_cap_mode(value: object, fallback: str = "capped") -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in _PIPELINE_WIP_CAP_UNLIMITED_VALUES:
-        return "unlimited"
-    if normalized in {"capped", "cap", "limited", "limit"}:
-        return "capped"
-    return fallback if fallback in {"capped", "unlimited"} else "capped"
-
-
-def _normalize_pipeline_wip_cap_value(value: object, fallback: int) -> int:
-    if value is None:
-        return max(1, int(fallback))
-    if isinstance(value, str) and value.strip().lower() in _PIPELINE_WIP_CAP_UNLIMITED_VALUES:
-        return max(1, int(fallback))
-    try:
-        parsed = int(value) if isinstance(value, (int, float)) else int(str(value).strip())
-    except Exception:
-        parsed = int(fallback)
-    return max(1, parsed)
-
-
-def _normalize_pipeline_wip_cap_payload(payload: dict) -> dict:
-    for stage_config in _PIPELINE_STAGE_WIP_CAPS.values():
-        mode_key = str(stage_config["mode_key"])
-        cap_key = str(stage_config["cap_key"])
-        default_cap = int(stage_config["default"])
-        payload[mode_key] = _normalize_pipeline_wip_cap_mode(
-            payload.get(mode_key),
-            str(_DEFAULT_PIPELINE_SETTINGS.get(mode_key) or "capped"),
-        )
-        payload[cap_key] = _normalize_pipeline_wip_cap_value(
-            payload.get(cap_key),
-            default_cap,
-        )
-    return payload
-
-
-def _normalize_graveyard_strategy_limit_mode(value: object, fallback: str = "capped") -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in _PIPELINE_WIP_CAP_UNLIMITED_VALUES:
-        return "unlimited"
-    if normalized in {"capped", "cap", "limited", "limit"}:
-        return "capped"
-    return fallback if fallback in {"capped", "unlimited"} else "capped"
-
-
-def _normalize_graveyard_strategy_limit_value(value: object, fallback: int = _DEFAULT_GRAVEYARD_STRATEGY_LIMIT) -> int:
-    if value is None:
-        return max(1, int(fallback))
-    if isinstance(value, str) and value.strip().lower() in _PIPELINE_WIP_CAP_UNLIMITED_VALUES:
-        return max(1, int(fallback))
-    try:
-        parsed = int(value) if isinstance(value, (int, float)) else int(str(value).strip())
-    except Exception:
-        parsed = int(fallback)
-    return max(1, parsed)
-
-
-def _normalize_graveyard_strategy_limit_payload(payload: dict) -> dict:
-    payload["graveyard_strategy_limit_mode"] = _normalize_graveyard_strategy_limit_mode(
-        payload.get("graveyard_strategy_limit_mode"),
-        str(_DEFAULT_PIPELINE_SETTINGS.get("graveyard_strategy_limit_mode") or "capped"),
-    )
-    payload["graveyard_strategy_limit"] = _normalize_graveyard_strategy_limit_value(
-        payload.get("graveyard_strategy_limit"),
-        _DEFAULT_GRAVEYARD_STRATEGY_LIMIT,
-    )
-    return payload
-
-
 def is_graveyard_strategy_status(status: str | None) -> bool:
     normalized = str(status or "").strip().lower()
     return normalized in _GRAVEYARD_STRATEGY_STATUSES
@@ -2296,78 +1113,8 @@ def resolve_strategy_query_limit(status: str | None, requested_limit: object = N
     return bounded_limit
 
 
-def _pipeline_wip_cap_kv_items(payload: dict) -> dict:
-    """Compute the ``pipeline:wip_cap:*`` KV entries a payload implies (no write)."""
-    items: dict = {}
-    for stage, stage_config in _PIPELINE_STAGE_WIP_CAPS.items():
-        mode_key = str(stage_config["mode_key"])
-        cap_key = str(stage_config["cap_key"])
-        if _normalize_pipeline_wip_cap_mode(payload.get(mode_key)) == "unlimited":
-            items[f"pipeline:wip_cap:{stage}"] = "unlimited"
-        else:
-            items[f"pipeline:wip_cap:{stage}"] = _normalize_pipeline_wip_cap_value(
-                payload.get(cap_key),
-                int(stage_config["default"]),
-            )
-    return items
-
-
 def _sync_pipeline_wip_cap_kv(payload: dict) -> None:
     kv_set_many(_pipeline_wip_cap_kv_items(payload))
-
-
-def _normalize_agent_model_key(raw: str) -> str | None:
-    if not isinstance(raw, str):
-        return None
-    raw = raw.strip()
-    if not raw:
-        return None
-    # Split on the FIRST colon only: provider:model_id. The model_id may itself
-    # contain colons — OpenRouter free models are "vendor/model:free" — so we
-    # must NOT reject a model_id that still contains a colon (that dropped every
-    # OpenRouter :free key on save, reverting the Models-tab checkbox).
-    provider, _, model_id = raw.partition(":")
-    provider = provider.strip().lower()
-    model_id = model_id.strip()
-    if not provider or not model_id:
-        return None
-    provider, normalized_model_id = normalize_provider_and_model(provider, model_id)
-    if provider not in _SUPPORTED_AUTH_PROVIDERS:
-        return None
-    return _agent_model_option_key(provider, normalized_model_id)
-
-
-def _coerce_agent_model_keys(value) -> list[str]:
-    if value is None:
-        return list(_DEFAULT_AGENT_MODEL_KEYS)
-    if not isinstance(value, list):
-        return list(_DEFAULT_AGENT_MODEL_KEYS)
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        key = _normalize_agent_model_key(str(item))
-        if key is None or key in seen:
-            continue
-        normalized.append(key)
-        seen.add(key)
-    return normalized
-
-
-def _coerce_bool(value, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on", "y"}:
-            return True
-        if normalized in {"0", "false", "no", "off", "n"}:
-            return False
-    return default
 
 
 def _has_open_book_routed_trades() -> bool:
@@ -2387,50 +1134,6 @@ def _has_open_book_routed_trades() -> bool:
         return row is not None
     except Exception:
         return False
-
-
-def _coerce_optional_int(value, default: int | None = None) -> int | None:
-    if value is None:
-        return default
-    if isinstance(value, int):
-        return value
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, float):
-        return int(value)
-    cleaned = str(value).strip()
-    if not cleaned:
-        return default
-    try:
-        return int(float(cleaned))
-    except Exception:
-        return default
-
-
-def _coerce_bounded_int(value, default: int, lower: int, upper: int) -> int:
-    parsed = _coerce_optional_int(value, default)
-    if parsed is None:
-        parsed = default
-    return max(lower, min(upper, int(parsed)))
-
-
-def _coerce_float(value, default: float) -> float:
-    """Strict float coercion: anything float() rejects keeps the previous value.
-
-    API-03/ARCH-02: a SECOND `_coerce_float` — the lenient legacy-metadata parser
-    now named `_coerce_legacy_metadata_float` — used to be defined further down
-    this module, so Python bound the last definition and every risk/pipeline
-    settings coercion above silently used the permissive one. A fat-fingered
-    "1,5" became 15.0 and "20 to 40" became 30.0 where the author expected
-    float() to raise and the safe stored value to survive. Keep this the
-    module-wide helper; the lenient parser is only for backtest metadata.
-    """
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except Exception:
-        return default
 
 
 def _load_settings_secrets() -> dict:
@@ -2580,186 +1283,6 @@ _NOTIF_TOGGLE_PREF_KEYS: dict[str, tuple[str, ...]] = {
     "notify_health_reports": ("system_degraded_to_discord", "system_recovered_to_discord"),
     "notify_errors": ("trade_failed_to_discord", "agent_failure_to_discord", "risk_critical_to_discord"),
 }
-
-
-# ── API-02: schema + sane bounds for the capital-bearing settings sections ───
-# Full editability of every gate threshold is a DELIBERATE project stance — these
-# specs take NO knob away from the operator. What they add is:
-#   (a) a hard refusal of numbers outside the range the enforcement code can
-#       actually honour. `max_drawdown_pct` was already clamped downstream into
-#       [0.01, 0.30]; `max_risk_per_trade_pct`, `max_daily_loss_pct` and the
-#       `live_hard_max_*` per-order ceilings had NOTHING, so a typo persisted
-#       verbatim straight into forven.exchange.risk.
-#   (b) a loud 422 on payload keys no handler reads, instead of the silent drop
-#       that produces the recurring "the setting does not stick" bug class.
-# Only sections whose accepted keys can be enumerated exactly appear here; every
-# other section keeps the previous permissive behaviour rather than risk 422-ing
-# a legitimate save.
-_SETTINGS_SECTION_KNOWN_KEYS: dict[str, frozenset[str]] = {
-    "initial-capital": frozenset({"initial_capital"}),
-    "trading-mode": frozenset({"trading_mode"}),
-    "risk": frozenset({
-        # per-trade / daily / drawdown limits
-        "max_risk_per_trade_pct", "max_position_size_pct", "max_daily_loss_pct",
-        "max_daily_loss", "max_drawdown_pct", "max_concurrent_positions",
-        "paper_max_concurrent_positions", "cooldown_after_loss_hours",
-        # direction books + margin mode
-        "live_books_enabled", "hyperliquid_long_book_address",
-        "hyperliquid_short_book_address", "hyperliquid_use_cross_margin",
-        "live_equity_include_master",
-        # liquidation proximity alerts
-        "liq_distance_warn_pct", "liq_distance_critical_pct",
-        # PORT-1 / SIZE-CAP-1 / BOOK-BUDGET-1 / CORR-1 live portfolio budget
-        "live_portfolio_budget_enabled", "live_max_total_open_risk_pct",
-        "live_max_asset_exposure_pct", "live_max_group_exposure_pct",
-        "live_hard_max_per_trade_risk_pct", "live_hard_max_order_notional_pct",
-        "live_max_book_notional_pct", "live_correlation_budget_enabled",
-        "live_max_effective_exposure_pct", "live_correlation_window_bars",
-        "live_correlation_missing_default",
-        # RETRY-STORM-1 failed-open brake
-        "live_failed_open_cooldown_minutes", "live_failed_open_max_attempts",
-        "live_failed_open_window_hours",
-        # PORT-LAYER-1 allocator
-        "portfolio_layer_enabled", "portfolio_allocator_enabled",
-        "portfolio_allocator_live", "portfolio_lookback_days",
-        "portfolio_target_book_vol_pct", "portfolio_min_risk_multiplier",
-        "portfolio_max_risk_multiplier",
-        # PORT-LAYER-2 / BASKET-2 funding-carry basket
-        "basket_funding_carry_enabled", "basket_rebalance_hours", "basket_n_legs",
-        "basket_gross_leverage", "basket_universe_min_bars", "basket_rank_buffer",
-        # LIVE-LOOP-1 paper->live graduation recommender
-        "live_graduation_recommender_enabled", "graduation_min_soak_days",
-        "graduation_min_paper_trades", "graduation_min_measured_trades",
-        "graduation_base_arm_usd", "graduation_max_arm_usd",
-        "graduation_daily_limit", "graduation_deny_cooldown_days",
-        "graduation_skew_lookback_days",
-        # LIQ-1 order-time liquidity guard
-        "live_liquidity_guard_enabled", "live_min_daily_volume_usd",
-        "live_max_spread_bps", "live_book_depth_window_bps",
-        "live_max_book_participation_pct", "live_max_price_impact_bps",
-        # regime gating (strict + REGIME-GATE-1 direction x regime)
-        "strict_regime_gating", "regime_min_confidence",
-        "allow_unknown_regime_strategies", "regime_gate_mode",
-        "regime_gate_block_long", "regime_gate_block_short",
-        "regime_gate_min_confidence",
-        # promotion-safety gates + paper test mode
-        "allow_unsupported_backtest_risk_controls", "canonical_requires_forward_proof",
-        "relaxed_trade_filters_enabled", "paper_test_mode_enabled",
-        "paper_test_high_activity_enabled", "paper_test_bypass_gates_enabled",
-        "paper_test_local_execution_only",
-    }),
-}
-
-# (minimum, maximum) inclusive. Deliberately generous — the job is to reject
-# nonsense (negative risk, a 5000% per-trade ceiling, a confidence of 12), not to
-# second-guess the operator inside the physically meaningful range.
-_SETTINGS_SECTION_NUMERIC_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
-    "initial-capital": {"initial_capital": (0.0, 1e12)},
-    "risk": {
-        "max_risk_per_trade_pct": (0.0001, 100.0),
-        "max_position_size_pct": (0.0001, 100.0),
-        "max_daily_loss_pct": (0.0001, 100.0),
-        "max_daily_loss": (0.0, 1e12),
-        "max_drawdown_pct": (0.0001, 100.0),
-        "max_concurrent_positions": (0.0, 1000.0),
-        "paper_max_concurrent_positions": (0.0, 1000.0),
-        "cooldown_after_loss_hours": (0.0, 8760.0),
-        "liq_distance_warn_pct": (0.0, 100.0),
-        "liq_distance_critical_pct": (0.0, 100.0),
-        "live_max_total_open_risk_pct": (0.0001, 100.0),
-        "live_max_asset_exposure_pct": (0.0001, 10000.0),
-        "live_max_group_exposure_pct": (0.0001, 10000.0),
-        "live_hard_max_per_trade_risk_pct": (0.0001, 100.0),
-        "live_hard_max_order_notional_pct": (0.0001, 10000.0),
-        "live_max_book_notional_pct": (0.0001, 10000.0),
-        "live_max_effective_exposure_pct": (0.0001, 10000.0),
-        "live_correlation_window_bars": (1.0, 1e6),
-        "live_correlation_missing_default": (0.0, 1.0),
-        "live_failed_open_cooldown_minutes": (0.0, 10080.0),
-        "live_failed_open_max_attempts": (1.0, 1000.0),
-        "live_failed_open_window_hours": (0.0, 8760.0),
-        "portfolio_lookback_days": (1.0, 3650.0),
-        "portfolio_target_book_vol_pct": (0.0, 1000.0),
-        "portfolio_min_risk_multiplier": (0.0, 100.0),
-        "portfolio_max_risk_multiplier": (0.0, 100.0),
-        "basket_rebalance_hours": (0.0, 8760.0),
-        "basket_n_legs": (1.0, 100.0),
-        "basket_gross_leverage": (0.0, 100.0),
-        "basket_universe_min_bars": (0.0, 1e7),
-        "basket_rank_buffer": (0.0, 100.0),
-        "graduation_min_soak_days": (0.0, 3650.0),
-        "graduation_min_paper_trades": (0.0, 1e5),
-        "graduation_min_measured_trades": (0.0, 1e5),
-        "graduation_base_arm_usd": (0.0, 1e7),
-        "graduation_max_arm_usd": (0.0, 1e7),
-        "graduation_daily_limit": (0.0, 1000.0),
-        "graduation_deny_cooldown_days": (0.0, 3650.0),
-        "graduation_skew_lookback_days": (1.0, 3650.0),
-        "live_min_daily_volume_usd": (0.0, 1e15),
-        "live_max_spread_bps": (0.0001, 10000.0),
-        "live_book_depth_window_bps": (0.0001, 10000.0),
-        "live_max_book_participation_pct": (0.0001, 100.0),
-        "live_max_price_impact_bps": (0.0001, 10000.0),
-        "regime_min_confidence": (0.0, 1.0),
-        "regime_gate_min_confidence": (0.0, 1.0),
-    },
-}
-
-
-def _validate_settings_section_payload(section: str, payload: dict) -> None:
-    """Reject unknown keys and out-of-range numbers BEFORE anything is persisted.
-
-    API-02. Raises 422 so the Settings save bar surfaces the actual refusal (it
-    renders the backend detail verbatim). A key absent from the payload is
-    untouched as before; an explicit ``null`` still means "keep the stored
-    value", which is what the coercers already did.
-    """
-    known = _SETTINGS_SECTION_KNOWN_KEYS.get(section)
-    if known is not None:
-        unknown = sorted(str(key) for key in payload if key not in known)
-        if unknown:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"settings section '{section}' has no handler for: "
-                    f"{', '.join(unknown)} — refusing the write rather than "
-                    "silently dropping it"
-                ),
-            )
-
-    for key, (low, high) in (_SETTINGS_SECTION_NUMERIC_BOUNDS.get(section) or {}).items():
-        if key not in payload:
-            continue
-        raw = payload.get(key)
-        if raw is None:
-            continue
-        # A bool here is never a legitimate limit — `float(True)` would quietly
-        # become a 1% ceiling, which is exactly the class of silent misconfig
-        # this guard exists to stop.
-        if isinstance(raw, bool):
-            raise HTTPException(
-                status_code=422,
-                detail=f"{section}.{key} must be a number, got a boolean",
-            )
-        try:
-            parsed = float(raw)
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=422,
-                detail=f"{section}.{key} must be a number, got {raw!r}",
-            ) from None
-        if parsed != parsed or parsed in (float("inf"), float("-inf")):
-            raise HTTPException(
-                status_code=422,
-                detail=f"{section}.{key} must be a finite number, got {raw!r}",
-            )
-        if not (low <= parsed <= high):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"{section}.{key} must be between {low:g} and {high:g}, got {parsed:g}"
-                ),
-            )
 
 
 def _apply_settings_section(section: str, payload: dict, actor: str = "ui") -> dict:
@@ -3792,262 +2315,13 @@ def _normalize_lifecycle_event_row(event_row: dict) -> dict:
     return row
 
 
-# â”€â”€ Pydantic models for POST bodies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-class BacktestingRunBody(BaseModel):
-    objective: str = "Discover profitable trading strategies"
-    symbol_filter: str | None = None
-    timeframe_filter: str | None = None
-    prompt_pack: str = "explore"
-    max_iterations: int = 50
-
-
-class BacktestPreviewBody(BaseModel):
-    strategy_name: str = Field(min_length=1, max_length=256)
-    strategy_version: str | None = None
-    symbol: str = "BTC"
-    timeframe: str = "1h"
-    start: str | None = None
-    end: str | None = None
-    params: dict | None = None
-    definition_json: dict | None = None
-    trade_mode: str | None = None
-
-
-class ManualStrategyBody(BaseModel):
-    code: str = Field(min_length=1, max_length=200_000)
-    type_name: str | None = Field(default=None, max_length=64)
-
-
-class SendToForgeBody(BaseModel):
-    mode: str = Field(min_length=1, max_length=16)  # 'code' | 'visual'
-    type_name: str | None = Field(default=None, max_length=64)  # code mode: registered TYPE_NAME
-    spec: dict | None = None  # visual mode: rule-engine spec
-    params: dict | None = None  # code mode: strategy params
-    symbol: str = "BTC"
-    timeframe: str = "1h"
-    name: str | None = Field(default=None, max_length=140)
-
-
-class PreviewChartBody(BaseModel):
-    spec: dict  # rule-engine visual spec
-    symbol: str = "BTC"
-    timeframe: str = "1h"
-    start: str | None = None
-    end: str | None = None
-    trade_mode: str | None = None
-    name: str | None = Field(default=None, max_length=140)
-
-
-class NlToSpecBody(BaseModel):
-    description: str = Field(min_length=1, max_length=4000)
-    symbol: str = "BTC"
-    timeframe: str = "1h"
-
-
-class BacktestSubmitBody(BaseModel):
-    strategy_id: str | None = Field(default=None, min_length=1, max_length=128)
-    strategy_name: str | None = Field(default=None, max_length=256)
-    strategy_version: str | None = None
-    symbol: str = "BTC"
-    timeframe: str = "1h"
-    start: str | None = None
-    end: str | None = None
-    params: dict | None = None
-    definition_json: dict | None = None
-    # Per-stage window override (calendar days). When set (and start/end are absent),
-    # the default rolling window uses this instead of the global backtest_duration_days
-    # — lets a gauntlet stage run its OWN configured window. <=0/None falls back to the
-    # global default.
-    duration_days: int | None = Field(default=None, ge=0, le=36500)
-    # Numeric controls carry sane bounds so absurd/negative values are rejected
-    # server-side (the form also validates, but the API is the trust boundary).
-    initial_capital: float | None = Field(default=None, gt=0, le=1e12)
-    fee_bps: float | None = Field(default=None, ge=0, le=1000)
-    slippage_bps: float | None = Field(default=None, ge=0, le=1000)
-    trade_mode: str | None = None
-    allow_shorting: bool | None = None
-    stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
-    take_profit_pct: float | None = Field(default=None, gt=0, le=1000)
-    trailing_stop_pct: float | None = Field(default=None, gt=0, le=100)
-    time_stop_bars: int | None = Field(default=None, ge=1, le=1_000_000)
-    sizing_mode: str | None = None
-    fixed_size: float | None = Field(default=None, gt=0, le=1e12)
-    risk_per_trade: float | None = Field(default=None, gt=0, le=1)
-    atr_stop_multiplier: float | None = Field(default=None, gt=0, le=50)
-    kelly_multiplier: float | None = Field(default=None, gt=0, le=5)
-    kelly_lookback: int | None = Field(default=None, ge=1, le=100_000)
-    leverage: float | None = Field(default=None, gt=0, le=125)
-    lifecycle_id: str | None = None
-    preserve_result: bool = False
-    # Point-in-time pin (ISO-8601): reconstruct the data as it was known at
-    # this instant from the revision log. Gauntlet stages pass their
-    # candidate's creation time so every stage scores identical data.
-    as_of: str | None = Field(default=None, max_length=64)
-
-
-class OptimizationSubmitBody(BaseModel):
-    strategy_id: str | None = Field(default=None, min_length=1, max_length=128)
-    strategy_name: str | None = Field(default=None, max_length=256)
-    symbol: str = "BTC"
-    timeframe: str = "1h"
-    objective: str | None = None
-    # Mirror BacktestSubmitBody's trust-boundary bounds — the API is the validation point.
-    n_trials: int | None = Field(default=None, ge=1, le=10000)
-    parameter_ranges: dict | None = None
-    start: str | None = None
-    end: str | None = None
-    # Per-stage window override (calendar days); see BacktestSubmitBody.duration_days.
-    duration_days: int | None = Field(default=None, ge=0, le=36500)
-    definition_json: dict | None = None
-    initial_capital: float | None = Field(default=None, gt=0, le=1e12)
-    fee_bps: float | None = Field(default=None, ge=0, le=1000)
-    slippage_bps: float | None = Field(default=None, ge=0, le=1000)
-    leverage: float | None = Field(default=None, gt=0, le=125)
-    sizing_mode: str | None = None
-    fixed_size: float | None = Field(default=None, gt=0, le=1e12)
-    risk_per_trade: float | None = Field(default=None, gt=0, le=1)
-    atr_stop_multiplier: float | None = Field(default=None, gt=0, le=50)
-    kelly_multiplier: float | None = Field(default=None, gt=0, le=5)
-    kelly_lookback: int | None = Field(default=None, ge=1, le=100_000)
-    stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
-    take_profit_pct: float | None = Field(default=None, gt=0, le=1000)
-    trailing_stop_pct: float | None = Field(default=None, gt=0, le=100)
-    time_stop_bars: int | None = Field(default=None, ge=1, le=1_000_000)
-    execution_profile: dict | None = None
-    execution_parameter_ranges: dict | None = None
-    lifecycle_id: str | None = None
-    as_of: str | None = Field(default=None, max_length=64)
-
-
+# ARCH-06: the POST-body models that were defined here now live in
+# forven.api_models (re-exported at the top of this file). These three are not
+# definitions — they alias models OWNED by forven.strategy_lifecycle — so they
+# stay here rather than making api_models import the lifecycle service.
 StrategyPromoteBody = lifecycle_service.StrategyPromoteBody
 LifecycleTransitionBody = lifecycle_service.LifecycleTransitionBody
 LifecycleCreateBody = lifecycle_service.LifecycleCreateBody
-
-
-class ForceCloseTradeBody(BaseModel):
-    reason: str | None = Field(default=None, max_length=512)
-
-
-class MarkTradeFailedBody(BaseModel):
-    reason: str | None = Field(default=None, max_length=512)
-
-
-class PaperClosePositionBody(BaseModel):
-    reason: str | None = Field(default=None, max_length=512)
-
-
-class PaperPartialCloseBody(BaseModel):
-    qty: float | None = Field(default=None, gt=0)
-    pct: float | None = Field(default=None, gt=0, le=100)
-
-
-class PaperOpenPositionBody(BaseModel):
-    direction: str = Field(..., pattern="^(?i)(long|short)$")
-    size: float | None = Field(default=None, gt=0)
-    risk_pct: float | None = Field(default=None, gt=0, le=100)
-    leverage: float = Field(default=1.0, gt=0, le=50)
-    stop_loss_price: float | None = Field(default=None, gt=0)
-    take_profit_price: float | None = Field(default=None, gt=0)
-
-
-class PaperAdjustLevelBody(BaseModel):
-    # null clears the level; a positive number sets it.
-    price: float | None = Field(default=None)
-
-
-class PaperAutoManagementBody(BaseModel):
-    paused: bool
-
-
-class LegacyAgentDocumentBody(BaseModel):
-    content: str
-
-
-class LegacyAgentUpdateBody(BaseModel):
-    name: str | None = None
-    role: str | None = None
-    model: str | None = None
-    model_id: str | None = None
-    schedule_type: str | None = None
-    schedule_expr: str | None = None
-    enabled: bool | None = None
-    visibility: str | None = None
-    instructions: str | None = None
-    discord_token: str | None = None
-
-
-class LegacyAgentModelBody(BaseModel):
-    model: str
-    model_id: str | None = None
-
-
-class LegacyAgentCreateBody(BaseModel):
-    name: str
-    model: str | None = "openai"
-    model_id: str | None = None
-    instructions: str | None = None
-
-
-class AgentDiscordTestBody(BaseModel):
-    discord_token: str | None = None
-
-
-class ModelPolicyUpdateBody(BaseModel):
-    provider_priority: list[str] | None = None
-    default_models: dict[str, str] | None = None
-    fallback_chains: dict[str, list[dict[str, str]]] | None = None
-
-
-class AuthProviderProfileBody(BaseModel):
-    access_token: str | None = None
-    access: str | None = None
-    token: str | None = None
-    api_key: str | None = None
-    refresh_token: str | None = None
-    refresh: str | None = None
-    expires_at: str | int | float | None = None
-    expires_in: str | int | float | None = None
-    base_url: str | None = None
-
-
-class AuthProviderOAuthStartBody(BaseModel):
-    pass
-
-
-class AuthProviderOAuthCompleteBody(BaseModel):
-    code: str | None = None
-    state: str | None = None
-    code_verifier: str | None = None
-
-
-class SettingsApiKeyBody(BaseModel):
-    source: str
-    api_key: str
-
-
-class SettingsTestRemoteEngineBody(BaseModel):
-    url: str
-
-
-class PipelineSettingsUpdateBody(BaseModel):
-    updates: dict[str, object]
-    actor: str = "manual"
-
-
-class BrainChatHistoryEntry(BaseModel):
-    role: str = Field(max_length=16)
-    content: str = Field(max_length=4000)
-
-
-class BrainChatBody(BaseModel):
-    message: str = Field(min_length=1, max_length=8000)
-    context: str | None = Field(default=None, max_length=512)
-    entity_type: str | None = Field(default=None, max_length=32)
-    entity_id: str | None = Field(default=None, max_length=64)
-    provider: str | None = Field(default=None, max_length=64)
-    model: str | None = Field(default=None, max_length=128)
-    history: list[BrainChatHistoryEntry] | None = Field(default=None, max_length=20)
 
 
 def _coerce_profile_expiry(body: AuthProviderProfileBody) -> int | None:
@@ -6908,58 +5182,6 @@ def put_pipeline_settings(body: PipelineSettingsUpdateBody):
     return payload
 
 
-_AUDIT_IGNORE_KEYS = frozenset({
-    "audit_log",
-    "updated_at",
-    "hyperliquid_has_key",
-    "discord_bot_token_configured",
-    "discord_bot_token_source",
-    "discord_webhook_configured",
-})
-
-
-def _diff_settings_section(
-    section: str,
-    old_payload: dict,
-    new_payload: dict,
-    actor: str = "system",
-) -> list[dict]:
-    """Emit one audit entry per leaf that changed between old and new payloads.
-
-    The ``section`` argument is used only as a label — entry ids are formed as
-    ``f"{section}.{dot_path_from_root}"``. Volatile/derived top-level keys
-    (``audit_log``, ``updated_at``, secret-presence flags, etc.) are skipped.
-    """
-    entries: list[dict] = []
-
-    def walk(prefix: str, a, b):
-        if isinstance(a, dict) and isinstance(b, dict):
-            keys = set(a.keys()) | set(b.keys())
-            for k in sorted(keys):
-                if prefix == section and k in _AUDIT_IGNORE_KEYS:
-                    continue
-                walk(f"{prefix}.{k}", a.get(k), b.get(k))
-        else:
-            if a != b:
-                entries.append({
-                    "id": prefix,
-                    "from": a,
-                    "to": b,
-                    "at": _now(),
-                    "actor": actor,
-                })
-
-    walk(section, old_payload or {}, new_payload or {})
-    return entries
-
-
-def _append_settings_audit(log: list[dict], entries: list[dict], cap: int = 50) -> list[dict]:
-    combined = list(log or []) + list(entries or [])
-    if len(combined) > cap:
-        combined = combined[-cap:]
-    return combined
-
-
 _PIPELINE_THRESHOLD_SETTING_KEYS = {
     # Active stance preset (relaxed | default | strict | custom). A plain string,
     # not a section dict — routes to the pipeline KV so policy._apply_pipeline_preset
@@ -9701,75 +7923,6 @@ def _resolve_strategy_for_backtest(
     return best_row
 
 
-def _resolve_backtest_context_from_results(
-    strategy_name: str,
-    symbol: str | None = None,
-    timeframe: str | None = None,
-) -> dict | None:
-    target_key = _normalize_strategy_lookup_key(strategy_name)
-    if not target_key:
-        return None
-    desired_symbol = _extract_base_asset_symbol(symbol) if symbol else ""
-    desired_timeframe = str(timeframe or "").strip().lower()
-
-    best: dict | None = None
-    best_score = -1
-    for rec in _chroma_backtest_records():
-        meta = rec.get("metadata") or {}
-        if not isinstance(meta, dict):
-            continue
-        candidates = [
-            str(meta.get("strategy_id") or "").strip(),
-            str(meta.get("strategy_name") or "").strip(),
-            str(rec.get("id") or "").strip(),
-        ]
-        score = 0
-        for candidate in candidates:
-            candidate_key = _normalize_strategy_lookup_key(candidate)
-            if not candidate_key:
-                continue
-            if candidate_key == target_key:
-                score = max(score, 100)
-            elif target_key in candidate_key or candidate_key in target_key:
-                score = max(score, 80)
-
-        if score <= 0:
-            continue
-
-        row_symbol = _extract_base_asset_symbol(meta.get("asset"))
-        row_timeframe = str(meta.get("timeframe") or "").strip().lower()
-        if desired_symbol and row_symbol == desired_symbol:
-            score += 5
-        if desired_timeframe and row_timeframe == desired_timeframe:
-            score += 3
-
-        if score > best_score:
-            best_score = score
-            best = {"record": rec, "metadata": meta}
-
-    if not best:
-        return None
-
-    meta = best.get("metadata") or {}
-    if not isinstance(meta, dict):
-        return None
-    config_meta = _parse_json_blob(meta.get("config_json"), {})
-    if not isinstance(config_meta, dict):
-        config_meta = {}
-    base_params = _parse_strategy_params_blob(config_meta.get("params"))
-    strategy_id = str(meta.get("strategy_id") or meta.get("strategy_name") or strategy_name).strip() or strategy_name
-    strategy_type = str(meta.get("strategy_type") or "").strip().lower() or None
-    if not strategy_type:
-        strategy_type = _infer_strategy_type_from_name(strategy_name) or _infer_strategy_type_from_name(strategy_id)
-    return {
-        "strategy_id": strategy_id,
-        "strategy_type": strategy_type,
-        "params": base_params,
-        "symbol": _extract_base_asset_symbol(meta.get("asset"), config_meta.get("symbol")),
-        "timeframe": str(meta.get("timeframe") or config_meta.get("timeframe") or timeframe or "1h").strip() or "1h",
-    }
-
-
 def _normalize_strategy_type(value: object) -> str | None:
     raw = str(value or "").strip()
     if not raw:
@@ -10060,128 +8213,6 @@ def _backfill_strategy_type_from_context(
                 strategy_id,
             ),
         )
-
-
-def _resolve_backtest_context_from_definition(
-    definition_json: object,
-    symbol: str | None = None,
-    timeframe: str | None = None,
-) -> dict | None:
-    if not isinstance(definition_json, dict):
-        return None
-    definition = dict(definition_json)
-    strategy_id = (
-        str(definition.get("api_name") or definition.get("name") or "").strip()
-        or None
-    )
-    strategy_type = _normalize_strategy_type(
-        definition.get("strategy_type") or definition.get("type")
-    )
-    if not strategy_type:
-        strategy_type = _infer_strategy_type_from_name(
-            definition.get("name") or definition.get("api_name")
-        )
-    params_blob = definition.get("params")
-    if not isinstance(params_blob, dict):
-        params_blob = definition.get("parameters")
-    params = _parse_strategy_params_blob(params_blob)
-    resolved_symbol = _extract_base_asset_symbol(
-        symbol,
-        definition.get("asset") or definition.get("symbol"),
-    )
-    resolved_timeframe = str(
-        timeframe or definition.get("timeframe") or "1h"
-    ).strip() or "1h"
-    return {
-        "strategy_id": strategy_id,
-        "strategy_type": strategy_type,
-        "params": params,
-        "symbol": resolved_symbol,
-        "timeframe": resolved_timeframe,
-    }
-
-
-def _resolve_backtest_context_from_lifecycle_id(
-    lifecycle_id: str | None,
-    symbol: str | None = None,
-    timeframe: str | None = None,
-) -> dict | None:
-    target = str(lifecycle_id or "").strip()
-    if not target:
-        return None
-    target_lower = target.lower()
-    desired_symbol = _extract_base_asset_symbol(symbol) if symbol else ""
-    desired_timeframe = str(timeframe or "").strip().lower()
-
-    best_meta: dict | None = None
-    best_score = -1
-    for rec in _chroma_backtest_records():
-        meta = rec.get("metadata") or {}
-        if not isinstance(meta, dict):
-            continue
-        rec_id = str(rec.get("id") or "").strip()
-        lifecycle_tag = str(meta.get("lifecycle_strategy_id") or "").strip()
-        strategy_id = str(meta.get("strategy_id") or "").strip()
-        strategy_name = str(meta.get("strategy_name") or "").strip()
-
-        score = 0
-        if rec_id.lower() == target_lower:
-            score = max(score, 140)
-        if lifecycle_tag.lower() == target_lower:
-            score = max(score, 130)
-        if strategy_id.lower() == target_lower:
-            score = max(score, 120)
-        if strategy_name.lower() == target_lower:
-            score = max(score, 115)
-        if score <= 0:
-            continue
-
-        row_symbol = _extract_base_asset_symbol(meta.get("asset"))
-        row_timeframe = str(meta.get("timeframe") or "").strip().lower()
-        if desired_symbol and row_symbol == desired_symbol:
-            score += 5
-        if desired_timeframe and row_timeframe == desired_timeframe:
-            score += 3
-
-        if score > best_score:
-            best_score = score
-            best_meta = meta
-
-    if not best_meta:
-        return None
-
-    config_meta = _parse_json_blob(best_meta.get("config_json"), {})
-    if not isinstance(config_meta, dict):
-        config_meta = {}
-
-    params = _parse_strategy_params_blob(config_meta.get("params"))
-    strategy_type = _normalize_strategy_type(
-        best_meta.get("strategy_type") or config_meta.get("strategy_type")
-    )
-    if not strategy_type:
-        strategy_type = _infer_strategy_type_from_name(
-            best_meta.get("strategy_name") or best_meta.get("strategy_id")
-        )
-
-    return {
-        "strategy_id": str(
-            best_meta.get("strategy_id")
-            or best_meta.get("strategy_name")
-            or target
-        ).strip() or target,
-        "strategy_type": strategy_type,
-        "params": params,
-        "symbol": _extract_base_asset_symbol(
-            symbol,
-            best_meta.get("asset") or config_meta.get("symbol"),
-        ),
-        "timeframe": str(
-            timeframe
-            or best_meta.get("timeframe")
-            or config_meta.get("timeframe")
-            or "1h"
-        ).strip() or "1h",
-    }
 
 
 def _build_backtest_document(
@@ -10504,7 +8535,12 @@ def _persist_completed_backtest_run(
     except Exception:
         pass
     compact_config = {k: v for k, v in config_payload.items() if v is not None}
-    lifecycle_tag = str(lifecycle_id).strip() if lifecycle_id else strategy_id
+    # NOTE: `lifecycle_id` now has no consumer in this function. Its only reader
+    # was `store_backtest_result(lifecycle_strategy_id=...)` in the ChromaDB
+    # memory layer, deleted in 97ac259b; the replacement
+    # `record_backtest_for_learning` takes no lifecycle id. The parameter is kept
+    # because callers still pass it — do not "fix" it by inventing a new
+    # consumer; give it one deliberately or drop it from the signature.
 
     metrics_for_storage = dict(metrics)
     if full_backtest_months is not None:
@@ -10849,9 +8885,28 @@ def register_manual_backtest_strategy(body: ManualStrategyBody) -> dict:
             params = getattr(instance, "default_params", {})
             if isinstance(params, dict):
                 default_params = dict(params)
-            from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
+            from forven.strategies.lookahead_probe import detect_execution_crash, probe_lookahead
 
-            leak_reason = detect_lookahead(instance)
+            # lookahead-probe-vacuous-pass (2026-07-25): `probe_lookahead` returns
+            # the SAME rejection reason the old `detect_lookahead` wrapper did
+            # (that wrapper is literally `probe_lookahead(x).reason`), so the
+            # accept/reject decision here is unchanged. What it adds is
+            # `inconclusive` — the probe compared NOTHING because the strategy
+            # never fired on the synthetic walk, so "no leak found" was a
+            # statement about an empty comparison set. Never a rejection (being
+            # quiet on synthetic data is not evidence of a leak), but the author
+            # must not read the green result as "causality verified", so it is
+            # surfaced as a warning. This call site could not say that at all
+            # before.
+            lookahead_verdict = probe_lookahead(instance)
+            leak_reason = lookahead_verdict.reason
+            if lookahead_verdict.inconclusive:
+                warnings.append(
+                    "Lookahead not verifiable: "
+                    f"{lookahead_verdict.inconclusive}. The causality probe had "
+                    "nothing to compare — this is NOT a leak finding, but nothing "
+                    "was verified either."
+                )
             crash_reason = detect_execution_crash(instance)
             if leak_reason or crash_reason:
                 registered = False
@@ -10900,6 +8955,12 @@ def send_manual_strategy_to_forge(body: SendToForgeBody) -> dict:
     asset = _extract_base_asset_symbol(body.symbol) or "BTC"
     timeframe = str(body.timeframe or "1h").strip() or "1h"
 
+    # Set only by the `code` branch, which is the one that runs the causality
+    # probe; the visual branch builds a rule_engine spec that has no vectorized
+    # path to probe. Surfaced on the response so the Forge can say "sent, but
+    # causality was not verifiable" instead of implying a clean probe.
+    lookahead_inconclusive: str | None = None
+
     if mode == "visual":
         spec = body.spec if isinstance(body.spec, dict) else None
         if not spec:
@@ -10925,10 +8986,18 @@ def send_manual_strategy_to_forge(body: SendToForgeBody) -> dict:
         strategy_type = type_name
         params = dict(body.params) if isinstance(body.params, dict) else {}
         try:
-            from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
+            from forven.strategies.lookahead_probe import detect_execution_crash, probe_lookahead
 
             probe = _TYPE_MAP[type_name](type_name, params)
-            leak_reason = detect_lookahead(probe)
+            # See register_manual_backtest_strategy: `probe_lookahead(x).reason`
+            # IS what `detect_lookahead(x)` returned, so intake rejects exactly
+            # the same strategies as before. `inconclusive` is the part this
+            # gate could not express — the probe compared nothing, so the pass
+            # is not evidence of causality. It never blocks intake; it rides
+            # back on the response.
+            lookahead_verdict = probe_lookahead(probe)
+            leak_reason = lookahead_verdict.reason
+            lookahead_inconclusive = lookahead_verdict.inconclusive
             crash_reason = detect_execution_crash(probe)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Strategy validation probe failed: {exc}") from exc
@@ -10968,7 +9037,14 @@ def send_manual_strategy_to_forge(body: SendToForgeBody) -> dict:
     except Exception:
         pass
 
-    return {"ok": True, "strategy_id": strategy_id, "display_id": display_id, "stage": "quick_screen", "type": strategy_type}
+    return {
+        "ok": True,
+        "strategy_id": strategy_id,
+        "display_id": display_id,
+        "stage": "quick_screen",
+        "type": strategy_type,
+        "lookahead_inconclusive": lookahead_inconclusive,
+    }
 
 
 def _collect_backtest_execution_controls(payload: object) -> dict[str, object]:
@@ -11495,7 +9571,10 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
         _existing = compact_config.get("warnings")
         compact_config["warnings"] = (list(_existing) if isinstance(_existing, list) else []) + execution_profile_warnings
 
-    lifecycle_tag = str(body.lifecycle_id).strip() if body.lifecycle_id else strategy_id
+    # (A `lifecycle_tag` local lived here. Its only reader was the ChromaDB
+    # `store_backtest_result(lifecycle_strategy_id=...)` call removed in
+    # 97ac259b; `body.lifecycle_id` is still honoured at the top of this
+    # function, where it resolves the strategy row.)
 
     metrics_for_storage = dict(metrics)
     if full_backtest_months is not None:
@@ -11779,9 +9858,11 @@ def post_optimization_submit(body: OptimizationSubmitBody):
     )
 
     # Capture values the background thread needs.
+    # (`opt_lifecycle_tag` and `definition_json` were captured here too. Both fed
+    # only the ChromaDB `store_backtest_result(...)` call removed in 97ac259b —
+    # the background thread never read either one otherwise, and
+    # `body.definition_json` is still used above for strategy resolution.)
     param_space = body.parameter_ranges if isinstance(body.parameter_ranges, dict) else None
-    opt_lifecycle_tag = str(body.lifecycle_id).strip() if body.lifecycle_id else strategy_id
-    definition_json = body.definition_json if isinstance(body.definition_json, dict) else None
     body_objective = body.objective
     body_start = body.start
     body_end = body.end
