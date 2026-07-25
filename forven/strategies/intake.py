@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import importlib
 import json
 import logging
 import pkgutil
@@ -170,6 +169,19 @@ class IntakeRegistration:
     # gauntlet backfill only picks up quick_screen/gauntlet) with the reason here.
     lookahead_blocked: bool = False
     lookahead_reason: str | None = None
+    # Probe VERIFIABILITY (lookahead-probe-vacuous-pass, 2026-07-25). The
+    # truncation-invariance probe can only prove causality at bars where the
+    # strategy actually fires; a strategy that stays quiet on the synthetic walk
+    # compares NOTHING and used to be stamped leak-free anyway. `lookahead_verifiable`
+    # False means "not verified", NEVER "leaking" — it must not block registration
+    # (quiet on synthetic data is not evidence of a leak), it only tells the operator
+    # the green tick is empty. `bounded_lookback` False means the signal at a
+    # timestamp depends on how far back the frame starts (expanding/ewm/frame-anchored
+    # statistics), so paper (~1500 bars) will not reproduce the gauntlet's full-history
+    # signal. Both are advisory; see lookahead_probe.probe_lookahead.
+    lookahead_verifiable: bool = True
+    lookahead_inconclusive_reason: str | None = None
+    bounded_lookback: bool | None = None
     # Data-availability probe outcome (GATE D). When a required enrichment feed
     # is unavailable and cannot be auto-downloaded, the strategy registers as
     # research_only — it can never produce a trading backtest until the data
@@ -179,6 +191,41 @@ class IntakeRegistration:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def lookahead_verifiability(meta: object) -> dict:
+    """Normalize a sandbox-worker meta blob's lookahead VERIFIABILITY fields.
+
+    One place that knows the contract, because the worker, the drop-zone scan and
+    the imported-file registration all consume the same payload. Returns
+    ``{"lookahead_verifiable": bool, "lookahead_inconclusive_reason": str|None,
+    "bounded_lookback": bool|None}``.
+
+    Contract (lookahead-probe-vacuous-pass): ``probe_lookahead().reason`` is the ONLY
+    field that may reject a strategy. ``inconclusive`` means the probe compared
+    nothing — it is surfaced as "lookahead not verifiable" and must never turn into a
+    rejection, or every strategy that is simply quiet on the synthetic walk would be
+    blocked. A worker that does not emit these keys yet reads as verifiable/unknown,
+    so this is safe to call against older payloads.
+    """
+    blob = meta if isinstance(meta, dict) else {}
+    reason = str(
+        blob.get("lookahead_inconclusive_reason") or blob.get("lookahead_inconclusive") or ""
+    ).strip()
+    verifiable = blob.get("lookahead_verifiable")
+    if not isinstance(verifiable, bool):
+        # Only an explicit inconclusive reason downgrades verifiability; absence of
+        # the key (older worker) is "unknown", which stays optimistic rather than
+        # flagging every existing strategy.
+        verifiable = not reason
+    bounded = blob.get("bounded_lookback")
+    if not isinstance(bounded, bool):
+        bounded = None
+    return {
+        "lookahead_verifiable": bool(verifiable),
+        "lookahead_inconclusive_reason": reason or None,
+        "bounded_lookback": bounded,
+    }
 
 
 def scan_custom_strategies(*, register: bool = False) -> dict:
@@ -200,7 +247,6 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
         custom_strategy_status,
         include_archived_custom_strategies,
     )
-    from forven.strategies.certification import certify_execution_strategy
 
     report = IntakeReport(timestamp=datetime.now(timezone.utc).isoformat())
     custom_dir = Path(custom.__file__).resolve().parent
@@ -209,7 +255,8 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
     # Ensure registry has been discovered at least once
     registry.discover(include_custom=False)
 
-    known_types = set(registry._TYPE_MAP.keys())
+    # ARCH-04: the `known_types` snapshot that used to be taken here fed only the
+    # deleted trusted-import branch — the sandboxed path registers via the worker.
 
     for _importer, modname, _ispkg in pkgutil.iter_modules(custom.__path__):
         if not modname or modname == "__init__":
@@ -289,6 +336,14 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
         if lookahead_reason or crash_reason:
             certified = False
             cert_error = cert_error or lookahead_reason or crash_reason
+        # NOT a rejection — see lookahead_verifiability(). Reported so the scan
+        # report shows an unearned leak-free tick instead of a silent green.
+        scan_verifiability = lookahead_verifiability(meta)
+        if not scan_verifiability["lookahead_verifiable"]:
+            log.info(
+                "%s: lookahead not verifiable (%s) — registering anyway, this is not a leak",
+                modname, scan_verifiability["lookahead_inconclusive_reason"],
+            )
         existing_strategy = _find_existing_strategy_container(
             type_name=type_name,
             source_ref=source_ref,
@@ -330,204 +385,10 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
             certification_error=cert_error,
             file_name=file_name,
         ))
-        continue
-
-        # Try importing
-        try:
-            mod = importlib.import_module(fqn)
-        except Exception as exc:
-            report.errors.append(IntakeError(
-                module_name=modname,
-                error=f"Import failed: {exc}",
-                file_name=file_name,
-            ))
-            continue
-
-        # Validate required exports
-        strategy_cls = getattr(mod, "STRATEGY_CLASS", None)
-        type_name = getattr(mod, "TYPE_NAME", None)
-
-        if not strategy_cls:
-            report.errors.append(IntakeError(
-                module_name=modname,
-                error="Missing STRATEGY_CLASS export",
-                file_name=file_name,
-            ))
-            continue
-
-        if not type_name:
-            report.errors.append(IntakeError(
-                module_name=modname,
-                error="Missing TYPE_NAME export",
-                file_name=file_name,
-            ))
-            continue
-
-        # Validate class
-        validation_errors = registry._registry_type_validation_errors(strategy_cls)
-        if validation_errors:
-            report.errors.append(IntakeError(
-                module_name=modname,
-                error=f"Class validation: {'; '.join(validation_errors)}",
-                file_name=file_name,
-            ))
-            continue
-
-        # Probe for default params and asset
-        try:
-            probe = strategy_cls("__probe__", {})
-            default_params = probe.default_params
-            raw_asset = probe.asset if hasattr(probe, "asset") else "BTC"
-            asset = str(raw_asset) if not isinstance(raw_asset, str) else raw_asset
-            asset = asset.strip() or "BTC"
-        except Exception as exc:
-            report.errors.append(IntakeError(
-                module_name=modname,
-                error=f"Could not instantiate: {exc}",
-                file_name=file_name,
-            ))
-            continue
-
-        # Certification check
-        cert = certify_execution_strategy(type_name, default_params)
-        certified = cert.certified
-        cert_error = cert.primary_blocking_reason()
-
-        # GATE B: lookahead / data-leak probe (see register_custom_strategy_file).
-        # A future-bar leak routes the strategy to research_only (inert) instead
-        # of the quick_screen funnel.
-        from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
-
-        lookahead_reason = detect_lookahead(probe)
-        if lookahead_reason:
-            certified = False
-            if not cert_error:
-                cert_error = lookahead_reason
-            log.warning(
-                "Intake: lookahead detected in %s (type=%s) — registering as research_only: %s",
-                modname, type_name, lookahead_reason,
-            )
-
-        # GATE C: execution smoke probe. Reject a strategy that crashes on a clean
-        # synthetic run (canonically a per-bar self.position read) here, rather
-        # than letting it die with a cryptic error three gates later. Downgrading
-        # certified routes it to research_only (initial_stage derives from it below).
-        crash_reason = detect_execution_crash(probe)
-        if crash_reason:
-            certified = False
-            if not cert_error:
-                cert_error = crash_reason
-            log.warning(
-                "Intake: execution smoke test failed for %s (type=%s) — registering as research_only: %s",
-                modname, type_name, crash_reason,
-            )
-
-        # GATE D: data-availability probe (see register_custom_strategy_file).
-        # A strategy needing an unavailable, non-downloadable feed can never
-        # produce a trading backtest — park it as research_only at birth.
-        data_block_reason = None
-        try:
-            from forven.strategies.data_availability import evaluate_data_availability
-
-            _avail = evaluate_data_availability(
-                type_name,
-                asset.upper(),
-                _intended_timeframe(default_params),
-                strategy_cls=strategy_cls,
-            )
-            if _avail is not None and _avail.blocked:
-                data_block_reason = _avail.error or "required data feed unavailable"
-        except Exception as exc:
-            log.warning(
-                "Intake: data-availability probe errored for %s (parking): %s",
-                modname, exc,
-            )
-            data_block_reason = f"data-availability check unavailable: {exc}"
-        if data_block_reason:
-            if not cert_error:
-                cert_error = data_block_reason
-            log.warning(
-                "Intake: required data feed unavailable for %s (type=%s) — registering as research_only: %s",
-                modname, type_name, data_block_reason,
-            )
-
-        existing_strategy = _find_existing_strategy_container(
-            type_name=type_name,
-            source_ref=source_ref,
-        )
-
-        if existing_strategy:
-            report.already_known += 1
-            continue
-
-        # --- DRY-RUN vs REGISTER split ---
-        # In dry-run mode (register=False), record the strategy as discoverable
-        # but skip runtime registration and DB container creation.
-        strategy_id = None
-
-        if register:
-            # Register in the runtime registry
-            if type_name not in known_types:
-                try:
-                    registry._load_custom_strategy_module(modname)
-                    known_types.add(type_name)
-                except Exception as exc:
-                    report.errors.append(IntakeError(
-                        module_name=modname,
-                        error=f"Registration failed: {exc}",
-                        file_name=file_name,
-                    ))
-                    continue
-
-            # Create DB container. ``certified`` may have been downgraded by the
-            # lookahead probe above, so derive the stage from the (possibly
-            # downgraded) local flag rather than cert.certified alone — a leak
-            # forces research_only even when certification itself passed. A
-            # data-blocked strategy is also parked regardless of certification.
-            initial_stage = "quick_screen" if (certified and not data_block_reason) else "research_only"
-            try:
-                from forven.db import create_strategy_container, get_db
-                stored_params = cert.canonical_params if certified else default_params
-                with get_db() as conn:
-                    sid, _display, _base = create_strategy_container(
-                        conn=conn,
-                        name=f"{asset}-{type_name}-intake",
-                        type_=type_name,
-                        symbol=asset.upper(),
-                        timeframe=_intended_timeframe(stored_params),
-                        params=stored_params,
-                        stage=initial_stage,
-                    )
-                    strategy_id = sid
-                    if data_block_reason:
-                        conn.execute(
-                            "UPDATE strategies SET status_reason = ? WHERE id = ?",
-                            (f"data_blocked: {data_block_reason[:400]}", strategy_id),
-                        )
-            except Exception as exc:
-                log.warning("Intake: DB container creation failed for %s: %s", modname, exc)
-
-        entry = IntakeEntry(
-            module_name=modname,
-            type_name=type_name,
-            strategy_id=strategy_id,
-            asset=asset.upper(),
-            certified=certified,
-            certification_error=cert_error,
-            file_name=file_name,
-        )
-        report.new_strategies.append(entry)
-
-        if register:
-            log.info(
-                "Intake: registered %s (type=%s, certified=%s, id=%s)",
-                modname, type_name, certified, strategy_id,
-            )
-        else:
-            log.debug(
-                "Intake: discovered %s (type=%s, certified=%s) — dry run, not registered",
-                modname, type_name, certified,
-            )
+        # ARCH-04 (2026-07-25): the trailing `continue` that used to sit here hid a
+        # ~195-line unreachable second copy of the trusted-import intake path below
+        # it (the sandboxed path above superseded it). Both are gone; do not add
+        # statements after the loop body's last append without checking reachability.
 
     report.registered = register
 
@@ -631,6 +492,7 @@ def _register_custom_strategy_sandboxed(
     if not moved_file and source_path != target:
         source_path.unlink(missing_ok=True)
 
+    verifiability = lookahead_verifiability(registered)
     payload = IntakeRegistration(
         strategy_id=str(registered["strategy_id"]),
         module_name=modname,
@@ -647,6 +509,7 @@ def _register_custom_strategy_sandboxed(
         lookahead_reason=registered.get("certification_error")
         if registered.get("lookahead_blocked")
         else None,
+        **verifiability,
     ).to_dict()
     payload["runtime_type"] = registered.get("runtime_type")
     payload["sandbox_only"] = True
@@ -669,12 +532,7 @@ def register_custom_strategy_file(
     detail views can surface what was generated during the session.
     """
     from forven.strategies import registry
-    from forven.strategies.certification import certify_execution_strategy
-    from forven.db import create_strategy_container, get_db, log_activity
-    from forven.ai_dropzone_sessions import (
-        record_strategy_in_session,
-        session_exists,
-    )
+    from forven.ai_dropzone_sessions import session_exists
 
     clean_session_id = str(session_id or "").strip() or None
     if clean_session_id and not session_exists(clean_session_id):
@@ -693,6 +551,12 @@ def register_custom_strategy_file(
                 f"{file_name} is missing embedded hypothesis_id for auto_intake registration"
             )
         hypothesis_id = inferred_hypothesis_id
+    # ARCH-04 (2026-07-25): ~254 unreachable lines used to follow this return — the
+    # pre-sandbox implementation that imported untrusted code into the API process
+    # (banned-import gate, AST guard, certification, lookahead/crash/data probes).
+    # It greps identically to live code, so a security fix could land there and never
+    # run. The live equivalents all live in _register_custom_strategy_sandboxed and
+    # the sandbox worker; the dead copy is deleted.
     return _register_custom_strategy_sandboxed(
         modname=modname,
         source_ref=source_ref,
@@ -702,261 +566,6 @@ def register_custom_strategy_file(
         session_id=clean_session_id,
         origin_task_id=origin_task_id,
     )
-
-    known_types = set(registry._TYPE_MAP.keys())
-
-    # Banned-import gate — reject before we even try to import so that
-    # lazy `ta` imports (which don't fail until runtime) are caught.
-    banned = _file_uses_banned_imports(Path(source_ref))
-    if banned:
-        raise ValueError(
-            f"{file_name} uses banned imports: {', '.join(banned)}. "
-            "These libraries are forbidden — rewrite using native pandas/numpy. "
-            "See forven/strategies/STRATEGY_TEMPLATE.md."
-        )
-
-    # SECURITY (Lead-2): this file is imported into the live API process below,
-    # so its top-level code runs with host privileges (os.environ secrets, the
-    # decrypted Fernet key in memory, exchange creds). Run the static AST guard
-    # — forbidden imports (os/subprocess/socket/urllib/…), dynamic exec/eval,
-    # dunder access — and REJECT before importing. This makes every code-ingress
-    # path symmetric with the manual authoring path (api_core.scan_custom_strategy),
-    # which already scans; the agent path previously imported on a ruff-pass alone.
-    try:
-        from forven.sandbox.ast_guard import scan_source
-
-        _scan_report = scan_source(Path(source_ref).read_text(encoding="utf-8"))
-    except Exception as exc:  # never import unscanned code if the guard itself fails
-        raise ValueError(f"Security scan failed for {file_name}: {exc}") from exc
-    if not _scan_report.ok:
-        _scan_findings = "; ".join(
-            f"line {f.lineno}: {f.message}" for f in _scan_report.findings[:10]
-        )
-        raise ValueError(
-            f"{file_name} rejected by the security scan: {_scan_findings}"
-        )
-
-    importlib.invalidate_caches()
-    fqn = f"forven.strategies.custom.{modname}"
-    try:
-        if fqn in _imported_modules():
-            import sys
-
-            module = importlib.reload(sys.modules[fqn])
-        else:
-            module = importlib.import_module(fqn)
-    except Exception as exc:
-        raise ValueError(f"Import failed for {file_name}: {exc}") from exc
-
-    strategy_cls = getattr(module, "STRATEGY_CLASS", None)
-    # A STRATEGY_CLASS declared as the class *name* (a string) is a common codegen
-    # slip; resolve it to the actual attribute before falling back.
-    if isinstance(strategy_cls, str):
-        strategy_cls = getattr(module, strategy_cls, None)
-    if not isinstance(strategy_cls, type):
-        # Tolerate a module that omits (or mis-declares) the module-level
-        # STRATEGY_CLASS but defines exactly one BaseStrategy subclass — matches
-        # the tolerant discovery path so anything the app auto-registers can also
-        # be re-registered/imported.
-        _subclasses = [
-            obj
-            for obj in vars(module).values()
-            if isinstance(obj, type)
-            and issubclass(obj, registry.BaseStrategy)
-            and obj is not registry.BaseStrategy
-            and getattr(obj, "__module__", None) == module.__name__
-        ]
-        if len(_subclasses) == 1:
-            strategy_cls = _subclasses[0]
-    type_name = getattr(module, "TYPE_NAME", None)
-    if not type_name and strategy_cls is not None:
-        # Fall back to a class-level TYPE_NAME when not declared at module level.
-        type_name = getattr(strategy_cls, "TYPE_NAME", None)
-
-    if not strategy_cls:
-        raise ValueError(f"{file_name} is missing STRATEGY_CLASS")
-    if not type_name:
-        raise ValueError(f"{file_name} is missing TYPE_NAME")
-    if type_name in known_types:
-        raise ValueError(f"TYPE_NAME '{type_name}' is already registered")
-
-    validation_errors = registry._registry_type_validation_errors(strategy_cls)
-    if validation_errors:
-        raise ValueError(f"Class validation failed: {'; '.join(validation_errors)}")
-
-    try:
-        probe = strategy_cls("__probe__", {})
-        default_params = probe.default_params
-        asset = probe.asset if hasattr(probe, "asset") else "BTC"
-    except Exception as exc:
-        raise ValueError(f"Could not instantiate {file_name}: {exc}") from exc
-
-    cert = certify_execution_strategy(type_name, default_params)
-    certified = cert.certified
-    cert_error = cert.primary_blocking_reason()
-
-    # GATE B: registration-time lookahead / data-leak probe. A strategy whose
-    # vectorized generate_signals reads future bars (e.g. a `.shift(-1)`) is
-    # routed to research_only — inert, since the gauntlet backfill only picks up
-    # quick_screen/gauntlet — instead of entering the normal funnel toward paper.
-    from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
-
-    lookahead_reason = detect_lookahead(probe)
-    lookahead_blocked = bool(lookahead_reason)
-    if lookahead_blocked:
-        # Treat as not-certified for stage/params purposes: research_only + raw
-        # params (canonical_params is only meaningful for a certified strategy).
-        certified = False
-        if not cert_error:
-            cert_error = lookahead_reason
-        log.warning(
-            "Targeted intake: lookahead detected in %s (type=%s) — registering as research_only: %s",
-            modname, type_name, lookahead_reason,
-        )
-
-    # GATE C: execution smoke probe. A strategy that raises on a clean synthetic
-    # run (canonically: a per-bar generate_signal reading self.position, which the
-    # engine never injects) would crash every backtest with a cryptic error three
-    # gates later. Catch it here and route to research_only with the real reason.
-    crash_reason = detect_execution_crash(probe)
-    if crash_reason:
-        certified = False
-        if not cert_error:
-            cert_error = crash_reason
-        log.warning(
-            "Targeted intake: execution smoke test failed for %s (type=%s) — registering as research_only: %s",
-            modname, type_name, crash_reason,
-        )
-
-    # GATE D: data-availability probe. A strategy that reads enrichment feed
-    # columns (funding/liquidations/ls_ratio/...) that don't exist for its
-    # target symbol and cannot be auto-downloaded can never produce a trading
-    # backtest — every downstream backtest correctly aborts, but the candidate
-    # then burns planner/repair cycles as a phantom (S05577, S05838). Park it
-    # at birth as research_only with the real reason; fetchable feeds are
-    # auto-downloaded by the probe itself, so this only fires on genuinely
-    # unavailable data. Internal errors park the candidate in research_only.
-    data_block_reason: str | None = None
-    try:
-        from forven.strategies.data_availability import evaluate_data_availability
-
-        _avail = evaluate_data_availability(
-            type_name,
-            str(asset).upper(),
-            _intended_timeframe(default_params),
-            strategy_cls=strategy_cls,
-        )
-        if _avail is not None and _avail.blocked:
-            data_block_reason = _avail.error or "required data feed unavailable"
-    except Exception as exc:
-        log.warning(
-            "Targeted intake: data-availability probe errored for %s (parking): %s",
-            modname, exc,
-        )
-        data_block_reason = f"data-availability check unavailable: {exc}"
-    if data_block_reason:
-        log.warning(
-            "Targeted intake: required data feed unavailable for %s (type=%s) — registering as research_only: %s",
-            modname, type_name, data_block_reason,
-        )
-
-    initial_stage = (
-        "research_only"
-        if (lookahead_blocked or crash_reason or data_block_reason)
-        else "quick_screen"
-    )
-
-    existing_strategy = _find_existing_strategy_container(
-        type_name=type_name,
-        source_ref=source_ref,
-        ignore_terminal=True,
-    )
-    if existing_strategy:
-        existing_id = str(existing_strategy.get("id") or "").strip() or "<unknown>"
-        existing_stage = str(existing_strategy.get("stage") or "").strip() or "unknown"
-        raise ValueError(
-            f"Strategy '{type_name}' is already registered as {existing_id} "
-            f"(stage={existing_stage}, still active). A rejected/archived sibling "
-            "would not block this — archive the active holder first if you mean "
-            "to replace it."
-        )
-
-    try:
-        registry._load_custom_strategy_module(modname)
-    except Exception as exc:
-        raise ValueError(f"Registration failed for {file_name}: {exc}") from exc
-
-    stored_params = cert.canonical_params if (certified and not lookahead_blocked) else default_params
-    with get_db() as conn:
-        strategy_id, _display, _base = create_strategy_container(
-            conn=conn,
-            name=f"{asset}-{type_name}-intake",
-            type_=type_name,
-            symbol=str(asset).upper(),
-            timeframe=_intended_timeframe(stored_params),
-            params=stored_params,
-            stage=initial_stage,
-            source=source,
-            source_ref=source_ref,
-            hypothesis_id=hypothesis_id,
-            origin_task_id=origin_task_id,
-        )
-        if clean_session_id:
-            record_strategy_in_session(
-                conn, session_id=clean_session_id, strategy_id=strategy_id
-            )
-        if data_block_reason:
-            conn.execute(
-                "UPDATE strategies SET status_reason = ? WHERE id = ?",
-                (f"data_blocked: {data_block_reason[:400]}", strategy_id),
-            )
-
-    registration = IntakeRegistration(
-        module_name=modname,
-        type_name=type_name,
-        strategy_id=strategy_id,
-        asset=str(asset).upper(),
-        certified=certified,
-        certification_error=cert_error,
-        file_name=file_name,
-        source=source,
-        source_ref=source_ref,
-        stage=initial_stage,
-        session_id=clean_session_id,
-        lookahead_blocked=lookahead_blocked,
-        lookahead_reason=lookahead_reason,
-        data_blocked=bool(data_block_reason),
-        data_block_reason=data_block_reason,
-    )
-
-    log_activity(
-        "info",
-        "strategy_intake",
-        f"Targeted intake: registered {modname} as {strategy_id} from {source}",
-        {
-            "mode": "register_file",
-            "strategy_id": strategy_id,
-            "module_name": modname,
-            "type_name": type_name,
-            "source": source,
-            "source_ref": source_ref,
-            "stage": initial_stage,
-            "session_id": clean_session_id,
-            "lookahead_blocked": lookahead_blocked,
-            "lookahead_reason": lookahead_reason,
-            "data_blocked": bool(data_block_reason),
-            "data_block_reason": data_block_reason,
-        },
-    )
-
-    log.info(
-        "Targeted intake: registered %s (type=%s, id=%s, source=%s)",
-        modname,
-        type_name,
-        strategy_id,
-        source,
-    )
-    return registration.to_dict()
 
 
 def register_imported_strategy_file(
@@ -1075,6 +684,12 @@ def register_imported_strategy_file(
         certified = False
         if not cert_error:
             cert_error = execution_crash_reason
+    # Probe VERIFIABILITY, deliberately NOT a gate: `inconclusive` means the
+    # truncation probe compared nothing (the strategy stayed quiet on the synthetic
+    # walk), which is absence of proof, not proof of a leak. Blocking on it would
+    # reject honest strategies; passing it silently is what let a leak-free stamp be
+    # issued on zero evidence. So it is recorded and surfaced instead.
+    verifiability = lookahead_verifiability(meta)
     initial_stage = "research_only" if (lookahead_blocked or execution_crash_reason or not certified) else "quick_screen"
     stored_params = (
         meta.get("canonical_params") if (certified and not lookahead_blocked) else meta.get("default_params")
@@ -1092,6 +707,18 @@ def register_imported_strategy_file(
     param_space = meta.get("parameter_space")
     if isinstance(param_space, dict) and param_space:
         stored_params.setdefault("_parameter_space", param_space)
+    # Stamp the probe's verifiability onto the strategy row's params so downstream
+    # readers (scanner parity checks, the gate report, the Forge detail page) can see
+    # that the leak-free tick was never actually earned — there is no dedicated column
+    # and db.py is not this module's to migrate.
+    if not verifiability["lookahead_verifiable"]:
+        stored_params["_lookahead_verifiable"] = False
+        if verifiability["lookahead_inconclusive_reason"]:
+            stored_params["_lookahead_inconclusive_reason"] = verifiability[
+                "lookahead_inconclusive_reason"
+            ]
+    if verifiability["bounded_lookback"] is not None:
+        stored_params["_bounded_lookback"] = verifiability["bounded_lookback"]
 
     with get_db() as conn:
         strategy_id, _display, _base = create_strategy_container(
@@ -1121,10 +748,20 @@ def register_imported_strategy_file(
                 session_id=_session_id,
                 strategy_id=strategy_id,
             )
-        if cert_error:
+        status_note = (
+            f"sandbox_validation: {str(cert_error)[:400]}"
+            if cert_error
+            else (
+                "lookahead not verifiable: "
+                f"{str(verifiability['lookahead_inconclusive_reason'])[:360]}"
+                if not verifiability["lookahead_verifiable"]
+                else None
+            )
+        )
+        if status_note:
             conn.execute(
                 "UPDATE strategies SET status_reason = ? WHERE id = ?",
-                (f"sandbox_validation: {str(cert_error)[:400]}", strategy_id),
+                (status_note, strategy_id),
             )
 
     # A running persistent worker discovered imported/ at its startup; force a
@@ -1163,6 +800,7 @@ def register_imported_strategy_file(
         "stage": initial_stage,
         "sandbox_only": True,
         "lookahead_blocked": lookahead_blocked,
+        **verifiability,
     }
 
 

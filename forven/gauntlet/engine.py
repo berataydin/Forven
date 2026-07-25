@@ -56,6 +56,14 @@ _GATE_CONTENTION_BACKOFF_MINUTES = 10.0
 #     engine-rebaseline sweep re-queues the validation suite automatically;
 #     draining here would archive a strategy for having been validated on
 #     since-fixed math — the exact wrongly-archived failure mode this closes.
+#
+# SINGLE REGISTRY (2026-07-25). This set is the ONE place a "block, don't fail"
+# reason code is declared. ``gauntlet/tasks.py`` imports it (RETRYABLE_BLOCK_REASON_CODES)
+# instead of keeping its own literal copy: it used to test a hardcoded four-code set,
+# so a code added here was INERT on the workflow path — the step fell through to
+# ``{"status": "failed_gate"}``, which ``demote_failed_gate_strategies`` then ARCHIVES.
+# That converts a false-green fix into a wrong-archive, the exact failure class this
+# codebase has hardened against repeatedly. Add evidence-absence codes HERE only.
 _NO_DRAIN_REASON_CODES = {
     "gate_contention",
     "awaiting_data_backfill",
@@ -65,7 +73,28 @@ _NO_DRAIN_REASON_CODES = {
     # lands within minutes, so retry on the bounded cadence, never drain.
     "validation_in_flight",
     "stale_engine_artifacts",
+    # Artifacts scored on different DATA semantics (data_provenance) awaiting
+    # re-validation — same class as an engine bump, from the data side.
+    "stale_data_artifacts",
+    # dsr-gate-fails-open (2026-07-25): the deflated-Sharpe gate is enabled but the
+    # DSR is not computable (compacted trades artifact / no backtest row). The gate
+    # now BLOCKS instead of silently passing; the block says nothing about edge
+    # quality and clears as soon as the backtest re-runs, so never drain on it.
+    "dsr_unavailable",
+    # verdict-stub-backfills-robustness-artifacts (2026-07-25): a required test whose
+    # artifact was deleted/compacted no longer has a cached stub standing in for it, so
+    # the gate reports MISSING evidence. Missing != failed: the sweep re-queues the run.
+    "missing_evidence",
+    # WFA produced too few judgeable folds for the window — re-runnable, says
+    # nothing about edge quality (S06127).
+    "wfa_window_insufficient",
+    # The source-reconciliation job has not produced a fresh divergence reading yet.
+    "source_reconciliation_pending",
 }
+
+# Public alias — import THIS from other modules (tasks.py). Same object, so the
+# registry can never drift into two copies.
+RETRYABLE_BLOCK_REASON_CODES = _NO_DRAIN_REASON_CODES
 
 # --- Quality-aware visitation -------------------------------------------------
 # When there are MORE active workflows than a tick's visit budget (the common
@@ -229,14 +258,32 @@ def _refresh_workflow_status(conn, workflow_id: str) -> dict[str, Any]:
 
 
 def claim_next_step(workflow_id: str) -> dict[str, Any] | None:
-    from forven.db import get_db
+    """Atomically claim the next runnable step of ``workflow_id`` (or None).
+
+    HARDEN (nonatomic-step-claim, 2026-07-25): this is a read-then-write state
+    transition — SELECT the first queued/pending step, then UPDATE it to running.
+    On a plain deferred transaction two tickers (the scheduler loop and a manual
+    /api advance, or two workers) could both read the SAME queued step and both
+    mark it running: the step then EXECUTES TWICE, i.e. two optimizations / two
+    walk-forwards writing artifacts for one strategy, and ``attempt_count`` burns
+    twice the retry budget toward the drain threshold. Mirrors the fix data-ops applied to
+    ``db.claim_pending_tasks``: BEGIN IMMEDIATE for the critical section plus a
+    compare-and-set UPDATE so a caller that loses the race claims NOTHING (returns
+    None) instead of double-running the step.
+    """
+    from forven.db import get_db, get_db_immediate
 
     clean_workflow_id = str(workflow_id or "").strip()
     if not clean_workflow_id:
         raise ValueError("workflow_id is required")
 
-    with get_db() as conn:
-        init_gauntlet_schema(conn)
+    # Schema init runs on its OWN connection, never inside the claim txn:
+    # ``executescript`` issues an implicit COMMIT, which would silently close the
+    # BEGIN IMMEDIATE below and hand the claim back its old read-then-write race.
+    with get_db() as schema_conn:
+        init_gauntlet_schema(schema_conn)
+
+    with get_db_immediate() as conn:
         workflow = conn.execute("SELECT * FROM gauntlet_workflows WHERE id = ?", (clean_workflow_id,)).fetchone()
         if not workflow:
             raise ValueError(f"workflow {clean_workflow_id!r} not found")
@@ -266,15 +313,26 @@ def claim_next_step(workflow_id: str) -> dict[str, Any] | None:
             return None
 
         now = _now()
-        conn.execute(
+        # Compare-and-set: only a step STILL in the status we read is ours. Under
+        # BEGIN IMMEDIATE this always wins; the guard is what keeps a future caller
+        # that forgets the immediate txn (or a step advanced by another path between
+        # the read and the write) from double-claiming — rowcount 0 means someone
+        # else took it, so claim nothing and let the next tick re-read.
+        claimed = conn.execute(
             """
             UPDATE gauntlet_steps
             SET status = 'running', attempt_count = attempt_count + 1,
                 started_at = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = ?
             """,
-            (now, now, candidate["id"]),
+            (now, now, candidate["id"], str(candidate["status"])),
         )
+        if claimed.rowcount == 0:
+            log.info(
+                "gauntlet step %s for workflow %s was claimed by another runner — skipping",
+                candidate["id"], clean_workflow_id,
+            )
+            return None
         conn.execute(
             "UPDATE gauntlet_workflows SET status = 'running', current_step_key = ?, updated_at = ? WHERE id = ?",
             (candidate["step_key"], now, clean_workflow_id),

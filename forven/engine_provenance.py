@@ -46,7 +46,7 @@ import json
 # data-substrate rebuild that invalidates comparisons against prior verdicts
 # (verdicts are only evidence relative to the data they were scored on) — and
 # add a matching ENGINE_VERSION_LOG entry (test-enforced).
-BACKTEST_ENGINE_VERSION = 5
+BACKTEST_ENGINE_VERSION = 6
 
 # Append-only changelog: one entry per version, newest last. The unit test
 # asserts the newest entry matches BACKTEST_ENGINE_VERSION so a bump can never
@@ -106,6 +106,23 @@ ENGINE_VERSION_LOG: tuple[dict, ...] = (
             "baseline (signal-walk aligned to the 30-bar baseline robustness + live use, "
             "was 44-bar); and true fixed-DOLLAR notional (fixed-mode sizes off equity at "
             "entry, so deployed notional stays ~fixed_size instead of scaling with equity)."
+        ),
+    },
+    {
+        "version": 6,
+        "date": "2026-07-25",
+        "summary": (
+            "Funding-cost + lake-substrate re-baseline (HARDEN-DATA-OPS). (1) Perp "
+            "funding is now charged over each print's OWN settlement interval instead "
+            "of a hardcoded /8: 4h-settlement pairs were mis-charged 2x, and the "
+            "whole-file divisor inflated funding ~8x on 1h bars — every carry-sensitive "
+            "backtest's net PnL, Sharpe and Kelly evidence changes. (2) OHLCV "
+            "forward-fill now runs per fetched BLOCK and the fabricated (no-trade) bars "
+            "are marked, so trade-reconstructed candles no longer smear a flat synthetic "
+            "price across gaps between windows — bar counts, volatility and drawdown on "
+            "gappy symbols differ from the pre-fix lake. Verdicts scored on the old "
+            "funding model or the unmarked forward fill are stale evidence and are "
+            "re-queued rather than compared against current numbers."
         ),
     },
 )

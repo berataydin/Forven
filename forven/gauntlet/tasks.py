@@ -6,7 +6,58 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from forven.gauntlet.engine import RETRYABLE_BLOCK_REASON_CODES
+
 log = logging.getLogger("forven.gauntlet.tasks")
+
+# Prose -> taxonomy code for blocked promotions that reach here as TEXT ONLY.
+# brain.transition_stage stamps the transition's reason_code from its own motion
+# vocabulary ("gate_failure"), so a policy GateRejection's STRUCTURAL code does not
+# survive the hop — this path has to read the message. Everything the canonical
+# matcher (policy._extract_reason_code) already classifies is handled by
+# _retryable_block_code below; only phrases it does not cover are listed here.
+_RETRYABLE_BLOCK_TEXTS: tuple[tuple[str, str], ...] = (
+    ("re-run after optimization", "stale_validation"),
+    ("stale validation", "stale_validation"),
+    # Insufficient WFA fold evidence is a RETRYABLE absence, never a merit fail
+    # (commit 531e0943's intent): the trade-rate-aware window sizing re-runs
+    # judgeably on the next pass. Draining it to failed_gate archived genuinely-
+    # unjudged strategies via the workflow path.
+    ("window insufficient", "wfa_window_insufficient"),
+    # dsr-gate-fails-open (2026-07-25): the enabled DSR gate now BLOCKS when the
+    # deflated Sharpe is not computable. Re-running the backtest resolves it, so it
+    # must never drain to failed_gate (which auto-ARCHIVES the strategy).
+    ("deflated-sharpe could not be computed", "dsr_unavailable"),
+)
+
+
+def _retryable_block_code(reason_code: object, blocked_text: str) -> str | None:
+    """Taxonomy code for a RETRYABLE (evidence-absence) block, else None.
+
+    ONE registry: ``engine.RETRYABLE_BLOCK_REASON_CODES`` decides what is
+    retryable, and ``policy._resolve_reason_code`` is the canonical prose->code
+    classifier. This used to be a fourth hardcoded literal set, so every code added
+    to the registry was INERT here — the step fell through to
+    ``{"status": "failed_gate"}`` and ``demote_failed_gate_strategies`` archived a
+    strategy for evidence that merely had not been re-run yet.
+    """
+    code = str(reason_code or "").strip().lower()
+    if code in RETRYABLE_BLOCK_REASON_CODES:
+        return code
+    text = str(blocked_text or "").lower()
+    if text:
+        try:
+            from forven.policy import _resolve_reason_code
+
+            derived = str(_resolve_reason_code(text) or "").strip().lower()
+        except Exception:  # noqa: BLE001 — classification must never break the step
+            derived = ""
+        if derived in RETRYABLE_BLOCK_REASON_CODES:
+            return derived
+        for needle, mapped in _RETRYABLE_BLOCK_TEXTS:
+            if needle in text:
+                return mapped
+    return None
 
 
 def _is_restart_interrupted(message: object) -> bool:
@@ -2093,19 +2144,8 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
     _blocked_text = str(
         transition.get("blocked_reason") or transition.get("reason") or transition.get("message") or ""
     ).lower()
-    if (
-        reason_code in {"stale_validation", "artifacts_pending", "stale_engine_artifacts", "validation_in_flight"}
-        or "ordering violation" in _blocked_text
-        or "re-run after optimization" in _blocked_text
-        or "stale validation" in _blocked_text
-        or "engine version" in _blocked_text
-        or "validation in flight" in _blocked_text
-        # Insufficient WFA fold evidence is a RETRYABLE absence, never a merit
-        # fail (commit 531e0943's intent): the trade-rate-aware window sizing
-        # re-runs judgeably on the next pass. Draining it to failed_gate
-        # archived genuinely-unjudged strategies via the workflow path.
-        or "window insufficient" in _blocked_text
-    ):
+    _retryable_code = _retryable_block_code(reason_code, _blocked_text)
+    if _retryable_code:
         if "window insufficient" in _blocked_text:
             # This block's whole premise is "the re-run produces judgeable folds"
             # — but nothing ever re-armed the (already-passed) walk_forward step,
@@ -2126,17 +2166,11 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         # reason_code is in engine._NO_DRAIN_REASON_CODES so requeue retries it on the
         # bounded cadence; the 2-day un-promotable hygiene backstop catches any genuine
         # deadlock where the validation truly never re-runs.
-        # Persist the TAXONOMY code (counter-exempt in engine._NO_DRAIN_REASON_CODES),
+        # Persist the TAXONOMY code (counter-exempt in engine.RETRYABLE_BLOCK_REASON_CODES),
         # not the transition's generic 'gate_failure' motion: the requeue sweep reads
         # this top-level code to decide attempt-budget exemption, and 'gate_failure'
         # would burn the budget on a self-resolving block and drain to failed_gate.
-        if reason_code not in {"stale_validation", "artifacts_pending", "stale_engine_artifacts", "validation_in_flight"}:
-            if "validation in flight" in _blocked_text:
-                reason_code = "validation_in_flight"
-            elif "engine version" in _blocked_text:
-                reason_code = "stale_engine_artifacts"
-            else:
-                reason_code = "stale_validation"
+        reason_code = _retryable_code
         return {
             "status": "blocked_runtime",
             "message": str(

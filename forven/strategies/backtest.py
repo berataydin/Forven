@@ -6730,90 +6730,18 @@ def _run_directional_signal_series(
     if ec is None:
         # Parity overhaul (decision: unify + re-score): a strategy with NO execution
         # profile is sized at the default 1% risk (fraction mode) via the SAME shared
-        # kernel the live/paper scanner uses — NOT the legacy full-notional path below.
+        # kernel the live/paper scanner uses — NOT the legacy full-notional path.
         # This is what makes paper reproduce the backtest for profile-less strategies
-        # (the common case for the autonomous pipeline). The legacy loop beneath is now
-        # dead code, retained temporarily and removed in cleanup.
+        # (the common case for the autonomous pipeline). ARCH-04 (2026-07-25): the
+        # legacy full-notional loop that used to sit unreachable below this return
+        # is DELETED — it greps identically to live code, so a correctness fix could
+        # land in the dead copy and silently never run.
         ec = _sizing.default_controls()
     return _run_controls_via_kernel(
         df, signals, warmup, leverage, regimes=regimes,
         round_trip_drag=round_trip_drag, trade_mode=trade_mode,
         allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
     )
-
-    # Signals are derived from a bar's own close, which is only known once that
-    # bar has finished. Acting on signal[idx] therefore requires filling at the
-    # NEXT bar's open, not the same bar's close (which would be lookahead bias).
-    for idx in range(max(int(warmup), 0) + 1, len(df)):
-        signal_idx = idx - 1
-        current_time = str(df.index[idx])
-        fill_price = float(df["open"].iloc[idx])
-        if fill_price <= 0:
-            continue
-
-        for direction in allowed_modes:
-            exit_series = signals.long_exits if direction == "long" else signals.short_exits
-            active_trade = active_trades.get(direction)
-            if active_trade is None or not bool(exit_series.iloc[signal_idx]):
-                continue
-            entry_price = float(active_trade["entry_price"])
-            gross_return = ((fill_price - entry_price) / entry_price) * _trade_direction_sign(direction) * leverage
-            pnl_pct = gross_return - round_trip_drag
-            trade = {
-                "entry_bar": int(active_trade["entry_bar"]),
-                "entry_price": entry_price,
-                "exit_price": fill_price,
-                "entry_time": str(active_trade["entry_time"]),
-                "exit_time": current_time,
-                "bars_held": max(0, idx - int(active_trade["entry_bar"])),
-                "pnl_pct": round(float(pnl_pct), 5),
-                "direction": direction,
-                "trade_mode": trade_mode,
-                "position_model": "hedged" if trade_mode == "both" else "single_side",
-            }
-            if active_trade.get("regime") is not None:
-                trade["regime"] = active_trade.get("regime")
-            trades.append(trade)
-            active_trades[direction] = None
-
-        for direction in allowed_modes:
-            entry_series = signals.long_entries if direction == "long" else signals.short_entries
-            if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
-                continue
-            active_trades[direction] = {
-                "entry_bar": idx,
-                "entry_price": fill_price,
-                "entry_time": current_time,
-                "regime": regimes.iloc[signal_idx] if regimes is not None and len(regimes) > signal_idx else RANGE_BOUND,
-            }
-
-    final_idx = len(df) - 1
-    final_close = float(df["close"].iloc[final_idx]) if len(df) else 0.0
-    final_time = str(df.index[final_idx]) if len(df) else ""
-    for direction, active_trade in active_trades.items():
-        if active_trade is None or final_close <= 0:
-            continue
-        entry_price = float(active_trade["entry_price"])
-        gross_return = ((final_close - entry_price) / entry_price) * _trade_direction_sign(direction) * leverage
-        pnl_pct = gross_return - round_trip_drag
-        trade = {
-            "entry_bar": int(active_trade["entry_bar"]),
-            "entry_price": entry_price,
-            "exit_price": final_close,
-            "entry_time": str(active_trade["entry_time"]),
-            "exit_time": final_time,
-            "bars_held": max(0, final_idx - int(active_trade["entry_bar"])),
-            "pnl_pct": round(float(pnl_pct), 5),
-            "direction": direction,
-            "trade_mode": trade_mode,
-            "position_model": "hedged" if trade_mode == "both" else "single_side",
-            "open_at_end": True,
-        }
-        if active_trade.get("regime") is not None:
-            trade["regime"] = active_trade.get("regime")
-        trades.append(trade)
-
-    return trades
 
 
 def _run_directional_signal_series_with_controls(
@@ -6839,7 +6767,9 @@ def _run_directional_signal_series_with_controls(
     """
     # Kept as a compatibility entry point for tests and older callers.  Execution
     # semantics live exclusively in execution_kernel; maintaining a second loop here
-    # previously let correctness fixes drift between paper and backtest.
+    # previously let correctness fixes drift between paper and backtest. ARCH-04
+    # (2026-07-25): that second (byte-divergent) copy of the loop sat unreachable
+    # after this return for months — deleted, since it greps identically to live code.
     return _run_controls_via_kernel(
         df,
         signals,
@@ -6852,174 +6782,6 @@ def _run_directional_signal_series_with_controls(
         ec=ec,
         initial_capital=initial_capital,
     )
-
-    opens = df["open"].astype(float).values
-    highs = df["high"].astype(float).values
-    lows = df["low"].astype(float).values
-    closes = df["close"].astype(float).values
-    atr_vals = _compute_atr_series(df, ec.get("atr_period", 14)).values if ec.get("needs_atr") else None
-
-    active_trades: dict[str, dict | None] = {direction: None for direction in allowed_modes}
-    trades: list[dict] = []
-    closed_gross: list[float] = []  # gross (pre-size) returns of closed trades, for kelly
-
-    lev = max(float(leverage), 1e-9)
-
-    def _entry_stop_dist_pct(entry_idx: int, entry_price: float) -> float | None:
-        atr_value = (
-            float(atr_vals[entry_idx])
-            if (ec["sizing_mode"] == "atr" and atr_vals is not None)
-            else None
-        )
-        return _sizing.entry_stop_dist_pct(ec, entry_price=entry_price, atr_value=atr_value)
-
-    def _size_fraction(stop_dist_pct: float | None) -> float:
-        return _sizing.size_fraction(
-            ec, stop_dist_pct, leverage=lev,
-            initial_capital=initial_capital, closed_gross=closed_gross,
-        )
-
-    def _finalize(at: dict, direction: str, exit_price: float, exit_idx: int,
-                  exit_time: str, exit_reason: str, *, open_at_end: bool = False) -> None:
-        entry_price = float(at["entry_price"])
-        if entry_price <= 0:
-            return
-        sign = _trade_direction_sign(direction)
-        gross = ((exit_price - entry_price) / entry_price) * sign * leverage - round_trip_drag
-        closed_gross.append(gross)  # pre-size, for kelly evidence
-        size_fraction = float(at.get("size_fraction", 1.0))
-        pnl_pct = gross * size_fraction
-        trade = {
-            "entry_bar": int(at["entry_bar"]),
-            "entry_price": entry_price,
-            "exit_price": float(exit_price),
-            "entry_time": str(at["entry_time"]),
-            "exit_time": str(exit_time),
-            "bars_held": max(0, exit_idx - int(at["entry_bar"])),
-            "pnl_pct": round(float(pnl_pct), 5),
-            "direction": direction,
-            "trade_mode": trade_mode,
-            "position_model": "hedged" if trade_mode == "both" else "single_side",
-            "size_fraction": round(size_fraction, 4),
-            # Full-precision fraction (the display field above is rounded to 4dp); the
-            # post-hoc funding pass reads this so its leg is scaled identically to price PnL.
-            "size_fraction_raw": size_fraction,
-            "exit_reason": exit_reason,
-        }
-        if open_at_end:
-            trade["open_at_end"] = True
-        if at.get("regime") is not None:
-            trade["regime"] = at.get("regime")
-        trades.append(trade)
-
-    for idx in range(max(int(warmup), 0) + 1, len(df)):
-        signal_idx = idx - 1
-        current_time = str(df.index[idx])
-        fill_price = float(opens[idx])
-        if fill_price <= 0:
-            continue
-        bar_high = float(highs[idx])
-        bar_low = float(lows[idx])
-
-        # (1) Intrabar stop / target / time-stop checks on already-open positions.
-        for direction in allowed_modes:
-            at = active_trades.get(direction)
-            if at is None:
-                continue
-            sign = _trade_direction_sign(direction)
-
-            exit_price: float | None = None
-            exit_reason = ""
-
-            if ec["time_stop_bars"] and (idx - int(at["entry_bar"])) >= ec["time_stop_bars"]:
-                exit_price, exit_reason = fill_price, "time_stop"
-
-            # Signal-driven exit (decided at the prior bar's close → a market-on-open
-            # order that fills at THIS bar's open). Because the open is the first tick of
-            # the bar, it must pre-empt any intrabar stop/take-profit that would only
-            # trigger later within the same bar — evaluated here, before the stop/TP.
-            if exit_price is None:
-                exit_series = signals.long_exits if direction == "long" else signals.short_exits
-                if bool(exit_series.iloc[signal_idx]):
-                    exit_price, exit_reason = fill_price, "signal"
-
-            # Combine fixed stop and trailing stop into the tighter effective level.
-            # The trailing level uses the peak through the PRIOR bar (at["extreme"]);
-            # this bar's new high/low is folded in only AFTER the breach check (below),
-            # so the trailing stop never ratchets on the same bar it triggers — that
-            # would be intrabar lookahead.
-            eff_stop = at.get("stop_price")
-            if at.get("trail_pct"):
-                trail_level = at["extreme"] * (1.0 - sign * at["trail_pct"])
-                if eff_stop is None:
-                    eff_stop = trail_level
-                else:
-                    eff_stop = max(eff_stop, trail_level) if direction == "long" else min(eff_stop, trail_level)
-            if exit_price is None and eff_stop is not None:
-                if direction == "long" and bar_low <= eff_stop:
-                    exit_price = min(fill_price, eff_stop)  # gap-through fills at open
-                    exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop > at["stop_price"])) else "stop_loss"
-                elif direction == "short" and bar_high >= eff_stop:
-                    exit_price = max(fill_price, eff_stop)
-                    exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop < at["stop_price"])) else "stop_loss"
-
-            tp = at.get("target_price")
-            if exit_price is None and tp is not None:
-                # Take-profit is a resting limit; model it conservatively as
-                # filling AT the target even on a gap-through (never crediting
-                # the more-favourable gapped open), symmetric with the
-                # pessimistic stop fills above. Filling at the gapped open would
-                # systematically inflate TP-based backtests.
-                if direction == "long" and bar_high >= tp:
-                    exit_price, exit_reason = (tp, "take_profit")
-                elif direction == "short" and bar_low <= tp:
-                    exit_price, exit_reason = (tp, "take_profit")
-
-            if exit_price is not None:
-                _finalize(at, direction, exit_price, idx, current_time, exit_reason)
-                active_trades[direction] = None
-            elif at.get("trail_pct"):
-                # Still open — ratchet the trailing peak with THIS bar for the next bar.
-                at["extreme"] = max(at["extreme"], bar_high) if direction == "long" else min(at["extreme"], bar_low)
-
-        # (2) Signal-driven entries (fill at this bar's open).
-        for direction in allowed_modes:
-            entry_series = signals.long_entries if direction == "long" else signals.short_entries
-            if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
-                continue
-            sign = _trade_direction_sign(direction)
-            # Size/stop off the ATR through the LAST CLOSED bar (signal_idx = idx-1).
-            # Using atr_vals[idx] would read the entry bar's own (not-yet-realized)
-            # high/low/close at the open where the fill happens — a forward-looking read.
-            stop_dist_pct = _entry_stop_dist_pct(signal_idx, fill_price)
-            stop_price = None
-            if stop_dist_pct is not None and (ec["stop_loss_pct"] is not None or ec["sizing_mode"] == "atr"):
-                stop_price = fill_price * (1.0 - sign * stop_dist_pct)
-            target_price = None
-            if ec["take_profit_pct"] is not None:
-                target_price = fill_price * (1.0 + sign * ec["take_profit_pct"] / 100.0)
-            active_trades[direction] = {
-                "entry_bar": idx,
-                "entry_price": fill_price,
-                "entry_time": current_time,
-                "regime": regimes.iloc[signal_idx] if regimes is not None and len(regimes) > signal_idx else RANGE_BOUND,
-                "size_fraction": _size_fraction(stop_dist_pct),
-                "stop_price": stop_price,
-                "target_price": target_price,
-                "trail_pct": (ec["trailing_stop_pct"] / 100.0) if ec["trailing_stop_pct"] is not None else None,
-                "extreme": fill_price,
-            }
-
-    # Force-close anything still open at the final close.
-    final_idx = len(df) - 1
-    final_close = float(closes[final_idx]) if len(df) else 0.0
-    final_time = str(df.index[final_idx]) if len(df) else ""
-    for direction, at in active_trades.items():
-        if at is None or final_close <= 0:
-            continue
-        _finalize(at, direction, final_close, final_idx, final_time, "signal", open_at_end=True)
-
-    return trades
 
 
 def _run_controls_via_kernel(
@@ -9676,6 +9438,21 @@ def _build_equity_curve_from_trades(
         entries.setdefault(record["entry_i"], []).append(record)
         exits.setdefault(record["exit_i"], []).append(record)
 
+    # mtm-curve-ignores-leverage-on-slowpath-trades (2026-07-25): _mark_pnl below
+    # defaults an unstamped trade to 1x, which SILENTLY understates max_drawdown_pct
+    # and mis-scales the bar-level Sharpe — both direct promotion-gate inputs. Every
+    # real producer (execution kernel, vectorized path, _run_signal_walk's slow path)
+    # now stamps `leverage`; warn loudly once per curve if a producer drifts back,
+    # rather than failing (synthetic/legacy callers legitimately pass bare trades).
+    _unstamped = sum(1 for record in records if "leverage" not in record["trade"])
+    if _unstamped:
+        log.warning(
+            "Equity curve: %d/%d trades carry no 'leverage' — open positions marked at "
+            "1x, so drawdown/Sharpe are understated for a leveraged strategy",
+            _unstamped,
+            len(records),
+        )
+
     realized_equity = capital
     active: dict[int, dict] = {}
     curve: list[dict] = []
@@ -11909,6 +11686,13 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             "direction": active_direction,
             "trade_mode": trade_mode,
             "position_model": "single_side",
+            # mtm-curve-ignores-leverage-on-slowpath-trades (2026-07-25): pnl_pct
+            # above is ALREADY leveraged, but _build_equity_curve_from_trades marks
+            # OPEN positions via trade["leverage"] and defaulted to 1.0 here — so a
+            # 3x slow-path strategy's intrabar drawdown was marked at 1x, understating
+            # max_drawdown_pct and mis-scaling the bar-level Sharpe. Both are direct
+            # gate inputs. The kernel/vectorized paths already stamp this.
+            "leverage": float(leverage),
 
 
             "regime": active_trade.get("regime", RANGE_BOUND),
@@ -11971,6 +11755,9 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
                 "direction": active_direction,
                 "trade_mode": trade_mode,
                 "position_model": "single_side",
+                # Same stamp as the in-loop exit above — the force-close leg must not
+                # mark at 1x either (mtm-curve-ignores-leverage-on-slowpath-trades).
+                "leverage": float(leverage),
 
 
                 "regime": active_trade.get("regime", RANGE_BOUND),

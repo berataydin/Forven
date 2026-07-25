@@ -24,6 +24,7 @@ the deterministic probe frame.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -34,7 +35,59 @@ log = logging.getLogger(__name__)
 # truncated-frame signals. All are well away from the warm-up region at the
 # start of the frame so rolling-window NaNs don't cause spurious diffs.
 _PROBE_OFFSETS = (60, 40, 20, 5)
-_SYNTHETIC_ROWS = 300
+# lookahead-probe-vacuous-pass (2026-07-25): 300 rows put the deepest probe bar at
+# t=240, INSIDE the warm-up of any strategy declaring >=240 bars (the pipeline's
+# own default is 210 and _infer_chart_warmup_bars can raise it well past that), so
+# such strategies emitted an all-False signal on the whole probe window and were
+# stamped leak-free on zero evidence. 900 puts every probe bar >= 600 bars past
+# warm-up, and the trending/volatile segments below give a signal something to
+# actually fire on.
+_SYNTHETIC_ROWS = 900
+
+# Left-truncation offsets k for the PREFIX-invariance arm: signals at a given
+# timestamp recomputed over df.iloc[k:]. Small enough to leave the compared span
+# far from the truncated frame's own warm-up.
+_LEFT_TRUNC_OFFSETS = (120, 300)
+# Bars of the truncated frame skipped before comparing. A rolling window shorter
+# than this is fully settled on both frames, so a bounded-lookback strategy is
+# invariant across the compared span; only a statistic that keeps growing with
+# history (expanding/ewm/frame-anchored) diverges. Deliberately generous: the flag
+# is advisory, but a false positive still costs a human a look.
+_LEFT_TRUNC_WARMUP_BUFFER = 400
+
+# Right-truncation probe bars are chosen from bars where the strategy ACTUALLY
+# FIRED, not from fixed offsets (lookahead-probe-vacuous-pass, round 2). Measured
+# over the built-in registry (2026-07-25): 21 of the 75 types implement a vectorized
+# generate_signals, and NINE of those 21 fired at none of the four fixed offsets —
+# a normal strategy fires on a few percent of bars, so four arbitrary bars rarely
+# coincide with a signal, and "compared nothing" was being stamped leak-free. Those
+# same strategies fired plenty elsewhere in the SAME frame. Firing bars are picked
+# from the settled second half of the walk and spread out; the fixed offsets remain
+# as extra coverage and as the fallback for a genuinely silent strategy (which then
+# reports `inconclusive`). Same measurement after the change: zero vacuous.
+_PROBE_FIRING_BARS = 4
+# Earliest bar eligible as a firing probe bar: half the frame, i.e. >= 450 with the
+# 900-row default, so the truncated recompute still spans hundreds of settled bars.
+_PROBE_MIN_BAR_FRACTION = 0.5
+
+
+@dataclass(frozen=True)
+class LookaheadVerdict:
+    """Structured outcome of :func:`probe_lookahead`.
+
+    ``reason`` is the only field that BLOCKS registration (it is what the legacy
+    ``detect_lookahead`` returns). ``inconclusive`` marks "not verifiable" — the
+    probe compared nothing because the strategy never fired on the synthetic walk —
+    and is surfaced, never blocking: a strategy that is merely quiet on synthetic
+    data is not a leak. ``bounded_lookback`` reports the LEFT-truncation arm
+    (see :func:`probe_lookahead`); ``None`` means it could not be measured.
+    """
+
+    reason: str | None = None
+    inconclusive: str | None = None
+    comparisons: int = 0
+    bounded_lookback: bool | None = None
+    left_comparisons: int = 0
 
 
 def _build_synthetic_ohlcv(rows: int = _SYNTHETIC_ROWS) -> pd.DataFrame:
@@ -42,14 +95,29 @@ def _build_synthetic_ohlcv(rows: int = _SYNTHETIC_ROWS) -> pd.DataFrame:
 
     Seeded RNG (no global/Date.now randomness) so the probe is reproducible and
     a flaky strategy can't pass by luck on one run and fail on another.
+
+    The close path is a random walk with regime SEGMENTS (drift up / drift down /
+    high-vol chop / quiet range) rather than one flat-drift walk: a trend-follower,
+    a breakout and a mean-reverter all find something to trigger on, which is what
+    keeps them out of the "never fired -> not verifiable" bucket
+    (lookahead-probe-vacuous-pass).
     """
     rng = np.random.default_rng(7)
     n = int(rows)
 
     index = pd.date_range("2023-01-01", periods=n, freq="1h")
 
-    # Geometric random walk for close (positive, realistically noisy).
-    log_returns = rng.normal(loc=0.0, scale=0.01, size=n)
+    # Geometric random walk for close, with cycling regime segments so the frame
+    # carries trend, volatility expansion and quiet range in one pass.
+    segments = ((0.0025, 0.008), (-0.0025, 0.010), (0.0, 0.025), (0.0, 0.003))
+    drift = np.empty(n, dtype=float)
+    scale = np.empty(n, dtype=float)
+    seg_len = max(int(n // (len(segments) * 2)), 1)
+    for i in range(n):
+        mu, sd = segments[(i // seg_len) % len(segments)]
+        drift[i] = mu
+        scale[i] = sd
+    log_returns = rng.normal(loc=0.0, scale=1.0, size=n) * scale + drift
     close = 30_000.0 * np.exp(np.cumsum(log_returns))
 
     # Derive a sane OHLC envelope around the close path.
@@ -136,23 +204,46 @@ def _normalize_to_bool_arrays(payload: object, index: pd.Index) -> dict[str, np.
     return None
 
 
-def detect_lookahead(strategy_obj) -> str | None:
-    """Return a rejection reason if ``strategy_obj`` reads future bars, else None.
+def probe_lookahead(strategy_obj) -> LookaheadVerdict:
+    """Full truncation-invariance probe: rejection reason + verifiability + lookback.
 
-    Runs a truncation-invariance probe: computes vectorized signals on a full
+    RIGHT truncation (the leak test): computes vectorized signals on a full
     synthetic frame, then recomputes on right-truncated frames ``df.iloc[:t+1]``
     for several interior bars ``t`` and checks the signal AT bar ``t`` is
     unchanged. Any flip means the bar-``t`` signal depended on bars after ``t``
-    (a lookahead leak, e.g. ``.shift(-1)``).
+    (a lookahead leak, e.g. ``.shift(-1)``) -> ``reason`` is set.
 
-    Returns ``None`` when the strategy has no vectorized entry point or when the
-    probe infrastructure itself is inconclusive. An exception raised by the
-    strategy's own module rejects registration because otherwise throwing on the
-    known probe frame is a trivial bypass.
+    VERIFIABILITY (lookahead-probe-vacuous-pass, 2026-07-25): the comparison is
+    vacuous when both arrays are False at every probe bar — an all-quiet strategy
+    "passed" a test that compared nothing and was stamped leak-free on zero
+    evidence. ``comparisons`` counts the (side, t) pairs where EITHER side was
+    True; zero means the probe is INCONCLUSIVE, reported via ``inconclusive``.
+    Callers surface that as "lookahead not verifiable" — it is not a rejection
+    (being quiet on synthetic data is not evidence of a leak). The probe bars
+    themselves are chosen from bars where the strategy actually FIRED
+    (:func:`_select_probe_bars`); fixed offsets alone left the large majority of
+    real strategies in the vacuous bucket, which is what made the finding real
+    rather than theoretical.
+
+    LEFT truncation (vectorized-signals-left-truncation-unchecked, 2026-07-25):
+    recomputes over ``df.iloc[k:]`` and compares the signal at the SAME TIMESTAMP.
+    A causal strategy with a BOUNDED lookback (rolling windows) is invariant; one
+    whose statistic expands with history (``expanding()``, ``ewm()``, a
+    whole-frame quantile/zscore) is not — and validation runs on thousands of bars
+    while paper runs on a ~1500-bar frame, so the same timestamp gets a DIFFERENT
+    signal in paper than in the gauntlet. This is NOT a leak, so it never sets
+    ``reason``; it is reported as ``bounded_lookback=False`` for the caller to
+    stamp on the strategy. ``None`` means it could not be measured.
+
+    Calibrate before acting on ``bounded_lookback=False``: an ``ewm()`` EMA is
+    formally infinite-memory, so a common EMA-cross strategy DOES flag here. That
+    is a truthful reading of "paper will not reproduce the gauntlet bar-for-bar",
+    but it is a warning about parity, not a defect — never gate promotion on it
+    without measuring how many real strategies it catches first.
     """
     if strategy_obj is None or not hasattr(strategy_obj, "generate_signals"):
         # Nothing to probe vectorized; the per-bar path is checked elsewhere.
-        return None
+        return LookaheadVerdict()
 
     strategy_file = _strategy_source_file(strategy_obj)
     try:
@@ -161,16 +252,21 @@ def detect_lookahead(strategy_obj) -> str | None:
 
         full_payload = strategy_obj.generate_signals(df)
         if full_payload is None:
-            return None
+            # NOT "unverifiable": ``None`` is BaseStrategy's documented "use the
+            # per-bar generate_signal loop" return, and the per-bar loop is causal by
+            # construction (the engine hands it only bars <= t). 53 of the 75 built-in
+            # types return None here, so flagging them would bury the real signal —
+            # `inconclusive` is reserved for a strategy that HAS a vectorized path and
+            # still gave the probe nothing to compare.
+            return LookaheadVerdict()
         full = _normalize_to_bool_arrays(full_payload, index)
         if full is None:
-            return None
+            return LookaheadVerdict(inconclusive="signal payload shape not interpretable")
 
         n = len(df)
-        for offset in _PROBE_OFFSETS:
-            t = n - offset
-            if t <= 1 or t >= n:
-                continue
+        comparisons = 0
+        for t in _select_probe_bars(full, n):
+            offset = n - t
             truncated = df.iloc[: t + 1]
             trunc_payload = strategy_obj.generate_signals(truncated)
             if trunc_payload is None:
@@ -185,21 +281,148 @@ def detect_lookahead(strategy_obj) -> str | None:
                     continue
                 if t >= len(full_arr) or t >= len(trunc_arr):
                     continue
+                # A False-vs-False comparison proves nothing about causality: count
+                # only the pairs where the strategy actually had an opinion.
+                if bool(full_arr[t]) or bool(trunc_arr[t]):
+                    comparisons += 1
                 if bool(full_arr[t]) != bool(trunc_arr[t]):
-                    return (
-                        f"Lookahead detected: vectorized signal at bar t=-{offset} "
-                        f"changes when future bars are withheld ({side}) -- strategy "
-                        f"reads future data (e.g. a .shift(-1)); rejected"
+                    return LookaheadVerdict(
+                        reason=(
+                            f"Lookahead detected: vectorized signal at bar t=-{offset} "
+                            f"changes when future bars are withheld ({side}) -- strategy "
+                            f"reads future data (e.g. a .shift(-1)); rejected"
+                        ),
+                        comparisons=comparisons,
                     )
-        return None
+
+        bounded, left_comparisons = _probe_left_truncation(strategy_obj, df, full)
+        if comparisons == 0:
+            return LookaheadVerdict(
+                inconclusive=(
+                    "strategy emitted no signal at any probe bar of the synthetic "
+                    f"{n}-bar walk, so right-truncation invariance compared nothing"
+                ),
+                comparisons=0,
+                bounded_lookback=bounded,
+                left_comparisons=left_comparisons,
+            )
+        return LookaheadVerdict(
+            comparisons=comparisons,
+            bounded_lookback=bounded,
+            left_comparisons=left_comparisons,
+        )
     except Exception as exc:
         if _raised_in_strategy_module(exc, strategy_file):
-            return (
-                f"Lookahead probe failed inside strategy code: {type(exc).__name__}: "
-                f"{exc}; rejected because causal execution could not be verified"
+            return LookaheadVerdict(
+                reason=(
+                    f"Lookahead probe failed inside strategy code: {type(exc).__name__}: "
+                    f"{exc}; rejected because causal execution could not be verified"
+                )
             )
         log.warning("Lookahead probe infrastructure error (treated as inconclusive): %s", exc)
-        return None
+        return LookaheadVerdict(inconclusive=f"probe infrastructure error: {exc}")
+
+
+def _select_probe_bars(full: dict[str, np.ndarray], n: int) -> list[int]:
+    """Interior bars ``t`` to right-truncate at, FIRING bars first.
+
+    The right-truncation arm only proves something at a bar where the strategy has
+    an opinion: a False-vs-False comparison is compatible with any amount of
+    lookahead. Fixed offsets almost never land on a firing bar (a normal strategy
+    fires on a few percent of bars), which is how 9 of the 21 built-in strategies
+    that HAVE a vectorized path were stamped leak-free having compared NOTHING
+    (the 53 per-bar-only types never reach here — see probe_lookahead). So: take up to
+    ``_PROBE_FIRING_BARS`` evenly-spread bars where the full-frame signal is True,
+    from the settled second half of the frame, and keep the fixed offsets as extra
+    coverage (and as the only option for a genuinely silent strategy, which then
+    reports ``inconclusive``).
+    """
+    fallback = [n - offset for offset in _PROBE_OFFSETS if 1 < n - offset < n]
+    lo = max(int(n * _PROBE_MIN_BAR_FRACTION), 2)
+    hi = n - 2  # at least one future bar must be withheld
+    if hi <= lo:
+        return fallback
+
+    fired = np.zeros(n, dtype=bool)
+    for arr in full.values():
+        values = np.asarray(arr, dtype=bool)
+        width = min(len(values), n)
+        if width:
+            fired[:width] |= values[:width]
+    candidates = np.flatnonzero(fired[lo : hi + 1]) + lo
+    if candidates.size == 0:
+        return fallback
+
+    picks = candidates[
+        np.unique(np.linspace(0, candidates.size - 1, num=_PROBE_FIRING_BARS).astype(int))
+    ]
+    ordered: list[int] = [int(t) for t in picks]
+    for t in fallback:
+        if t not in ordered:
+            ordered.append(int(t))
+    return ordered
+
+
+def _probe_left_truncation(
+    strategy_obj, df: pd.DataFrame, full: dict[str, np.ndarray]
+) -> tuple[bool | None, int]:
+    """Prefix-length invariance arm. Returns ``(bounded_lookback, comparisons)``.
+
+    ``bounded_lookback`` is ``None`` when nothing could be compared (the strategy
+    was silent, or every truncated recompute was uninterpretable) — absence of a
+    measurement, distinct from a measured ``False``.
+    """
+    n = len(df)
+    comparisons = 0
+    diverged = False
+    for k in _LEFT_TRUNC_OFFSETS:
+        start = k + _LEFT_TRUNC_WARMUP_BUFFER  # absolute bar where comparison begins
+        if k <= 0 or start >= n - 1:
+            continue
+        left = df.iloc[k:]
+        try:
+            left_payload = strategy_obj.generate_signals(left)
+        except Exception as exc:
+            # The strategy runs on the full frame but not on a shorter one. That is
+            # a real paper-vs-gauntlet hazard, but it is the crash probe's business
+            # to name — here it only means "lookback not measurable on this arm".
+            log.debug("Left-truncation probe raised at k=%s (skipped): %s", k, exc)
+            continue
+        if left_payload is None:
+            continue
+        left_signals = _normalize_to_bool_arrays(left_payload, left.index)
+        if left_signals is None:
+            continue
+        for side, full_arr in full.items():
+            left_arr = left_signals.get(side)
+            if left_arr is None:
+                continue
+            # Compare the whole settled overlap, not a handful of bars: a growing
+            # statistic drifts slowly, so a 4-bar sample misses it almost always.
+            stop = min(len(full_arr), len(left_arr) + k)
+            if stop <= start:
+                continue
+            a = np.asarray(full_arr[start:stop], dtype=bool)
+            b = np.asarray(left_arr[start - k : stop - k], dtype=bool)
+            # Only bars where SOMETHING fired are evidence about causality.
+            comparisons += int(np.count_nonzero(a | b))
+            if bool(np.any(a != b)):
+                diverged = True
+    if comparisons == 0:
+        return None, 0
+    return (not diverged), comparisons
+
+
+def detect_lookahead(strategy_obj) -> str | None:
+    """Return a rejection reason if ``strategy_obj`` reads future bars, else None.
+
+    Thin back-compat wrapper over :func:`probe_lookahead` — a truthy return still
+    means REJECT, so every existing caller keeps its contract. Callers that want to
+    know whether the probe actually verified anything (``inconclusive``) or whether
+    the strategy's lookback is bounded (``bounded_lookback``) should call
+    :func:`probe_lookahead` directly.
+    """
+    return probe_lookahead(strategy_obj).reason
 
 
 # Exception types that, when raised from a strategy's OWN module on clean
@@ -331,4 +554,9 @@ def _format_crash_reason(entry_point: str, exc: BaseException) -> str:
     )
 
 
-__all__ = ["detect_lookahead", "detect_execution_crash"]
+__all__ = [
+    "LookaheadVerdict",
+    "detect_lookahead",
+    "detect_execution_crash",
+    "probe_lookahead",
+]
