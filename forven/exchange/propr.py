@@ -1011,6 +1011,8 @@ def close_position(
         else:
             return {"error": f"close size for {asset_n} is non-positive"}
 
+    # Reference mark only — a Propr close is a venue MARKET order with no
+    # client-side price cap, so an unavailable mid never blocks this exit.
     mid = float(get_all_mids().get(asset_n, 0) or 0)
     account_id, _ = resolve_account()
     order = {
@@ -1031,15 +1033,35 @@ def close_position(
     if order_id is None:
         return {"error": "Propr close create returned no order id", "raw_response": created}
 
+    # PROPR-CLOSE-1: a close that did not actually fill must fail CLOSED, exactly
+    # like market_order's entry leg. This returned a success-shaped payload whose
+    # close_price fell back to the MID, so the mirror booked a still-open position
+    # as closed at a price that never traded — and cancelled its protective stops
+    # on the way out, leaving a live position naked. Mirror the entry contract:
+    # surface rejected/cancelled, and surface "no fill" too.
+    status = _order_status(row)
+    if status in ("rejected", "cancelled", "canceled"):
+        return {
+            "error": f"Propr close order {status}",
+            "order_id": order_id,
+            "raw_response": created,
+        }
+
     fill = _order_fill_price(row)
     filled_size = _order_filled_size(row)
     if fill is None:
         polled = _poll_order_fill(account_id, order_id)
         if polled is not None:
+            status = _order_status(polled) or status
+            if status in ("rejected", "cancelled", "canceled"):
+                return {
+                    "error": f"Propr close order {status} after submit",
+                    "order_id": order_id,
+                }
             fill = _order_fill_price(polled)
             filled_size = _order_filled_size(polled) or filled_size
 
-    return {
+    payload = {
         "venue": "propr",
         "account_id": account_id,
         "mid": mid,
@@ -1051,6 +1073,15 @@ def close_position(
         "exit_order_id": order_id,
         "order_ids": {"exit": order_id},
     }
+    if not (filled_size and float(filled_size) > 0):
+        payload["error"] = (
+            f"Propr close order returned no filled quantity (status={status or 'unknown'})"
+        )
+        log.error(
+            "Propr close %s size=%s: no fill after poll — %s",
+            asset_n, size, payload["error"],
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------

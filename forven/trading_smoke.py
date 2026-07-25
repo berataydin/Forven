@@ -14,6 +14,20 @@ _STATUS_ORDER = {"ok": 0, "warn": 1, "fail": 2}
 _DEFAULT_ASSET_CANDIDATES = ("SOL", "ETH", "BTC")
 
 
+def resolve_effective_testnet(requested_testnet: bool) -> bool:
+    """The network the smoke will ACTUALLY hit, resolved from the credentials.
+
+    MAINNET-GUARD-1: the mainnet block below reasoned about the REQUESTED flag,
+    but ``get_exchange`` picks the endpoint from the credential-resolved
+    ``USE_TESTNET`` — so ``--mainnet`` omitted plus mainnet-resolving credentials
+    ran an "it's only testnet" smoke that opened and closed a REAL position.
+    Resolve once, up front, and gate on that.
+    """
+    from forven.exchange.hyperliquid import resolve_configured_testnet
+
+    return resolve_configured_testnet(bool(requested_testnet))
+
+
 def get_account_value(*, testnet: bool = True, require_connection: bool = True) -> dict[str, Any]:
     from forven.exchange.hyperliquid import get_account_value as _get_account_value
 
@@ -382,12 +396,23 @@ def _run_active_order_smoke(
     open_orders_payload: list[Any],
     mids_payload: dict[str, Any],
 ) -> dict[str, Any]:
+    # MAINNET-GUARD-1: gate on the CREDENTIAL-RESOLVED network, never the caller's
+    # requested flag — a caller asking for testnet against mainnet-resolving
+    # credentials was placing a real order here while reporting testnet=True. The
+    # resolved value is what every downstream order call uses too, so the report
+    # and the endpoint can never disagree.
+    requested_testnet = bool(testnet)
+    testnet = resolve_effective_testnet(requested_testnet)
     if not testnet and not allow_mainnet:
         return _make_check(
             "execution",
             "fail",
             "Active trading smoke is blocked on mainnet",
-            {"testnet": bool(testnet), "allow_mainnet": bool(allow_mainnet)},
+            {
+                "testnet": bool(testnet),
+                "requested_testnet": requested_testnet,
+                "allow_mainnet": bool(allow_mainnet),
+            },
         )
 
     normalized_direction = str(direction or "long").strip().lower()
@@ -468,7 +493,14 @@ def _run_active_order_smoke(
         "info",
         "trading_smoke",
         f"Starting active trading smoke {trade_id} {selected_asset} {normalized_direction} size={size}",
-        {"trade_id": trade_id, "asset": selected_asset, "usd_notional": requested_notional, "testnet": testnet},
+        {
+            "trade_id": trade_id,
+            "asset": selected_asset,
+            "usd_notional": requested_notional,
+            # The RESOLVED network (MAINNET-GUARD-1) — this is real money when False.
+            "testnet": testnet,
+            "requested_testnet": requested_testnet,
+        },
     )
 
     try:
@@ -538,9 +570,11 @@ def _run_active_order_smoke(
             return _make_check(
                 "execution",
                 "fail",
-                "Active testnet smoke left residual open orders",
+                "Active smoke left residual open orders",
                 {
                     "trade_id": trade_id,
+                    "testnet": bool(testnet),
+                    "requested_testnet": requested_testnet,
                     "asset": selected_asset,
                     "direction": normalized_direction,
                     "usd_notional": requested_notional,
@@ -564,9 +598,11 @@ def _run_active_order_smoke(
         return _make_check(
             "execution",
             "ok",
-            "Active testnet order smoke passed",
+            "Active order smoke passed" if testnet else "Active MAINNET order smoke passed",
             {
                 "trade_id": trade_id,
+                "testnet": bool(testnet),
+                "requested_testnet": requested_testnet,
                 "asset": selected_asset,
                 "direction": normalized_direction,
                 "usd_notional": requested_notional,
@@ -698,6 +734,12 @@ def collect_trading_plane_smoke(
     checks: list[dict[str, Any]] = []
     overall_status = "ok"
 
+    # MAINNET-GUARD-1: resolve the network ONCE, up front, so every check, every
+    # order and the reported summary describe the endpoint the SDK will actually
+    # use — not the flag the caller asked for.
+    requested_testnet = bool(testnet)
+    testnet = resolve_effective_testnet(requested_testnet)
+
     account_payload: dict[str, Any] | None = None
     positions_payload: dict[str, Any] | None = None
     open_orders_payload: list[Any] | None = None
@@ -781,6 +823,7 @@ def collect_trading_plane_smoke(
         "summary": {
             "execution_mode": get_execution_mode(),
             "testnet": bool(testnet),
+            "requested_testnet": requested_testnet,
             "mode": "active" if place_test_order else "passive",
             "requested_asset": str(asset or "").strip().upper() or None,
             "selected_asset": execution_details.get("asset"),
