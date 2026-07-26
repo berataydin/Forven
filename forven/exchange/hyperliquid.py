@@ -457,7 +457,7 @@ def mainnet_arming_state() -> dict:
     """
     armed = _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET"))
     master_key_override = _is_truthy(os.environ.get("FORVEN_HL_ALLOW_MASTER_KEY"))
-    return {
+    state = {
         "flag": "FORVEN_ALLOW_MAINNET",
         "armed": armed,
         "permits": (
@@ -468,6 +468,65 @@ def mainnet_arming_state() -> dict:
         "master_key_override_flag": "FORVEN_HL_ALLOW_MASTER_KEY",
         "master_key_override_armed": master_key_override,
     }
+    state.update(_mainnet_arming_age())
+    return state
+
+
+# OPS-4 (second half). Visibility alone does not answer "should this STILL be
+# armed?". FORVEN_ALLOW_MAINNET is a user-level env var, so an arming done for one
+# deliberate session outlives every restart afterwards, and the failure mode is
+# forgetting rather than deciding.
+#
+# A hard `armed_until` expiry was the audit's suggestion, and it is NOT the default
+# here. This system runs UNATTENDED: an expiry that lapses at 03:00 stops live
+# ENTRIES with nobody present to re-arm, converting a disclosure problem into a
+# silent trading outage. (Exits are unaffected either way — the arming refusal is
+# an entry guard only; see _assert_execution_allowed's exit_only contract.) So the
+# expiry is available and opt-in, while the thing that is ALWAYS on is the age:
+# how long this instance has been armed, surfaced in /api/health so a months-old
+# arming is visible rather than inferred.
+_ARMED_SINCE_KEY = "forven:mainnet:armed_since"
+
+
+def _mainnet_arming_age() -> dict:
+    """First-observation timestamp + age for the arming flag. Never raises."""
+    from datetime import datetime, timezone
+
+    if not _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET")):
+        return {"armed_since": None, "armed_age_hours": None, "armed_expires_at": None}
+    try:
+        from forven.db import kv_get, kv_set_best_effort
+
+        now = datetime.now(timezone.utc)
+        since_raw = kv_get(_ARMED_SINCE_KEY)
+        if not since_raw:
+            # First time this instance has seen the flag armed. Record it rather
+            # than the env var's mtime, which does not exist on Windows.
+            since_raw = now.isoformat()
+            kv_set_best_effort(_ARMED_SINCE_KEY, since_raw)
+        since = datetime.fromisoformat(str(since_raw))
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        age_hours = round((now - since).total_seconds() / 3600.0, 1)
+
+        expires_at = None
+        try:
+            from forven.config import get_settings
+
+            window = float((get_settings() or {}).get("mainnet_arming_expiry_hours") or 0)
+        except Exception:  # noqa: BLE001 — an unreadable setting means "no expiry"
+            window = 0.0
+        if window > 0:
+            from datetime import timedelta
+
+            expires_at = (since + timedelta(hours=window)).isoformat()
+        return {
+            "armed_since": since.isoformat(),
+            "armed_age_hours": age_hours,
+            "armed_expires_at": expires_at,
+        }
+    except Exception:  # noqa: BLE001 — diagnostics must never break the order path
+        return {"armed_since": None, "armed_age_hours": None, "armed_expires_at": None}
 
 
 def _assert_execution_allowed(testnet: bool, *, exit_only: bool = False) -> None:
@@ -498,7 +557,35 @@ def _assert_execution_allowed(testnet: bool, *, exit_only: bool = False) -> None
     """
     if testnet:
         return
+    # Opt-in arming expiry (default OFF — see _mainnet_arming_age for why an
+    # unattended system does not get a hard cutoff by default). When configured
+    # and lapsed, the flag stops authorizing ENTRIES and this falls through to the
+    # same refusal an unarmed instance gets. Exits are unaffected: the exit_only
+    # carve-out below is evaluated after this, so a reduce-only flatten is still
+    # permitted on an expired arming. An expiry that could strand real capital
+    # would be worse than the staleness it guards against.
+    _expired = False
     if _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET")):
+        try:
+            from datetime import datetime, timezone
+
+            _exp = _mainnet_arming_age().get("armed_expires_at")
+            if _exp:
+                _deadline = datetime.fromisoformat(str(_exp))
+                if _deadline.tzinfo is None:
+                    _deadline = _deadline.replace(tzinfo=timezone.utc)
+                _expired = datetime.now(timezone.utc) > _deadline
+        except Exception:  # noqa: BLE001 — an unreadable expiry must not disarm a live instance
+            _expired = False
+        if _expired and not exit_only:
+            raise RuntimeError(
+                "Refusing to place a MAINNET order: FORVEN_ALLOW_MAINNET is set but the "
+                "configured arming window (mainnet_arming_expiry_hours) has LAPSED. "
+                "Re-arm deliberately by clearing the 'forven:mainnet:armed_since' key, or "
+                "set mainnet_arming_expiry_hours to 0 to disable the expiry. Exits are "
+                "still permitted."
+            )
+    if _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET")) and not _expired:
         # OPS-4: make the arming visible at least once per process, at the moment
         # it actually authorizes real money, rather than only in a config file.
         global _MAINNET_ARMING_WARNED
