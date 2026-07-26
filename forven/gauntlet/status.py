@@ -316,16 +316,16 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
     # strategies with no artifacts.
     composite = None
     try:
-        # ARCH-03 leftover: the scorer itself now lives in forven.robustness.engine
-        # and forven.routers.robustness only RE-EXPORTS it, so this is a shim hop —
-        # the last place the gauntlet still reaches up through the web layer.
-        # Repointing this line at `forven.robustness.engine` is the finishing move,
-        # but tests/test_gauntlet_status_live_composite.py monkeypatches
-        # `forven.routers.robustness.compute_composite_robustness_score`, and a
-        # monkeypatch on the shim does NOT rebind the engine's own global. Move both
-        # together or the four live-composite regression tests silently stop
-        # exercising anything.
-        from forven.routers.robustness import compute_composite_robustness_score
+        # ARCH-03: import the scorer from where it LIVES (forven.robustness.engine),
+        # not from forven.routers.robustness, which only re-exports it. The gauntlet
+        # must never reach up through the web layer to reach engine code — importing
+        # a router drags FastAPI, the auth dependency and every sibling endpoint
+        # module into a background worker that has no business owning them.
+        # tests/test_finish_shims.py holds this line down with an AST walk, and
+        # tests/test_gauntlet_status_live_composite.py patches the ENGINE attribute
+        # (patching the router re-export would not rebind this import and the four
+        # live-composite regression tests would silently stop exercising anything).
+        from forven.robustness.engine import compute_composite_robustness_score
 
         computed = compute_composite_robustness_score(strategy_id)
         if computed is not None:
