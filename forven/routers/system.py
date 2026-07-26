@@ -49,6 +49,18 @@ def put_settings_section(section: str, payload: dict):
     return core.put_settings_section(section, payload)
 
 
+@router.get("/api/settings/manifest-defaults")
+def get_settings_manifest_defaults():
+    # ARCH-05: the Settings page used to hand-copy ~214 engine defaults into
+    # frontend/src/lib/settings/manifest.ts, and they drifted — nine gate
+    # thresholds were captioning numbers the engine did not run, on the page an
+    # operator reviews before arming live capital. The flattening lives in
+    # forven/settings_manifest.py, not here: routers stay thin.
+    from forven import settings_manifest
+
+    return settings_manifest.manifest_defaults_payload()
+
+
 @router.post("/api/settings/test-discord")
 def post_settings_test_discord():
     return core.post_settings_test_discord()

@@ -1,3 +1,5 @@
+import BACKEND_DEFAULTS_SNAPSHOT from './backendDefaults.generated.json';
+
 export type SettingsAreaId =
   | 'home'
   | 'data'
@@ -34,7 +36,31 @@ export interface SettingsEntry {
   // from a day-valued field (e.g. the Backtest window) so an operator entering 1095
   // days immediately sees it as ~3 years.
   valueHint?: 'years';
+  /**
+   * ARCH-05: the engine owns this value, not the manifest.
+   *
+   * The literal written below is only the OFFLINE fallback. At module load
+   * `applyBackendDefaults` overwrites it from the backend's own default dicts
+   * (see backendDefaults.generated.json), and a live instance can refresh it
+   * again via `refreshSettingsManifestDefaults()`. Change a default in
+   * forven/policy.py or forven/settings_apply.py and regenerate — never here.
+   */
   default: unknown;
+  /**
+   * Set `false` to keep the literal above and skip the backend overlay. Only
+   * legitimate where the field is a deliberate UNIT MIRROR of the backend rail
+   * (a %-shaped input over a fraction-shaped config value) — overlaying there
+   * would caption a fraction under a "%" label. Every other entry must take the
+   * backend value; tests/test_finish_manifest.py enforces that.
+   */
+  defaultFromBackend?: false;
+  /**
+   * The committed source literal, stashed by `applyBackendDefaults` before it
+   * overwrites `default`. This is what the page falls back to when the generated
+   * snapshot is absent, so it is the value drift tests must assert against —
+   * checking `default` after the overlay is a tautology.
+   */
+  offlineDefault?: unknown;
   type: 'number' | 'text' | 'toggle' | 'select' | 'secret' | 'csv';
   options?: Array<{ value: string; label: string }>;
   area: SettingsAreaId;
@@ -1141,7 +1167,13 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.quick_screen.min_profit_factor',
     label: 'Quick-screen min profit factor',
-    default: 1.05,
+    // 1.0 matches the engine's Default preset ("keep only a not-a-clear-loser
+    // screen at the cheapest triage"; the Strict preset restores 1.1). This was
+    // the last of the ten drifted captions: it could not be corrected in
+    // isolation because tests/test_arch_wiring.py::_KNOWN_MANIFEST_DEFAULT_DRIFT
+    // asserted that this ONE entry still disagreed. Both landed together, and
+    // that exemption set is now empty.
+    default: 1.0,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
@@ -1395,6 +1427,14 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.gauntlet.mc_max_dd_p95',
     label: 'Gauntlet Monte-Carlo p95 max drawdown',
     unit: '%',
+    // %-shaped mirror of a fraction-shaped rail: policy stores 0.40 and
+    // _RATIO_THRESHOLD_PATHS accepts either form on write, so 40 round-trips.
+    // The backend would serve 0.4 here because policy._UI_PERCENT_THRESHOLD_PATHS
+    // (which converts 0.30 -> 30 at the settings read boundary) does not list
+    // this path — so the FIELD already renders 0.4 under a "%" label. Overlaying
+    // would only make the caption match that bug. The real fix is three lines in
+    // policy._UI_PERCENT_THRESHOLD_PATHS; until then this caption stays %-shaped.
+    defaultFromBackend: false,
     default: 40,
     type: 'number',
     area: 'lab',
@@ -1422,7 +1462,9 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     label: 'Walk-forward fold pass-rate floor',
     unit: '%',
     // Backend stores the fraction 0.33 (a ratio rail — see policy._RATIO_THRESHOLD_PATHS,
-    // which accepts either form); this field is the %-shaped mirror of it.
+    // which accepts either form); this field is the %-shaped mirror of it. Not
+    // overlaid from the backend for the same reason as gauntlet.mc_max_dd_p95 above.
+    defaultFromBackend: false,
     default: 33,
     type: 'number',
     area: 'lab',
@@ -1438,6 +1480,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     label: 'Param-jitter pass-rate floor',
     unit: '%',
     // Backend stores the fraction 0.50 (ratio rail, see the note above).
+    defaultFromBackend: false,
     default: 50,
     type: 'number',
     area: 'lab',
@@ -3051,7 +3094,13 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'data-engine.source_reconciliation_enabled',
     label: 'Source reconciliation gate',
-    default: false,
+    // ARCH-05 (2026-07-25): was captioned `false` against a backend that
+    // defaults this promotion-BLOCKING gate to true (dataeng/settings.py). This
+    // entry and the next were two further drifts, both invisible to
+    // tests/test_arch_wiring.py because its resolver reads
+    // _DEFAULT_SETTINGS_PAYLOAD, which does not carry the data_engine_settings
+    // subtree. Now overlaid from the backend as well.
+    default: true,
     type: 'toggle',
     area: 'data',
     subsection: 'data-engine-core',
@@ -3078,7 +3127,10 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'data-engine.source_reconciliation_block_when_missing',
     label: 'Block when divergence unknown',
-    default: false,
+    // See the note on source_reconciliation_enabled: the backend defaults this
+    // to true ("until the reconciliation job has computed a usable reading,
+    // capital entry stays parked"), the caption said false.
+    default: true,
     type: 'toggle',
     area: 'data',
     subsection: 'data-engine-core',
@@ -3182,3 +3234,59 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   // choose which categories to KEEP, and executes behind a typed confirmation. It
   // calls POST /api/system/factory-reset directly, so it has no flat-settings rows.
 ];
+
+// --------------------------------------------------------------------------
+// ARCH-05: defaults come from the backend, not from the literals above
+// --------------------------------------------------------------------------
+// Every `default:` above is an offline fallback. The authoritative value is the
+// engine's own — forven/policy.py DEFAULT_PIPELINE_CONFIG, settings_apply's
+// _DEFAULT_SETTINGS_PAYLOAD, and the consumer-side live-risk registries —
+// flattened to backendPath keys by forven/settings_manifest.py and snapshotted
+// into backendDefaults.generated.json.
+//
+// Why the snapshot rather than a fetch: `default` is read synchronously while a
+// section renders (both as the "Default: N" caption and as the value a field
+// falls back to), so a promise that resolves after mount would leave the page
+// showing numbers it had already committed to. The snapshot is applied before
+// any component imports the manifest, works in SSR/unit tests/with the backend
+// down, and is pinned fresh by tests/test_finish_manifest.py.
+// `refreshSettingsManifestDefaults()` ($lib/api/settings) re-applies the LIVE
+// map on top for an instance whose snapshot was committed stale.
+
+/** Overlay `backendPath` -> value onto the manifest. Returns entries updated. */
+export function applyBackendDefaults(
+  values: Record<string, unknown>,
+  entries: SettingsEntry[] = SETTINGS_MANIFEST,
+): number {
+  let applied = 0;
+  for (const entry of entries) {
+    if (entry.defaultFromBackend === false) continue;
+    if (!entry.backendPath) continue;
+    if (!Object.prototype.hasOwnProperty.call(values, entry.backendPath)) continue;
+    const next = values[entry.backendPath];
+    // A backend that cannot answer must not blank a caption: the literal is a
+    // better answer than `undefined`.
+    if (next === undefined) continue;
+    // Preserve the committed source literal BEFORE the first overwrite. Without
+    // it there is nothing left to check the literal against: a test asserting
+    // `entry.default === values[path]` after this runs is true by construction
+    // and cannot fail on drift. `offlineDefault` is what the page shows when the
+    // snapshot is missing, so it is the value that actually needs pinning.
+    // Guarded so refreshSettingsManifestDefaults() re-applying the LIVE map does
+    // not overwrite the literal with the generated snapshot's value.
+    if (!Object.prototype.hasOwnProperty.call(entry, 'offlineDefault')) {
+      entry.offlineDefault = entry.default;
+    }
+    entry.default = next;
+    applied += 1;
+  }
+  return applied;
+}
+
+/** `backendPath` -> default, as shipped by the backend at generation time. */
+export const BACKEND_DEFAULTS: Record<string, unknown> = (
+  BACKEND_DEFAULTS_SNAPSHOT as { defaults?: Record<string, unknown> }
+).defaults ?? {};
+
+/** How many entries the snapshot overlaid. Exported so a test can pin coverage. */
+export const BACKEND_DEFAULTS_APPLIED: number = applyBackendDefaults(BACKEND_DEFAULTS);

@@ -48,7 +48,7 @@ _RATIO_TOLERANT_SUFFIX = ("_pct", "_rate_min", "_percentile_min", "mc_max_dd_p95
 # is the stale end, not the manifest. Fixing it means editing that test file and
 # the manifest in ONE change and deleting this entry — it is exempted, not
 # forgiven, so the divergence stays counted.
-_KNOWN_MANIFEST_DEFAULT_DRIFT = {"quick_screen.min_profit_factor"}
+_KNOWN_MANIFEST_DEFAULT_DRIFT: set[str] = set()
 
 
 def _parse_manifest_entries() -> list[dict]:
