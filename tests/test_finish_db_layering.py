@@ -55,11 +55,22 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "forven"
 
-# Generated strategy archetypes. Thousands of files, each a leaf that imports
-# only forven.strategies.base, authored by the pipeline rather than by hand.
-# They cannot participate in a cycle and they would multiply the parse cost of
-# this test by ~7x, so the architecture graph is measured without them.
-_EXCLUDED_PREFIX = "forven.strategies.custom."
+# Generated/untrusted-origin strategy modules. Each is a leaf importing only
+# forven.strategies.base, authored by the pipeline rather than by hand, so none
+# can participate in a cycle — verified: excluding them leaves the largest SCC at
+# 180, unchanged. They also multiply this test's parse cost by ~7x.
+#
+# BOTH prefixes are excluded, not just custom/. Both are gitignored, so they exist
+# on a developer machine and NOT on a CI checkout — 6,064 under custom/ and 545
+# under imported/ here. Excluding only custom/ made this measurement environment
+# dependent: 960 modules locally against 417 in CI, which broke the parse guard
+# and, worse, meant the SCC ratchet was ratcheting a different graph in each
+# place. They are leaves (nothing first-party imports them), so dropping both
+# leaves the architecture graph unchanged and makes it reproducible.
+_EXCLUDED_PREFIXES = (
+    "forven.strategies.custom.",
+    "forven.strategies.imported.",
+)
 
 # ---------------------------------------------------------------------------
 # THE RATCHET. Measured 2026-07-25. MAY ONLY BE REDUCED — read the module
@@ -87,7 +98,7 @@ def _first_party_modules() -> dict[str, Path]:
     modules: dict[str, Path] = {}
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
         name = _module_name(path)
-        if name.startswith(_EXCLUDED_PREFIX):
+        if name.startswith(_EXCLUDED_PREFIXES):
             continue
         modules[name] = path
     return modules
@@ -212,9 +223,18 @@ def test_import_graph_parses_every_module() -> None:
     swallowed the error reported a cluster ~9 modules smaller than reality.
     """
     modules = _first_party_modules()
-    assert len(modules) > 500, f"suspiciously few first-party modules: {len(modules)}"
+    # Count against what is ACTUALLY on disk, not a magic threshold. The first
+    # version asserted `> 500`, which passed locally (6,064 gitignored files under
+    # strategies/custom/ inflate the count) and failed on a clean CI checkout at
+    # 417 — the test was measuring the developer's working tree, not the invariant.
+    # What matters is that nothing found was silently dropped.
+    assert modules, "no first-party modules found at all — the walk is broken"
     _graph, unparsed = _build_import_graph()
     assert unparsed == [], f"these modules could not be parsed: {unparsed}"
+    assert len(_graph) == len(modules), (
+        f"the graph has {len(_graph)} nodes but {len(modules)} modules were found — "
+        "something was dropped between the walk and the parse"
+    )
 
 
 def test_bom_carrying_modules_are_in_the_graph(import_graph: dict[str, set[str]]) -> None:
