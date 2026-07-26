@@ -220,6 +220,30 @@ export interface ForvenRiskStatus {
 		}>;
 		/** Live-stage strategies with no go-live ceiling recorded (pre-existing lives). */
 		ceilings_missing?: string[];
+		/**
+		 * SLICE-1: the account is divided equally across the live cohort, and each
+		 * strategy sizes within its own share. `slice_usd` is that share.
+		 */
+		capital_slice?: {
+			cohort_size?: number | null;
+			slice_usd?: number | null;
+			account_equity_usd?: number | null;
+			unavailable_reason?: string | null;
+		};
+		/**
+		 * Per-strategy answer to "how big will this trade?". `mode` is 'system'
+		 * (the equal slice) or 'manual' (an operator cap on top); `binding` says
+		 * which of the two actually decides, since the smaller always wins.
+		 */
+		strategy_sizing?: Array<{
+			strategy_id: string;
+			mode: 'system' | 'manual';
+			manual_usd?: number | null;
+			slice_usd?: number | null;
+			effective_usd?: number | null;
+			binding?: 'system' | 'manual' | 'slice' | null;
+			stage?: string | null;
+		}>;
 	};
 	/** LIQ-1: order-time liquidity guard (limits + recent admit/block decisions). */
 	liquidity_guard_live?: {
