@@ -752,9 +752,31 @@ def test_test3_ci_runs_the_entire_test_suite() -> None:
         "test_propr_venue.py) were never wired in"
     )
     run = str(full[0]["run"])
-    assert not re.search(r"tests/test_\w+\.py", run), (
-        "the full-suite step must not name individual test files"
-    )
+
+    # The invariant is TOTAL COVERAGE, not "no filenames appear". The original
+    # form asserted the proxy, and it fired when the subprocess-heavy sandbox
+    # suites were moved to a serial lane — they are still RUN, just not under
+    # xdist, because they flake when competing for cores (test_isolated_per_bar_
+    # matches_in_process passes alone in 5m22s and failed once at -n 6). Asserting
+    # the proxy would have forced the choice between a flaky required gate and
+    # deleting the guard. So: any file the parallel step --ignore's must be picked
+    # up by another pytest step, and nothing may be silently dropped.
+    ignored = set(re.findall(r"tests/test_\w+\.py", run))
+    if ignored:
+        assert "--ignore" in run, (
+            "the full-suite step names test files but does not --ignore them — that is "
+            "the hand-picked allowlist TEST-3 removed, not a serial lane"
+        )
+        other_runs = " ".join(
+            str(step.get("run", ""))
+            for step in steps
+            if step is not full[0] and "pytest" in str(step.get("run", ""))
+        )
+        uncovered = sorted(f for f in ignored if f not in other_runs)
+        assert not uncovered, (
+            f"these files are --ignore'd by the full-suite step and run by NO other "
+            f"step, so they are silently ungated: {uncovered}"
+        )
 
 
 def test_test3_new_test_files_are_gated_without_editing_ci() -> None:
