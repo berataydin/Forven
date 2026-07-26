@@ -13,9 +13,6 @@ backtesting and live scanning.
 """
 
 
-
-
-
 import json
 
 
@@ -44,18 +41,10 @@ import multiprocessing
 from datetime import datetime, timezone
 
 
-
-
-
-
-
 import numpy as np
 
 
 import pandas as pd
-
-
-
 
 
 from forven.db import create_strategy_container, get_db, init_db, next_container_id
@@ -74,47 +63,19 @@ from forven.regime import (
 
 
 from forven.scanner import (
-
-
     fetch_candles,
-
-
     rsi as compute_rsi,
-
-
     adx as compute_adx,
-
-
     check_s012_signal,
-
-
     check_keltner_signal,
-
-
     check_bb_signal,
-
-
     check_bb_reversion_signal,
-
-
     check_macd_signal,
-
-
     check_ema_cross_signal,
-
-
     check_vwap_signal,
-
-
     check_supertrend_signal,
-
-
     check_funding_direction_signal,
-
-
     STRATEGIES as HARDCODED_STRATEGIES,
-
-
 )
 
 
@@ -125,19 +86,10 @@ from forven.strategies.base import BaseStrategy, DirectionalSignals, TradeMode
 from forven.strategies.params import canonicalize_params, resolve_strategy_family
 
 
-
-
-
 log = logging.getLogger("forven.strategies.backtest")
 
 
-
-
-
 REGIME_KEYS = [TREND_UP, TREND_DOWN, RANGE_BOUND, HIGH_VOL]
-
-
-
 
 
 # Bars per calendar year for each supported timeframe (used for Sharpe annualization).
@@ -146,29 +98,13 @@ REGIME_KEYS = [TREND_UP, TREND_DOWN, RANGE_BOUND, HIGH_VOL]
 
 
 _BARS_PER_YEAR = {
-
-
     "1m": 525_960,
-
-
     "5m": 105_192,
-
-
     "15m": 35_064,
-
-
     "1h": 8_760,
-
-
     "4h": 2_190,
-
-
     "1d": 365,
-
-
     "1w": 52,
-
-
 }
 
 
@@ -648,35 +584,16 @@ def _isolated_walk_forward_worker(
     }
 
 
-
 SIGNAL_CHECKERS = {
-
-
     "rsi_momentum": check_s012_signal,
-
-
     "keltner": check_keltner_signal,
-
-
     "bollinger": check_bb_signal,
     "bollinger_reversion": check_bb_reversion_signal,
-
-
     "macd": check_macd_signal,
-
-
     "ema_cross": check_ema_cross_signal,
-
-
     "vwap": check_vwap_signal,
-
-
     "supertrend": check_supertrend_signal,
-
-
     "funding_direction": check_funding_direction_signal,    "funding": check_funding_direction_signal,
-
-
 }
 
 
@@ -697,40 +614,16 @@ _MIRROR_SHORT_SAFE_TYPES: set[str] = {
 }
 
 
-
-
-
 _CHART_SUPPORTED_TYPES = {
-
-
     "rsi_momentum",
-
-
     "bollinger",
-
-
     "keltner",
-
-
     "macd",
-
-
     "ema_cross",
-
-
     "stochastic",
-
-
     "vwap",
-
-
     "supertrend",
-
-
 }
-
-
-
 
 
 # Risk/sizing controls that are NOT enforced when present in a strategy's
@@ -744,86 +637,32 @@ _CHART_SUPPORTED_TYPES = {
 # limits, cooldowns) have no simulator implementation at all.
 _UNSUPPORTED_BACKTEST_RISK_FIELDS = {
     "stop_loss_pct": "stop_loss_pct",
-
-
     "take_profit_pct": "take_profit_pct",
-
-
     "trailing_stop_pct": "trailing_stop_pct",
-
-
     "time_stop_bars": "time_stop_bars",
-
-
     "sizing_mode": "sizing_mode",
-
-
     "fixed_size": "fixed_size",
-
-
     "risk_pct": "risk_pct",
-
-
     "risk_per_trade": "risk_per_trade",
-
-
     "atr_stop_multiplier": "atr_stop_multiplier",
-
-
     "kelly_multiplier": "kelly_multiplier",
-
-
     "kelly_lookback": "kelly_lookback",
-
-
     "max_position_size_pct": "max_position_size_pct",
-
-
     "max_risk_per_trade_pct": "max_risk_per_trade_pct",
-
-
     "min_risk_reward_ratio": "min_risk_reward_ratio",
-
-
     "max_daily_loss": "max_daily_loss",
-
-
     "max_daily_loss_pct": "max_daily_loss_pct",
-
-
     "max_drawdown": "max_drawdown",
-
-
     "max_drawdown_pct": "max_drawdown_pct",
-
-
     "max_concurrent_positions": "max_concurrent_positions",
-
-
     "cooldown_after_loss_hours": "cooldown_after_loss_hours",
-
-
     "cooldown_after_loss_bars": "cooldown_after_loss_bars",
-
-
     "risk_fee_bps": "risk_fee_bps",
-
-
     "risk_slippage_bps": "risk_slippage_bps",
-
-
 }
 
 
-
-
-
-
-
-
 def _is_backtest_risk_control_enabled(value: object) -> bool:
-
-
     if value is None:
 
         return False
@@ -853,27 +692,11 @@ def _is_backtest_risk_control_enabled(value: object) -> bool:
     return True
 
 
-
-
-
-
-
-
 def validate_backtest_risk_controls(
-
-
     params: dict | None,
-
-
     *,
-
-
     extra_controls: dict | None = None,
-
-
 ) -> str | None:
-
-
     controls: dict[str, object] = {}
 
     if isinstance(params, dict):
@@ -902,14 +725,10 @@ def validate_backtest_risk_controls(
         }
 
     enabled_fields = [
-
         field_name
-
         for field_name in _UNSUPPORTED_BACKTEST_RISK_FIELDS.values()
-
         if field_name not in profile_covered
         and _is_backtest_risk_control_enabled(controls.get(field_name))
-
     ]
 
     if not enabled_fields:
@@ -919,13 +738,9 @@ def validate_backtest_risk_controls(
     fields = ", ".join(sorted(set(enabled_fields)))
 
     return (
-
         "Local backtesting does not yet enforce these risk controls: "
-
         f"{fields}. Remove them from the request or validate them in the paper/live "
-
         "risk engine until backtest parity is implemented."
-
     )
 
 
@@ -1118,30 +933,12 @@ def expand_strategy_trade_modes(
     return ordered or ["long_only"]
 
 
-
-
-
-
-
-
 def _validate_backtest_execution_parity(
-
-
     strategy_type: str | None,
-
-
     params: dict | None,
-
-
     *,
-
-
     allow_uncertified: bool = False,
-
-
 ) -> tuple[dict, str | None, str | None]:
-
-
     """Returns (canonical_params, blocking_error, risk_warning)."""
 
     from forven.strategies.certification import EXECUTION_CERTIFIED_FAMILIES
@@ -1173,15 +970,7 @@ def _validate_backtest_execution_parity(
     return certification.canonical_params, None, risk_warning
 
 
-
-
-
-
-
-
 def _normalize_backtest_frame(df: pd.DataFrame | None, *, keep_extra_columns: bool = False) -> pd.DataFrame:
-
-
     columns = ["open", "high", "low", "close", "volume"]
 
     if df is None or df.empty:
@@ -1230,15 +1019,7 @@ def _normalize_backtest_frame(df: pd.DataFrame | None, *, keep_extra_columns: bo
     return frame
 
 
-
-
-
-
-
-
 def _base_asset(value: str) -> str:
-
-
     raw = str(value or "").strip().upper()
 
     for sep in ("/", "-", "_"):
@@ -1260,31 +1041,17 @@ def _base_asset(value: str) -> str:
     return raw.strip()
 
 
-
-
-
-
-
-
 def _dataset_symbol_candidates(asset: str) -> list[str]:
-
-
     base = _base_asset(asset)
 
     candidates: list[str] = []
 
     for candidate in (
-
         str(asset or "").strip().upper(),
-
         base,
-
         f"{base}/USDT" if base else "",
-
         f"{base}/USD" if base else "",
-
         f"{base}/USDC" if base else "",
-
     ):
 
         normalized = str(candidate or "").strip().upper()
@@ -1296,15 +1063,7 @@ def _dataset_symbol_candidates(asset: str) -> list[str]:
     return candidates
 
 
-
-
-
-
-
-
 def _coerce_backtest_timestamp(value: object) -> pd.Timestamp | None:
-
-
     if value in (None, ""):
 
         return None
@@ -1326,33 +1085,16 @@ def _coerce_backtest_timestamp(value: object) -> pd.Timestamp | None:
     return ts
 
 
-
-
-
-
-
-
 def _timeframe_to_timedelta(timeframe: str) -> pd.Timedelta | None:
-
-
     mapping = {
-
         "1m": "1min",
-
         "5m": "5min",
-
         "15m": "15min",
-
         "30m": "30min",
-
         "1h": "1h",
-
         "4h": "4h",
-
         "1d": "1d",
-
         "1w": "7d",
-
     }
 
     alias = mapping.get(str(timeframe or "").strip().lower())
@@ -1370,33 +1112,13 @@ def _timeframe_to_timedelta(timeframe: str) -> pd.Timedelta | None:
         return None
 
 
-
-
-
-
-
-
 def _estimate_required_bars_for_window(
-
-
     *,
-
-
     start_date: str | None,
-
-
     end_date: str | None,
-
-
     timeframe: str,
-
-
     warmup_bars: int = 210,
-
-
 ) -> int:
-
-
     start_ts = _coerce_backtest_timestamp(start_date)
 
     end_ts = _coerce_backtest_timestamp(end_date)
@@ -1416,33 +1138,13 @@ def _estimate_required_bars_for_window(
     return max(estimated, max(int(warmup_bars), 0) + 1)
 
 
-
-
-
-
-
-
 def _filter_backtest_frame_to_window(
-
-
     frame: pd.DataFrame | None,
-
-
     *,
-
-
     start_date: str | None,
-
-
     end_date: str | None,
-
-
     warmup_bars: int = 210,
-
-
 ) -> pd.DataFrame:
-
-
     # keep_extra_columns: the caller may hand us an ALREADY-ENRICHED frame
     # (grid_search pre-loads candles once and re-windows them per trial);
     # normalizing must not strip the enrichment columns strategies key on.
@@ -1491,30 +1193,12 @@ def _filter_backtest_frame_to_window(
     return working.copy()
 
 
-
-
-
-
-
-
 def _sync_strategy_metrics_and_promote_if_eligible(
-
-
     strategy_id: str,
-
-
     metrics: dict | None,
-
-
     *,
-
-
     promotion_reason: str,
-
-
 ) -> None:
-
-
     """Persist backtest metrics onto a strategy row and auto-promote quick-screen candidates."""
 
     if not strategy_id or not isinstance(metrics, dict) or not metrics:
@@ -1528,11 +1212,8 @@ def _sync_strategy_metrics_and_promote_if_eligible(
         with get_db() as conn:
 
             row = conn.execute(
-
                 "SELECT stage, status, metrics, timeframe FROM strategies WHERE id = ?",
-
                 (strategy_id,),
-
             ).fetchone()
 
             if not row:
@@ -1542,17 +1223,11 @@ def _sync_strategy_metrics_and_promote_if_eligible(
             strategy_stage = str(row["stage"] or row["status"] or "").strip().lower()
 
             stage_aliases = {
-
                 "researching": "quick_screen",
-
                 "developing": "quick_screen",
-
                 "backtesting": "gauntlet",
-
                 "paper_trading": "paper",
-
                 "deployed": "live_graduated",
-
             }
 
             strategy_stage = stage_aliases.get(strategy_stage, strategy_stage)
@@ -1654,15 +1329,12 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 metrics[DATA_QUALITY_FLAGS_KEY] = integrity_anomalies
 
             updated = conn.execute(
-
                 """UPDATE strategies
                    SET metrics = ?, updated_at = ?
                    WHERE id = ?
                      AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
                          ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
-
                 (json.dumps(metrics), datetime.now(timezone.utc).isoformat(), strategy_id),
-
             )
             if updated.rowcount != 1:
                 log.info(
@@ -1717,11 +1389,8 @@ def _sync_strategy_metrics_and_promote_if_eligible(
         if not passed:
 
             log.info(
-
                 "Backtest gate not met for %s: %s â€” strategy remains in %s",
-
                 strategy_id, gate_reason, strategy_stage,
-
             )
 
             return  # Stay in current stage. Evolution will re-evaluate.
@@ -1729,15 +1398,10 @@ def _sync_strategy_metrics_and_promote_if_eligible(
         from forven.brain import transition_stage
 
         transition_stage(
-
             strategy_id,
-
             target_stage,
-
             reason=promotion_reason,
-
             actor="system",
-
         )
 
         log.info("Backtest auto-promoted %s to %s", strategy_id, target_stage)
@@ -1747,15 +1411,7 @@ def _sync_strategy_metrics_and_promote_if_eligible(
         log.warning("Backtest auto-promotion failed for %s: %s", strategy_id, exc)
 
 
-
-
-
-
-
-
 def _check_data_requirements(strategy_type: str, asset: str, timeframe: str, bars: int) -> str | None:
-
-
     """Pre-flight check: verify the strategy's data requirements can be met.
 
 
@@ -1825,53 +1481,36 @@ def _check_data_requirements(strategy_type: str, asset: str, timeframe: str, bar
                     try:
 
                         log.info(
-
                             "Auto-fetching %s %s from %s (%d bars)",
-
                             ccxt_symbol, req_tf, fetch_exchange, req_bars,
-
                         )
 
                         fetch_ohlcv_chunked(
-
                             symbol=ccxt_symbol,
-
                             timeframe=req_tf,
-
                             exchange_id=fetch_exchange,
-
                             limit=req_bars,
-
                         )
 
                     except Exception as fetch_err:
 
                         missing.append(
-
                             f"{req_asset} on {req_exchange} ({req_tf}): auto-fetch failed â€” {fetch_err}"
-
                         )
 
                 else:
 
                     missing.append(
-
                         f"{req_asset} on {req_exchange} ({req_tf}): "
-
                         f"no local data and exchange not supported for auto-fetch"
-
                     )
 
         if missing:
 
             return (
-
                 f"Data requirements not fully met for {strategy_type}: "
-
                 + "; ".join(missing)
-
                 + ". Backtest will proceed with available data but results may be incomplete."
-
             )
 
         return None
@@ -1883,15 +1522,7 @@ def _check_data_requirements(strategy_type: str, asset: str, timeframe: str, bar
         return None
 
 
-
-
-
-
-
-
 def _resolve_strategy_class(strategy_type: str | None):
-
-
     """Resolve a strategy class by runtime type, including custom archived-style modules."""
 
     normalized_type = str(strategy_type or "").strip().lower()
@@ -1956,27 +1587,11 @@ def _resolve_strategy_class(strategy_type: str | None):
     return None
 
 
-
-
-
-
-
-
 def load_multi_exchange_candles(
-
-
     requirements: list[dict],
-
-
     bars: int = 720,
-
-
     timeframe: str = "1h",
-
-
 ) -> dict[str, pd.DataFrame]:
-
-
     """Load candles from multiple exchanges for cross-exchange strategies.
 
 
@@ -2027,12 +1642,6 @@ def load_multi_exchange_candles(
             result[key] = df
 
     return result
-
-
-
-
-
-
 
 
 def _resolve_market_data_series(normalized_asset: str, start_ms: int, end_ms: int):
@@ -2187,38 +1796,16 @@ def _resolve_point_in_time_as_of() -> object | None:
 
 
 def load_backtest_candles(
-
-
     asset: str,
-
-
     bars: int = 720,
-
-
     timeframe: str = "1h",
-
-
     *,
-
-
     start_date: str | None = None,
-
-
     end_date: str | None = None,
-
-
     warmup_bars: int = 210,
-
-
     enrich_market_data: bool = True,
-
-
     as_of: object | None = None,
-
-
 ) -> pd.DataFrame:
-
-
     """Load candles for backtesting, preferring local parquet datasets.
 
     With ``as_of`` set (explicitly, or via the data-engine point_in_time pin) the
@@ -2233,21 +1820,13 @@ def load_backtest_candles(
     required_bars = max(int(bars), 1)
 
     required_bars = max(
-
         required_bars,
-
         _estimate_required_bars_for_window(
-
             start_date=start_date,
-
             end_date=end_date,
-
             timeframe=resolved_timeframe,
-
             warmup_bars=warmup_bars,
-
         ),
-
     )
 
     try:
@@ -2265,15 +1844,10 @@ def load_backtest_candles(
             if start_date or end_date:
 
                 frame = _filter_backtest_frame_to_window(
-
                     frame,
-
                     start_date=start_date,
-
                     end_date=end_date,
-
                     warmup_bars=warmup_bars,
-
                 )
 
             elif len(frame) > required_bars:
@@ -2281,17 +1855,11 @@ def load_backtest_candles(
                 frame = frame.tail(required_bars)
 
             log.info(
-
                 "Backtest candles source=dataset symbol=%s timeframe=%s bars=%d requested=%d",
-
                 symbol,
-
                 resolved_timeframe,
-
                 len(frame),
-
                 required_bars,
-
             )
 
             if enrich_market_data:
@@ -2315,15 +1883,10 @@ def load_backtest_candles(
     except Exception as exc:
 
         log.warning(
-
             "Dataset candle load failed (falling back to scanner) for %s %s: %s",
-
             asset,
-
             resolved_timeframe,
-
             exc,
-
         )
 
     frame = _normalize_backtest_frame(fetch_candles(asset, bars=required_bars, interval=resolved_timeframe))
@@ -2331,15 +1894,10 @@ def load_backtest_candles(
     if start_date or end_date:
 
         frame = _filter_backtest_frame_to_window(
-
             frame,
-
             start_date=start_date,
-
             end_date=end_date,
-
             warmup_bars=warmup_bars,
-
         )
 
     elif len(frame) > required_bars:
@@ -2347,17 +1905,11 @@ def load_backtest_candles(
         frame = frame.tail(required_bars)
 
     log.info(
-
         "Backtest candles source=scanner symbol=%s timeframe=%s bars=%d requested=%d",
-
         asset,
-
         resolved_timeframe,
-
         len(frame),
-
         required_bars,
-
     )
 
     if enrich_market_data:
@@ -2379,15 +1931,7 @@ def load_backtest_candles(
     return frame
 
 
-
-
-
-
-
-
 def _dedupe_chart_messages(messages: list[str]) -> list[str]:
-
-
     deduped: list[str] = []
 
     seen: set[str] = set()
@@ -2407,15 +1951,7 @@ def _dedupe_chart_messages(messages: list[str]) -> list[str]:
     return deduped
 
 
-
-
-
-
-
-
 def _coerce_chart_params(value: object) -> dict:
-
-
     if isinstance(value, dict):
 
         return dict(value)
@@ -2435,15 +1971,7 @@ def _coerce_chart_params(value: object) -> dict:
     return {}
 
 
-
-
-
-
-
-
 def _parse_chart_timestamp(value: object) -> pd.Timestamp | None:
-
-
     if value in (None, ""):
 
         return None
@@ -2467,15 +1995,7 @@ def _parse_chart_timestamp(value: object) -> pd.Timestamp | None:
     return ts
 
 
-
-
-
-
-
-
 def _serialize_chart_timestamp(value: object) -> str | None:
-
-
     ts = _parse_chart_timestamp(value)
 
     if ts is None:
@@ -2485,15 +2005,7 @@ def _serialize_chart_timestamp(value: object) -> str | None:
     return ts.isoformat()
 
 
-
-
-
-
-
-
 def _coerce_chart_float(value: object) -> float | None:
-
-
     try:
 
         parsed = float(value)
@@ -2509,15 +2021,7 @@ def _coerce_chart_float(value: object) -> float | None:
     return float(parsed)
 
 
-
-
-
-
-
-
 def _infer_chart_warmup_bars(params: dict | None) -> int:
-
-
     warmup = 210
 
     if not isinstance(params, dict):
@@ -2543,39 +2047,15 @@ def _infer_chart_warmup_bars(params: dict | None) -> int:
     return warmup
 
 
-
-
-
-
-
-
 def _slice_chart_frame_for_window(
-
-
     frame: pd.DataFrame | None,
-
-
     *,
-
-
     start_ts: pd.Timestamp | None,
-
-
     end_ts: pd.Timestamp | None,
-
-
     warmup_bars: int,
-
-
     symbol: str,
-
-
     timeframe: str,
-
-
 ) -> tuple[pd.DataFrame, list[str]]:
-
-
     warnings: list[str] = []
 
     working = _normalize_backtest_frame(frame)
@@ -2609,9 +2089,7 @@ def _slice_chart_frame_for_window(
         if actual_warmup < int(warmup_bars):
 
             warnings.append(
-
                 f"Only {actual_warmup} warmup bars were available for {symbol} {timeframe}; requested {int(warmup_bars)}."
-
             )
 
     else:
@@ -2635,15 +2113,7 @@ def _slice_chart_frame_for_window(
     return working.copy(), warnings
 
 
-
-
-
-
-
-
 def _chart_remote_symbol_candidates(asset: str) -> list[str]:
-
-
     candidates: list[str] = []
 
     base = _base_asset(asset)
@@ -2665,36 +2135,14 @@ def _chart_remote_symbol_candidates(asset: str) -> list[str]:
     return candidates
 
 
-
-
-
-
-
-
 def _load_remote_chart_frame(
-
-
     *,
-
-
     asset: str,
-
-
     timeframe: str,
-
-
     start_ts: pd.Timestamp | None,
-
-
     end_ts: pd.Timestamp | None,
-
-
     warmup_bars: int,
-
-
 ) -> tuple[pd.DataFrame, list[str]]:
-
-
     warnings: list[str] = []
 
     resolved_asset = str(asset or "").strip().upper()
@@ -2738,19 +2186,12 @@ def _load_remote_chart_frame(
         try:
 
             fetch_ohlcv_chunked(
-
                 symbol=symbol,
-
                 timeframe=resolved_timeframe,
-
                 exchange_id="binance",
-
                 limit=None if since_ms is not None else fallback_limit,
-
                 since_ms=since_ms,
-
                 until_ms=until_ms,
-
             )
 
             frame = _normalize_backtest_frame(load_parquet(symbol, resolved_timeframe))
@@ -2762,19 +2203,12 @@ def _load_remote_chart_frame(
             continue
 
         sliced, slice_warnings = _slice_chart_frame_for_window(
-
             frame,
-
             start_ts=start_ts,
-
             end_ts=end_ts,
-
             warmup_bars=warmup_bars,
-
             symbol=symbol,
-
             timeframe=resolved_timeframe,
-
         )
 
         warnings.extend(slice_warnings)
@@ -2786,17 +2220,11 @@ def _load_remote_chart_frame(
         warnings.append(f"Fetched remote OHLCV for {symbol} {resolved_timeframe} to render this chart.")
 
         log.info(
-
             "Backtest chart candles source=remote symbol=%s timeframe=%s bars=%d warmup=%d",
-
             symbol,
-
             resolved_timeframe,
-
             len(sliced),
-
             int(warmup_bars),
-
         )
 
         return sliced, _dedupe_chart_messages(warnings)
@@ -2804,39 +2232,15 @@ def _load_remote_chart_frame(
     return _normalize_backtest_frame(None), _dedupe_chart_messages(warnings)
 
 
-
-
-
-
-
-
 def _load_local_chart_frame(
-
-
     *,
-
-
     asset: str,
-
-
     timeframe: str,
-
-
     start_date: str | None,
-
-
     end_date: str | None,
-
-
     warmup_bars: int,
-
-
     allow_remote_fallback: bool = True,
-
-
 ) -> tuple[pd.DataFrame, list[str]]:
-
-
     warnings: list[str] = []
 
     resolved_asset = str(asset or "").strip().upper()
@@ -2894,19 +2298,12 @@ def _load_local_chart_frame(
             continue
 
         working, slice_warnings = _slice_chart_frame_for_window(
-
             frame,
-
             start_ts=start_ts,
-
             end_ts=end_ts,
-
             warmup_bars=warmup_bars,
-
             symbol=symbol,
-
             timeframe=resolved_timeframe,
-
         )
 
         warnings.extend(slice_warnings)
@@ -2930,25 +2327,17 @@ def _load_local_chart_frame(
             window_label = " -> ".join(window_bits) if window_bits else "the requested window"
 
             warnings.append(
-
                 f"No local OHLCV bars are available for {resolved_asset} {resolved_timeframe} in {window_label}."
-
             )
 
             return best_frame, _dedupe_chart_messages(warnings)
 
         remote_frame, remote_warnings = _load_remote_chart_frame(
-
             asset=resolved_asset,
-
             timeframe=resolved_timeframe,
-
             start_ts=start_ts,
-
             end_ts=end_ts,
-
             warmup_bars=warmup_bars,
-
         )
 
         warnings.extend(remote_warnings)
@@ -2962,39 +2351,23 @@ def _load_local_chart_frame(
         window_label = " -> ".join(window_bits) if window_bits else "the requested window"
 
         warnings.append(
-
             f"No local OHLCV bars are available for {resolved_asset} {resolved_timeframe} in {window_label}."
-
         )
 
         return best_frame, _dedupe_chart_messages(warnings)
 
     log.info(
-
         "Backtest chart candles source=dataset symbol=%s timeframe=%s bars=%d warmup=%d",
-
         best_symbol or resolved_asset,
-
         resolved_timeframe,
-
         len(best_frame),
-
         int(warmup_bars),
-
     )
 
     return best_frame, _dedupe_chart_messages(warnings)
 
 
-
-
-
-
-
-
 def _frame_to_chart_bars(frame: pd.DataFrame) -> list[dict]:
-
-
     if frame.empty:
 
         return []
@@ -3004,37 +2377,20 @@ def _frame_to_chart_bars(frame: pd.DataFrame) -> list[dict]:
     for ts, row in frame.iterrows():
 
         bars.append(
-
             {
-
                 "timestamp": pd.Timestamp(ts).isoformat(),
-
                 "open": round(float(row["open"]), 8),
-
                 "high": round(float(row["high"]), 8),
-
                 "low": round(float(row["low"]), 8),
-
                 "close": round(float(row["close"]), 8),
-
                 "volume": round(float(row["volume"]), 8),
-
             }
-
         )
 
     return bars
 
 
-
-
-
-
-
-
 def _indicator_points(frame: pd.DataFrame, column: str) -> list[dict]:
-
-
     if frame.empty or column not in frame.columns:
 
         return []
@@ -3050,24 +2406,13 @@ def _indicator_points(frame: pd.DataFrame, column: str) -> list[dict]:
             continue
 
         points.append(
-
             {
-
                 "timestamp": pd.Timestamp(ts).isoformat(),
-
                 "value": round(float(value), 8),
-
             }
-
         )
 
     return points
-
-
-
-
-
-
 
 
 def _build_rule_engine_chart_indicators(
@@ -3136,8 +2481,6 @@ def _build_rule_engine_chart_indicators(
 
 
 def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dict | None) -> tuple[list[dict], list[dict], list[str]]:
-
-
     warnings: list[str] = []
 
     normalized_type = str(strategy_type or "").strip().lower().lower()
@@ -3195,31 +2538,21 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
     if normalized_type == "rsi_momentum":
 
         main_specs = [
-
             ("EMA Fast", "ema_fast", "#f59e0b"),
-
             ("EMA Slow", "ema_slow", "#60a5fa"),
-
         ]
 
         sub_specs = [
-
             ("RSI", "rsi", "#a78bfa"),
-
             ("ADX", "adx_val", "#22d3ee"),
-
         ]
 
     elif normalized_type in ("bollinger", "bollinger_reversion"):
 
         main_specs = [
-
             ("BB Upper", "bb_upper", "#f97316"),
-
             ("BB Mid", "bb_mid", "#60a5fa"),
-
             ("BB Lower", "bb_lower", "#22c55e"),
-
         ]
 
         if normalized_type == "bollinger_reversion":
@@ -3230,13 +2563,9 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
     elif normalized_type == "keltner":
 
         main_specs = [
-
             ("KC Upper", "kc_upper", "#f97316"),
-
             ("KC Mid", "kc_mid", "#60a5fa"),
-
             ("KC Lower", "kc_lower", "#22c55e"),
-
         ]
 
         sub_specs = [("ADX", "adx_val", "#22d3ee")]
@@ -3244,21 +2573,15 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
     elif normalized_type == "macd":
 
         sub_specs = [
-
             ("MACD", "macd", "#22d3ee"),
-
             ("Signal", "macd_signal", "#f97316"),
-
         ]
 
     elif normalized_type == "ema_cross":
 
         main_specs = [
-
             ("EMA Fast", "ema_fast", "#f59e0b"),
-
             ("EMA Slow", "ema_slow", "#60a5fa"),
-
         ]
 
         sub_specs = [("ADX", "adx_val", "#22d3ee")]
@@ -3266,11 +2589,8 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
     elif normalized_type == "stochastic":
 
         sub_specs = [
-
             ("Stoch %K", "stoch_k", "#22d3ee"),
-
             ("Stoch %D", "stoch_d", "#f97316"),
-
         ]
 
     elif normalized_type == "vwap":
@@ -3282,17 +2602,13 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
     elif normalized_type == "supertrend":
 
         main_specs = [
-
             ("Supertrend Upper", "final_upper", "#f97316"),
-
             ("Supertrend Lower", "final_lower", "#22c55e"),
-
         ]
 
         sub_specs = [("ADX", "adx_val", "#22d3ee")]
 
     def _serialize_indicator(name: str, column: str, color: str) -> dict | None:
-
         data = _indicator_points(enriched, column)
 
         if not data:
@@ -3300,47 +2616,27 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
             return None
 
         return {
-
             "name": name,
-
             "color": color,
-
             "data": data,
-
         }
 
     main_indicators = [
-
         indicator
-
         for indicator in (_serialize_indicator(name, column, color) for name, column, color in main_specs)
-
         if indicator is not None
-
     ]
 
     sub_indicators = [
-
         indicator
-
         for indicator in (_serialize_indicator(name, column, color) for name, column, color in sub_specs)
-
         if indicator is not None
-
     ]
 
     return main_indicators, sub_indicators, warnings
 
 
-
-
-
-
-
-
 def _build_trade_markers(trades: object) -> tuple[list[dict], list[dict]]:
-
-
     if not isinstance(trades, list):
 
         return [], []
@@ -3356,9 +2652,7 @@ def _build_trade_markers(trades: object) -> tuple[list[dict], list[dict]]:
             continue
 
         entry_time = _serialize_chart_timestamp(
-
             trade.get("entry_time") or trade.get("entry_ts") or trade.get("opened_at")
-
         )
 
         entry_price_raw = trade.get("entry_price") if trade.get("entry_price") is not None else trade.get("entry")
@@ -3368,25 +2662,16 @@ def _build_trade_markers(trades: object) -> tuple[list[dict], list[dict]]:
         if entry_time and entry_price is not None:
 
             entry_markers.append(
-
                 {
-
                     "timestamp": entry_time,
-
                     "price": round(entry_price, 8),
-
                     "label": "Buy",
-
                     "direction": str(trade.get("direction", "long")).strip().lower(),
-
                 }
-
             )
 
         exit_time = _serialize_chart_timestamp(
-
             trade.get("exit_time") or trade.get("exit_ts") or trade.get("closed_at")
-
         )
 
         exit_price_raw = trade.get("exit_price") if trade.get("exit_price") is not None else trade.get("exit")
@@ -3396,33 +2681,18 @@ def _build_trade_markers(trades: object) -> tuple[list[dict], list[dict]]:
         if exit_time and exit_price is not None:
 
             exit_markers.append(
-
                 {
-
                     "timestamp": exit_time,
-
                     "price": round(exit_price, 8),
-
                     "label": "Sell",
-
                     "direction": str(trade.get("direction", "long")).strip().lower(),
-
                 }
-
             )
 
     return entry_markers, exit_markers
 
 
-
-
-
-
-
-
 def _build_chart_strategy_meta(asset: str, timeframe: str, start_date: str | None, end_date: str | None) -> str:
-
-
     meta_parts = [part for part in (str(asset or "").strip(), str(timeframe or "").strip()) if part]
 
     if start_date or end_date:
@@ -3436,54 +2706,20 @@ def _build_chart_strategy_meta(asset: str, timeframe: str, start_date: str | Non
     return " | ".join(meta_parts)
 
 
-
-
-
-
-
-
 def build_backtest_chart_context(
-
-
     *,
-
-
     asset: str,
-
-
     timeframe: str,
-
-
     start_date: str | None,
-
-
     end_date: str | None,
-
-
     strategy_name: str | None,
-
-
     strategy_type: str | None,
-
-
     strategy_params: dict | None,
-
-
     trades: object,
-
-
     strategy_meta: str | None = None,
-
-
     extra_warnings: list[str] | None = None,
-
-
     allow_remote_fallback: bool = True,
-
-
 ) -> dict:
-
-
     warnings = list(extra_warnings or [])
 
     resolved_asset = str(asset or "").strip().upper()
@@ -3495,19 +2731,12 @@ def build_backtest_chart_context(
     warmup_bars = _infer_chart_warmup_bars(resolved_params)
 
     frame, frame_warnings = _load_local_chart_frame(
-
         asset=resolved_asset,
-
         timeframe=resolved_timeframe,
-
         start_date=start_date,
-
         end_date=end_date,
-
         warmup_bars=warmup_bars,
-
         allow_remote_fallback=allow_remote_fallback,
-
     )
 
     warnings.extend(frame_warnings)
@@ -3515,44 +2744,24 @@ def build_backtest_chart_context(
     entry_markers, exit_markers = _build_trade_markers(trades)
 
     main_indicators, sub_indicators, indicator_warnings = _build_chart_indicators(
-
         frame,
-
         str(strategy_type or "").strip(),
-
         resolved_params,
-
     )
 
     warnings.extend(indicator_warnings)
 
     return {
-
         "bars": _frame_to_chart_bars(frame),
-
         "entry_markers": entry_markers,
-
         "exit_markers": exit_markers,
-
         "main_indicators": main_indicators,
-
         "sub_indicators": sub_indicators,
-
         "strategy_name": str(strategy_name or strategy_type or "Strategy").strip() or "Strategy",
-
         "strategy_meta": strategy_meta or _build_chart_strategy_meta(resolved_asset, resolved_timeframe, start_date, end_date),
-
         "strategy_params": resolved_params,
-
         "warnings": _dedupe_chart_messages(warnings),
-
     }
-
-
-
-
-
-
 
 
 def build_strategy_preview_chart_context(
@@ -3664,8 +2873,6 @@ def build_strategy_preview_chart_context(
 
 
 def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict:
-
-
     detail = result_detail if isinstance(result_detail, dict) else {}
 
     config = detail.get("config") if isinstance(detail.get("config"), dict) else {}
@@ -3723,15 +2930,10 @@ def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict
                 resolved_params = core._parse_strategy_params_blob(strategy_row.get("params"))
 
         resolved_type = core._resolve_backtesting_strategy_type(
-
             explicit_type=resolved_type or (strategy_row or {}).get("type"),
-
             strategy_name=strategy_name or strategy_id,
-
             params=resolved_params,
-
             payload=config.get("definition_json"),
-
         )
 
         if strategy_id and (not resolved_params or not resolved_type):
@@ -3745,15 +2947,10 @@ def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict
             if not resolved_type:
 
                 resolved_type = core._resolve_backtesting_strategy_type(
-
                     explicit_type=(audit_context or {}).get("strategy_type"),
-
                     strategy_name=strategy_name or strategy_id,
-
                     params=resolved_params,
-
                     payload=config.get("definition_json"),
-
                 )
 
     except Exception as exc:
@@ -3769,17 +2966,11 @@ def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict
     if not start_date and isinstance(trades, list):
 
         start_candidates = [
-
             _serialize_chart_timestamp(
-
                 trade.get("entry_time") or trade.get("entry_ts") or trade.get("opened_at")
-
             )
-
             for trade in trades
-
             if isinstance(trade, dict)
-
         ]
 
         start_candidates = [candidate for candidate in start_candidates if candidate]
@@ -3791,25 +2982,15 @@ def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict
     if not end_date and isinstance(trades, list):
 
         end_candidates = [
-
             _serialize_chart_timestamp(
-
                 trade.get("exit_time")
-
                 or trade.get("exit_ts")
-
                 or trade.get("closed_at")
-
                 or trade.get("entry_time")
-
                 or trade.get("opened_at")
-
             )
-
             for trade in trades
-
             if isinstance(trade, dict)
-
         ]
 
         end_candidates = [candidate for candidate in end_candidates if candidate]
@@ -3819,39 +3000,20 @@ def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict
             end_date = max(end_candidates)
 
     return build_backtest_chart_context(
-
         asset=asset,
-
         timeframe=timeframe,
-
         start_date=start_date,
-
         end_date=end_date,
-
         strategy_name=strategy_name,
-
         strategy_type=resolved_type,
-
         strategy_params=resolved_params,
-
         trades=trades,
-
         extra_warnings=warnings,
-
         allow_remote_fallback=bool(detail.get("_allow_remote_fallback", True)),
-
     )
 
 
-
-
-
-
-
-
 def _precompute_indicators(df: pd.DataFrame, strategy_type: str, params: dict) -> pd.DataFrame:
-
-
     """Pre-compute all indicators for a built-in strategy type on the full DataFrame.
 
 
@@ -3919,17 +3081,11 @@ def _precompute_indicators(df: pd.DataFrame, strategy_type: str, params: dict) -
         # Support multiple naming conventions for Keltner multiplier
 
         km = float(
-
             p.get("kc_mult") or
-
             p.get("keltner_mult") or
-
             p.get("keltner_multiplier") or
-
             p.get("atr_multiplier") or
-
             2.0
-
         )
 
         d["kc_mid"] = d["close"].ewm(span=kp, adjust=False).mean()
@@ -4059,15 +3215,7 @@ def _precompute_indicators(df: pd.DataFrame, strategy_type: str, params: dict) -
     return d
 
 
-
-
-
-
-
-
 def _compute_adx_filter(df: pd.DataFrame, params: dict) -> pd.Series:
-
-
     """Compute ADX filter based on adx_min and optional adx_max parameters.
 
 
@@ -4138,15 +3286,7 @@ def _compute_adx_filter(df: pd.DataFrame, params: dict) -> pd.Series:
         return df["adx_val"] >= adx_min
 
 
-
-
-
-
-
-
 def _vectorized_signals(df: pd.DataFrame, strategy_type: str, params: dict) -> tuple:
-
-
     """Generate entry/exit boolean Series from pre-computed indicators.
 
 
@@ -4509,15 +3649,7 @@ def _vectorized_directional_signals(
     return signals
 
 
-
-
-
-
-
-
 def _precompute_regimes(df: pd.DataFrame) -> pd.Series:
-
-
     """Pre-compute market regime for every bar using only prefix-causal indicators."""
 
     regimes = pd.Series(RANGE_BOUND, index=df.index)
@@ -4575,15 +3707,7 @@ def _precompute_regimes(df: pd.DataFrame) -> pd.Series:
     return regimes
 
 
-
-
-
-
-
-
 def _strategy_runtime_params(params: dict | None, strategy_obj=None) -> dict:
-
-
     if strategy_obj is not None and isinstance(getattr(strategy_obj, "params", None), dict):
 
         return dict(strategy_obj.params)
@@ -4591,15 +3715,7 @@ def _strategy_runtime_params(params: dict | None, strategy_obj=None) -> dict:
     return dict(params or {})
 
 
-
-
-
-
-
-
 def _strategy_runtime_compatible_regimes(strategy_obj) -> object | None:
-
-
     if strategy_obj is None:
 
         return None
@@ -4613,39 +3729,15 @@ def _strategy_runtime_compatible_regimes(strategy_obj) -> object | None:
     return getattr(strategy_obj, "compatible_regimes", None)
 
 
-
-
-
-
-
-
 def _build_regime_gate_masks(
-
-
     df: pd.DataFrame,
-
-
     strategy_type: str | None,
-
-
     params: dict | None,
-
-
     *,
-
-
     strategy_obj=None,
-
-
     regimes: pd.Series | None = None,
-
-
     regime_gate: bool = True,
-
-
 ) -> tuple[pd.Series, pd.Series, pd.Series | None]:
-
-
     runtime_params = _strategy_runtime_params(params, strategy_obj)
 
     # When regime_gate is disabled (discovery/lab mode), skip all regime
@@ -4658,25 +3750,17 @@ def _build_regime_gate_masks(
         )
 
     compatible_regimes, adx_min, adx_cap = resolve_regime_gate(
-
         str(strategy_type or ""),
-
         runtime_params,
-
         compatible_regimes=_strategy_runtime_compatible_regimes(strategy_obj),
-
     )
 
     if not compatible_regimes and adx_cap is None and adx_min is None:
 
         return (
-
             pd.Series(True, index=df.index, dtype=bool),
-
             pd.Series(False, index=df.index, dtype=bool),
-
             regimes,
-
         )
 
     resolved_regimes = regimes if regimes is not None else _precompute_regimes(df)
@@ -4715,27 +3799,11 @@ def _build_regime_gate_masks(
     return entry_allowed.fillna(False), forced_exit.fillna(False), resolved_regimes
 
 
-
-
-
-
-
-
 def _clamp_ratio(value: float) -> float:
-
-
     return float(np.clip(float(value or 0.0), -_MAX_ABS_RISK_RATIO, _MAX_ABS_RISK_RATIO))
 
 
-
-
-
-
-
-
 def _filter_trades_from_start(trades: list[dict], start_timestamp: object) -> list[dict]:
-
-
     if not trades:
 
         return []
@@ -4761,15 +3829,7 @@ def _filter_trades_from_start(trades: list[dict], start_timestamp: object) -> li
     return filtered
 
 
-
-
-
-
-
-
 def _to_float(value):
-
-
     try:
 
         if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -4783,15 +3843,7 @@ def _to_float(value):
         return None
 
 
-
-
-
-
-
-
 def _index_to_position(value, index: pd.Index) -> int:
-
-
     """Resolve trade entry/exit index values to integer row positions."""
 
     numeric = _to_float(value)
@@ -4839,19 +3891,7 @@ def _index_to_position(value, index: pd.Index) -> int:
         return -1
 
 
-
-
-
-
-
-
-
-
-
-
 def _coerce_bool_series(values, index: pd.Index, label: str) -> pd.Series:
-
-
     """Normalize arbitrary signal payloads into bool Series aligned to index."""
 
     if isinstance(values, pd.Series):
@@ -4865,9 +3905,7 @@ def _coerce_bool_series(values, index: pd.Index, label: str) -> pd.Series:
     if len(series) != len(index):
 
         raise ValueError(
-
             f"{label} length mismatch: expected {len(index)} rows, got {len(series)}"
-
         )
 
     if not series.index.equals(index):
@@ -4879,9 +3917,7 @@ def _coerce_bool_series(values, index: pd.Index, label: str) -> pd.Series:
         if missing:
 
             raise ValueError(
-
                 f"{label} index mismatch: {missing} rows could not be aligned to price index"
-
             )
 
     return series.fillna(False).astype(bool)
@@ -5842,58 +4878,21 @@ def run_strategy_execution(
     )
 
 
-
-
-
-
-
-
-
-
-
-
 def _run_signal_backtest(
-
-
     df: pd.DataFrame,
-
-
     signal_payload,
-
-
     warmup: int,
-
-
     leverage: float,
-
-
     *,
-
-
     with_regimes: bool = False,
-
-
     regimes: pd.Series | None = None,
-
-
     signal_source: str = "unknown",
-
-
     fee_bps: float = 4.5,
-
-
     slippage_bps: float = 2.0,
-
-
     trade_mode: str = "long_only",
-
     execution_controls: dict | None = None,
-
     initial_capital: float = 10000.0,
-
 ) -> list[dict]:
-
-
     """Run backtest with pre-computed directional signals."""
 
     d = df.copy()
@@ -5927,31 +4926,13 @@ def _run_signal_backtest(
     return trades
 
 
-
-
-
-
-
-
 def _run_vectorized_backtest(
-
-
     df: pd.DataFrame, strategy_type: str, params: dict,
-
-
     warmup: int, leverage: float, *, with_regimes: bool = False,
-
-
     fee_bps: float = 4.5, slippage_bps: float = 2.0,
-
-
     strategy_obj=None, regime_gate: bool = True, trade_mode: str = "long_only",
-
     execution_controls: dict | None = None, initial_capital: float = 10000.0,
-
 ) -> list[dict]:
-
-
     """Run backtest using pre-computed vectorized directional signals."""
 
     runtime_params = _strategy_runtime_params(params, strategy_obj)
@@ -5984,19 +4965,12 @@ def _run_vectorized_backtest(
     regime_series = _precompute_regimes(d) if with_regimes else None
 
     entry_allowed, forced_exit, regime_series = _build_regime_gate_masks(
-
         d,
-
         strategy_type,
-
         runtime_params,
-
         strategy_obj=strategy_obj,
-
         regimes=regime_series,
-
         regime_gate=regime_gate,
-
     )
 
     signals.long_entries = signals.long_entries & entry_allowed
@@ -6005,62 +4979,32 @@ def _run_vectorized_backtest(
     signals.short_exits = signals.short_exits | forced_exit
 
     return _run_signal_backtest(
-
         d,
-
         signals,
-
         warmup,
-
         leverage,
-
         with_regimes=with_regimes,
-
         regimes=regime_series,
-
         signal_source=f"built-in:{strategy_type}",
-
         fee_bps=fee_bps,
-
         slippage_bps=slippage_bps,
-
         trade_mode=trade_mode,
-
         execution_controls=execution_controls,
-
         initial_capital=initial_capital,
-
     )
 
 
-
-
-
-
-
-
 def _run_remote_backtest(
-
-
     strategy_id: str, asset: str, strategy_type: str, params: dict, bars: int, url: str,
     trade_mode: str | None = None,
-
-
 ):
-
-
     import httpx
 
     payload = {
-
         "strategy_code": strategy_type,
-
         "symbol": asset,
-
         "timeframe": "1h",
-
         "parameters": params,
-
     }
     if trade_mode:
         payload["trade_mode"] = trade_mode
@@ -6096,52 +5040,27 @@ def _run_remote_backtest(
         remote_oos = {}
 
     mapped_metrics = {
-
         "in_sample": remote_is,
-
         "out_of_sample": remote_oos,
-
         "robustness": 0.95,
-
         "total_trades": rm.get("total_trades", 0),
-
         "sharpe": rm.get("sharpe_ratio", 0.0),
-
         "max_drawdown_pct": rm.get("max_drawdown_pct", 0.0),
-
         "profit_factor": rm.get("profit_factor", 0.0),
-
         "total_return_pct": rm.get("total_return_pct", 0.0),
-
         "win_rate": rm.get("win_rate_pct", 0.0) / 100.0,
-
     }
 
     return {
-
         "trades": [],
-
         "metrics": mapped_metrics,
-
         "bars": bars,
-
         "asset": asset,
-
         "start_date": "2024-01-01T00:00:00Z",
-
         "end_date": datetime.now(timezone.utc).isoformat(),
-
         "is_remote": True,
-
         "remote_run_id": data.get("run_id")
-
     }
-
-
-
-
-
-
 
 
 def resolve_default_leverage(settings: dict | None = None) -> float:
@@ -6178,65 +5097,27 @@ def resolve_leverage(params: dict | None, explicit: float | None = None, *, sett
 
 
 def backtest_strategy(
-
-
     strategy_id: str,
-
-
     asset: str,
-
-
     strategy_type: str,
-
-
     params: dict,
-
-
     bars: int | None = None,
-
-
     leverage: float | None = None,
-
-
     timeframe: str | None = None,
-
-
     fee_bps: float | None = None,
-
-
     slippage_bps: float | None = None,
-
-
     persist_legacy_run: bool = True,
-
-
     candles_df: "pd.DataFrame | None" = None,
-
-
     regime_gate: bool = True,
-
-
     trade_mode: TradeMode | None = None,
-
-
     allow_shorting: bool | None = None,
-
-
     sync_strategy_state: bool = True,
-
     start_date: str | None = None,
-
     end_date: str | None = None,
-
     initial_capital: float | None = None,
-
     execution_controls: dict | None = None,
-
     as_of: str | None = None,
-
 ) -> dict:
-
-
     """Run a backtest for a single strategy over historical candles.
 
 
@@ -6342,13 +5223,9 @@ def backtest_strategy(
         family_strategy_type = resolved_family_type
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
         original_strategy_type,
-
         params,
-
         allow_uncertified=True,
-
     )
 
     if validation_error:
@@ -6440,25 +5317,15 @@ def backtest_strategy(
         resolved_initial_capital = 10000.0
 
     log.info(
-
         "Backtesting %s (%s %s, %d bars @ %s, trade_mode=%s, fee=%.2f bps, slippage=%.2f bps)",
-
         strategy_id,
-
         asset,
-
         strategy_type,
-
         resolved_bars,
-
         resolved_timeframe,
-
         resolved_trade_mode,
-
         resolved_fee_bps,
-
         resolved_slippage_bps,
-
     )
 
     # Check settings for remote engine delegation
@@ -6494,11 +5361,8 @@ def backtest_strategy(
                         run_id = next_container_id(conn, "B")
 
                         conn.execute(
-
                             "INSERT INTO backtest_runs (run_id, strategy_id, is_metrics_json, oos_metrics_json, robustness_score) VALUES (?, ?, ?, ?, ?)",
-
                             (run_id, strategy_id, json.dumps(remote_res["metrics"]["in_sample"]), json.dumps(remote_res["metrics"]), remote_res["metrics"]["robustness"])
-
                         )
 
                 except (sqlite3.Error, TypeError, KeyError) as exc:
@@ -6514,57 +5378,32 @@ def backtest_strategy(
                         remote_metrics = remote_res.get("metrics", {}) if isinstance(remote_res, dict) else {}
 
                         remote_config = {
-
                             "strategy_id": strategy_id,
-
                             "strategy_type": original_strategy_type,
-
                             "symbol": asset,
-
                             "asset": asset,
-
                             "timeframe": str(params.get("timeframe") or resolved_timeframe),
-
                             "params": params,
-
                             "start": str(remote_res.get("start_date") or ""),
-
                             "end": str(remote_res.get("end_date") or ""),
-
                             "bars": int(resolved_bars),
-
                             "leverage": float(leverage),
-
                             "trade_mode": resolved_trade_mode,
-
                             "position_model": remote_metrics.get("position_model"),
-
                             "is_remote": True,
-
                             "remote_run_id": remote_res.get("remote_run_id"),
-
                         }
 
                         _persist_backtest_result_row(
-
                             result_id=run_id,
-
                             strategy_id=strategy_id,
-
                             result_type="backtest",
-
                             symbol=asset,
-
                             timeframe=str(params.get("timeframe") or resolved_timeframe),
-
                             start_date=str(remote_res.get("start_date") or "").strip() or None,
-
                             end_date=str(remote_res.get("end_date") or "").strip() or None,
-
                             metrics=remote_metrics,
-
                             config={k: v for k, v in remote_config.items() if v is not None},
-
                         )
 
                     except Exception as exc:
@@ -6580,13 +5419,9 @@ def backtest_strategy(
             if sync_strategy_state:
 
                 _sync_strategy_metrics_and_promote_if_eligible(
-
                     strategy_id,
-
                     remote_metrics,
-
                     promotion_reason="Auto-promoted after remote backtest gate pass",
-
                 )
 
             return remote_res
@@ -6707,9 +5542,7 @@ def backtest_strategy(
             ts_col = ts_col.ffill().bfill().astype("int64")
 
         df['funding_rate'] = ts_col.apply(
-
             lambda ts: get_funding_for_backtest(asset.replace('-USDT', '').replace('/', ''), int(ts))
-
         )
 
     warmup = 210  # minimum bars needed for EMA200
@@ -6849,71 +5682,41 @@ def backtest_strategy(
     robustness_score = round(1.0 - max(0.0, degradation), 3)
 
     metrics = {
-
         "in_sample": is_metrics,
-
         "out_of_sample": oos_metrics,
-
         "robustness": robustness_score,
-
         # Flatten primary keys for legacy compatibility
         # NOTE: These top-level fields use OOS values. Gate functions (brain.py)
         # should read from the nested "in_sample"/"out_of_sample" dicts for
         # accurate IS vs OOS metrics. See brain.py check_s9100200_guardrails().
-
         "funding_applied": bool(oos_metrics.get("funding_applied", False)),
-
         "funding_complete": bool(oos_metrics.get("funding_complete", True)),
-
         "total_trades": oos_metrics.get("total_trades", 0),
-
         "breakeven_trades": oos_metrics.get("breakeven_trades", 0),
-
         "sharpe": oos_sharpe,
-
         "sharpe_is_reliable": bool(oos_metrics.get("sharpe_is_reliable", False)),
-
         # Surface Sortino top-level too (mirrors "sharpe") so the execution-profile
         # selector's --objective sortino actually scores by Sortino instead of
         # silently falling back to Sharpe.
         "sortino": oos_metrics.get("sortino", 0.0),
-
         "max_drawdown_pct": oos_metrics.get("max_drawdown_pct", 0.0),
-
         "profit_factor": oos_metrics.get("profit_factor", 0.0),
-
         "profit_factor_is_infinite": bool(oos_metrics.get("profit_factor_is_infinite", False)),
-
         "total_return_pct": oos_metrics.get("total_return_pct", 0.0),
-
         "win_rate": oos_metrics.get("win_rate", 0.0),
-
         "avg_trade_pct": oos_metrics.get("avg_trade_pct", 0.0),
-
         "avg_bars_held": oos_metrics.get("avg_bars_held", 0.0),
-
         "gross_profit": oos_metrics.get("gross_profit", 0.0),
-
         "gross_loss": oos_metrics.get("gross_loss", 0.0),
-
         "monthly_return_pct": oos_metrics.get("monthly_return_pct"),
-
         "annualized_return_pct": oos_metrics.get("annualized_return_pct"),
-
         "annualized_return_reliable": bool(oos_metrics.get("annualized_return_reliable", False)),
-
         "backtest_months": oos_metrics.get("backtest_months"),
-
         "trade_mode": resolved_trade_mode,
-
         "position_model": "hedged" if resolved_trade_mode == "both" else "single_side",
-
         "by_side": dict(oos_metrics.get("by_side") or {}),
-
         "start_date": oos_metrics.get("start_date"),
-
         "end_date": oos_metrics.get("end_date"),
-
     }
 
     # Enrichment coverage: persisted with the metrics so funding-blind windows
@@ -6929,11 +5732,8 @@ def backtest_strategy(
     metrics["taker_ratio_coverage_pct"] = _enrichment_coverage_pct(df, "taker_buy_sell_ratio")
 
     log.info(
-
         "Backtest %s: Robustness: %.2f | IS Sharpe=%.2f, OOS Sharpe=%.2f | OOS Trades=%d, Return=%.1f%%",
-
         strategy_id, robustness_score, is_sharpe, oos_sharpe, len(oos_trades), oos_metrics.get("total_return_pct", 0) * 100,
-
     )
 
     # Build equity curve and buy-and-hold benchmark from OOS close prices.
@@ -6975,33 +5775,19 @@ def backtest_strategy(
         metrics["data_source"] = data_source
 
     result = {
-
         "trades": oos_trades, # returns OOS trades for UI visualization
-
         "metrics": metrics,
-
         "bars": bars,
-
         "asset": asset,
-
         "data_source": data_source,
-
         "start_date": data_start,
-
         "end_date": data_end,
-
         "trade_mode": resolved_trade_mode,
-
         "position_model": "hedged" if resolved_trade_mode == "both" else "single_side",
-
         "equity_curve": equity_curve,
-
         "benchmark_curve": benchmark_curve,
-
         "equity_curve_full": full_equity_curve,
-
         "benchmark_curve_full": full_benchmark_curve,
-
     }
 
     if risk_parity_warning:
@@ -7023,11 +5809,8 @@ def backtest_strategy(
                 run_id = next_container_id(conn, "B")
 
                 conn.execute(
-
                     "INSERT INTO backtest_runs (run_id, strategy_id, is_metrics_json, oos_metrics_json, robustness_score) VALUES (?, ?, ?, ?, ?)",
-
                     (run_id, strategy_id, json.dumps(is_metrics), json.dumps(oos_metrics), robustness_score)
-
                 )
 
         except (sqlite3.Error, TypeError, KeyError) as exc:
@@ -7047,61 +5830,35 @@ def backtest_strategy(
             from forven.api_core import _persist_backtest_result_row, _write_backtest_result_artifacts
 
             backtest_config = {
-
                 "strategy_id": strategy_id,
-
                 "strategy_type": original_strategy_type,
-
                 "symbol": asset,
-
                 "asset": asset,
-
                 "timeframe": str(params.get("timeframe") or oos_metrics.get("timeframe") or resolved_timeframe),
-
                 "params": params,
-
                 "start": data_start,
-
                 "end": data_end,
-
                 "evaluation_start": str(oos_metrics.get("start_date") or ""),
-
                 "evaluation_end": str(oos_metrics.get("end_date") or ""),
-
                 "bars": int(bars),
-
                 "warmup": int(warmup),
-
                 "leverage": float(leverage),
-
                 "trade_mode": resolved_trade_mode,
-
                 "position_model": "hedged" if resolved_trade_mode == "both" else "single_side",
-
             }
 
             try:
 
                 _persist_backtest_result_row(
-
                     result_id=run_id,
-
                     strategy_id=strategy_id,
-
                     result_type="backtest",
-
                     symbol=asset,
-
                     timeframe=str(backtest_config["timeframe"]),
-
                     start_date=data_start,
-
                     end_date=data_end,
-
                     metrics=metrics,
-
                     config={k: v for k, v in backtest_config.items() if v is not None},
-
                 )
 
             except Exception as row_exc:
@@ -7113,13 +5870,9 @@ def backtest_strategy(
             try:
 
                 _write_backtest_result_artifacts(
-
                     run_id, run_id, oos_trades,
-
                     equity_curve=result.get("equity_curve"),
-
                     benchmark_curve=result.get("benchmark_curve"),
-
                 )
 
             except Exception as artifact_exc:
@@ -7132,13 +5885,9 @@ def backtest_strategy(
 
     if sync_strategy_state:
         _sync_strategy_metrics_and_promote_if_eligible(
-
             strategy_id,
-
             metrics,
-
             promotion_reason="Auto-promoted after backtest gate pass",
-
         )
 
     # Feed the quant-skills learning loop (fire-and-forget)
@@ -7176,29 +5925,17 @@ def backtest_strategy(
             storage_metrics["sharpe"] = oos_sharpe
 
             record_backtest_for_learning(
-
                 strategy_id=strategy_id,
-
                 asset=asset,
-
                 strategy_type=original_strategy_type,
-
                 params=params,
-
                 metrics=storage_metrics,
-
                 fitness=fitness,
-
                 result_id=run_id,
-
                 job_id=run_id,
-
                 strategy_name=strategy_id,
-
                 config=backtest_config,
-
                 definition_json=strategy_definition,
-
             )
 
         except Exception as e:
@@ -7212,12 +5949,6 @@ def backtest_strategy(
             )
 
     return result
-
-
-
-
-
-
 
 
 def _downsample_curve(curve: list[dict], max_points: int = 2000) -> list[dict]:
@@ -7251,20 +5982,10 @@ def _downsample_curve(curve: list[dict], max_points: int = 2000) -> list[dict]:
 
 
 def _build_closed_trade_equity_curve(
-
-
     trades: list[dict],
-
-
     df: "pd.DataFrame",
-
-
     initial_capital: float = 10000.0,
-
-
 ) -> list[dict]:
-
-
     """Build a timestamped equity curve by replaying trades over the OOS price series.
 
 
@@ -7495,24 +6216,10 @@ def _build_equity_curve_from_trades(
     return curve
 
 
-
-
-
-
-
-
 def _build_buy_and_hold_curve(
-
-
     df: "pd.DataFrame",
-
-
     initial_capital: float = 10000.0,
-
-
 ) -> list[dict]:
-
-
     """Build a buy-and-hold equity curve from close prices.
 
 
@@ -7551,45 +6258,17 @@ def _build_buy_and_hold_curve(
     return curve
 
 
-
-
-
-
-
-
 def compute_metrics(
-
-
     trades: list[dict],
-
-
     total_bars: int = 720,
-
-
     *,
-
-
     timeframe: str = "1h",
-
-
     start_date: str | None = None,
-
-
     end_date: str | None = None,
-
-
     trade_mode: str | None = None,
-
-
     symbol: str | None = None,
-
-
     equity_curve: list[dict] | None = None,
-
-
 ) -> dict:
-
-
     """Compute performance metrics from a list of trades."""
 
     metrics = _compute_basic_metrics(
@@ -7662,12 +6341,6 @@ def compute_metrics(
     return metrics
 
 
-
-
-
-
-
-
 def _compute_basic_metrics(
     trades: list[dict],
     total_bars: int,
@@ -7676,50 +6349,29 @@ def _compute_basic_metrics(
     symbol: str | None = None,
     equity_curve: list[dict] | None = None,
 ) -> dict:
-
-
     """Compute base performance metrics from a list of trades."""
 
     if not trades:
 
         return {
-
             "total_trades": 0,
-
             "wins": 0,
-
             "losses": 0,
-
             "breakeven_trades": 0,
-
             "win_rate": 0,
-
             "sharpe": 0,
-
             "sharpe_is_reliable": False,
-
             "sortino": 0,
-
             "trade_sharpe": 0,
-
             "trade_sortino": 0,
-
             "max_drawdown_pct": 0,
-
             "profit_factor": 0,
-
             "profit_factor_is_infinite": False,
-
             "total_return_pct": 0,
-
             "avg_trade_pct": 0,
-
             "avg_bars_held": 0,
-
             "gross_profit": 0,
-
             "gross_loss": 0,
-
         }
 
     pnls = [t.get("pnl_pct", 0) for t in trades]
@@ -7892,79 +6544,40 @@ def _compute_basic_metrics(
     funding_complete = all(bool(t.get("funding_complete", True)) for t in trades)
 
     return {
-
         "funding_applied": funding_applied,
-
         "funding_complete": funding_complete,
-
         "total_trades": len(trades),
-
         "wins": len(wins),
-
         "losses": len(losses),
-
         "breakeven_trades": len(breakevens),
-
         "win_rate": round(win_rate, 4),
-
         "sharpe": round(float(sharpe), 3),
-
         "sharpe_is_reliable": sharpe_is_reliable,
-
         "sortino": round(float(sortino), 3),
-
         # Trade-based (event) Sharpe/Sortino preserved for diagnostics/DSR — equals
         # `sharpe`/`sortino` on the legacy no-curve path, differs when the bar-level
         # calendar value is primary. See the bar-level block above.
         "trade_sharpe": round(float(trade_sharpe), 3),
-
         "trade_sortino": round(float(trade_sortino), 3),
-
         "max_drawdown_pct": round(float(max_drawdown), 5),
-
         "profit_factor": (
             float("inf") if profit_factor_is_infinite else round(float(profit_factor), 3)
         ),
-
         "profit_factor_is_infinite": profit_factor_is_infinite,
-
         "total_return_pct": round(total_return, 5),
-
         "avg_trade_pct": round(np.mean(pnls), 5) if pnls else 0,
-
         "avg_bars_held": round(float(avg_bars), 1),
-
         "gross_profit": round(gross_profit, 5),
-
         "gross_loss": round(gross_loss, 5),
-
     }
 
 
-
-
-
-
-
-
 def _compute_backtest_months(
-
-
     start_date: str | None,
-
-
     end_date: str | None,
-
-
     total_bars: int,
-
-
     timeframe: str = "1h",
-
-
 ) -> float:
-
-
     """Estimate backtest span in months from timestamps, falling back to bar count.
 
     The bar-count fallback is TIMEFRAME-AWARE: a bar is not always one hour. Using a
@@ -8004,15 +6617,7 @@ def _compute_backtest_months(
     return float(total_bars) / bars_per_year * 12.0
 
 
-
-
-
-
-
-
 def _compound_monthly_return(total_return_pct: float, months: float) -> float:
-
-
     """Compute monthly return from total return using CAGR-style compounding.
 
 
@@ -8041,15 +6646,7 @@ def _compound_monthly_return(total_return_pct: float, months: float) -> float:
     return growth ** (1.0 / months) - 1.0
 
 
-
-
-
-
-
-
 def _annualized_return(total_return_pct: float, months: float) -> float:
-
-
     """Compute annualized return from total return using CAGR-style compounding.
 
 
@@ -8081,15 +6678,7 @@ def _annualized_return(total_return_pct: float, months: float) -> float:
     return math.exp(min(exponent, math.log(1_000_001.0))) - 1.0
 
 
-
-
-
-
-
-
 def _detect_entry_regime(window) -> str:
-
-
     """Classify regime at a specific backtest entry bar using regime.py logic."""
 
     if len(window) < 210:
@@ -8146,66 +6735,26 @@ def _detect_entry_regime(window) -> str:
     return RANGE_BOUND
 
 
-
-
-
-
-
-
 def walk_forward(
-
-
     strategy_id: str,
-
-
     asset: str,
-
-
     strategy_type: str,
-
-
     params: dict,
-
-
     total_bars: int | None = None,
-
-
     in_sample_pct: float | None = None,
-
-
     n_splits: int | None = None,
-
-
     leverage: float | None = None,
-
-
     fee_bps: float | None = None,
-
-
     slippage_bps: float | None = None,
-
-
     start_date: str | None = None,
-
-
     end_date: str | None = None,
-
     timeframe: str | None = None,
-
-
     trade_mode: TradeMode | None = None,
-
-
     allow_shorting: bool | None = None,
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
-
     as_of: str | None = None,
-
-
 ) -> dict:
-
-
     """Chronological rolling-origin validation for a fixed parameter set.
 
 
@@ -8295,13 +6844,9 @@ def walk_forward(
     family_strategy_type = resolve_strategy_family(original_strategy_type)
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
         original_strategy_type,
-
         params,
-
         allow_uncertified=True,
-
     )
 
     if validation_error:
@@ -8546,39 +7091,23 @@ def walk_forward(
         )
 
     log.info(
-
         "Walk-forward: %s (%s %s, %d bars, %d splits @ %s)",
-
         strategy_id,
-
         asset,
-
         strategy_type,
-
         resolved_total_bars,
-
         resolved_n_splits,
-
         resolved_timeframe,
-
     )
 
     df = load_backtest_candles(
-
         asset=asset,
-
         bars=resolved_total_bars,
-
         timeframe=resolved_timeframe,
-
         start_date=start_date,
-
         end_date=end_date,
-
         warmup_bars=210,
-
         as_of=as_of,
-
     )
 
     # Apply bar cap after loading — when date ranges produce too many bars,
@@ -8770,41 +7299,23 @@ def walk_forward(
     robust = degradation < 0.5 and agg_oos.get("total_trades", 0) >= 5
 
     result = {
-
         "splits": splits,
-
         "aggregate_oos": agg_oos,
-
         "avg_is_sharpe": round(float(avg_is_sharpe), 3),
-
         "avg_oos_sharpe": round(float(avg_oos_sharpe), 3),
-
         "degradation": round(float(degradation), 3),
-
         "robust": robust,
-
         "verdict": "PASS" if robust else "FAIL",
-
         "symbol": asset,
-
         "timeframe": resolved_timeframe,
-
         "trade_mode": resolved_trade_mode,
-
         "position_model": "hedged" if resolved_trade_mode == "both" else "single_side",
-
         "start_date": df.index[0].isoformat() if len(df) else start_date,
-
         "end_date": df.index[-1].isoformat() if len(df) else end_date,
-
         "cv_method": worker_result.get("cv_method", resolved_cv_method),
-
         "purge_bars": worker_result.get("purge_bars", resolved_purge_gap),
-
         "embargo_bars": worker_result.get("embargo_bars", 0),
-
         "as_of": as_of,
-
     }
 
     if risk_parity_warning:
@@ -8812,25 +7323,14 @@ def walk_forward(
         result["warning"] = risk_parity_warning
 
     log.info(
-
         "Walk-forward %s: IS Sharpe=%.2f OOS Sharpe=%.2f degradation=%.0f%% â†’ %s",
-
         strategy_id, avg_is_sharpe, avg_oos_sharpe, degradation * 100, result["verdict"],
-
     )
 
     return result
 
 
-
-
-
-
-
-
 def _resolve_strategy_vectorized_signals(strategy_obj, df: pd.DataFrame):
-
-
     """Return optional strategy-provided vectorized signals."""
 
     if strategy_obj is None or not hasattr(strategy_obj, "generate_signals"):
@@ -8865,34 +7365,15 @@ def _resolve_strategy_vectorized_signals(strategy_obj, df: pd.DataFrame):
     )
 
 
-
-
-
-
-
-
 def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
-
-
                      strategy_obj=None, strategy_type: str | None = None,
-
-
                      fee_bps: float = 4.5, slippage_bps: float = 2.0,
-
-
                      regime_gate: bool = True, trade_mode: str = "long_only",
-
                      execution_controls: dict | None = None,
-
                      initial_capital: float = 10000.0,
-
                      asset: str | None = None,
-
                      resolved_timeframe: str | None = None,
-
                      include_funding: bool = False) -> list[dict]:
-
-
     """Run signal checker across a dataframe window and collect trades.
 
     ``include_funding`` (backtest opt-in): when True, the kernel path accrues perp funding
@@ -8948,32 +7429,19 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
         try:
 
             return _run_vectorized_backtest(
-
                 df,
-
                 strategy_type,
-
                 runtime_params,
-
                 warmup,
-
                 leverage,
-
                 with_regimes=True,
-
                 fee_bps=fee_bps,
-
                 slippage_bps=slippage_bps,
-
                 strategy_obj=strategy_obj,
-
                 regime_gate=regime_gate,
                 trade_mode=trade_mode,
-
                 execution_controls=execution_controls,
-
                 initial_capital=initial_capital,
-
             )
 
         except RuntimeError as exc:
@@ -9001,19 +7469,12 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
     regimes = _precompute_regimes(d)
 
     entry_allowed, forced_exit, regimes = _build_regime_gate_masks(
-
         d,
-
         strategy_type or getattr(strategy_obj, "strategy_type", None),
-
         runtime_params,
-
         strategy_obj=strategy_obj,
-
         regimes=regimes,
-
         regime_gate=regime_gate,
-
     )
 
     if trade_mode == "both":
@@ -9141,17 +7602,11 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
                 continue
 
             active_trade = {
-
                 "entry_bar": fill_idx,
-
                 "entry_price": price,
-
                 "entry_time": str(d.index[fill_idx]),
-
                 "direction": active_direction,
-
                 "regime": regimes.iloc[idx] if len(regimes) > idx else RANGE_BOUND,
-
             }
 
             continue
@@ -9165,21 +7620,13 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
         pnl_pct = ((price - entry_price) / entry_price) * _trade_direction_sign(active_direction) * leverage - round_trip_drag
 
         trade = {
-
             "entry_bar": int(active_trade["entry_bar"]),
-
             "entry_price": entry_price,
-
             "exit_price": price,
-
             "entry_time": str(active_trade["entry_time"]),
-
             "exit_time": str(d.index[fill_idx]),
-
             "bars_held": max(0, fill_idx - int(active_trade["entry_bar"])),
-
             "pnl_pct": round(float(pnl_pct), 5),
-
             "direction": active_direction,
             "trade_mode": trade_mode,
             "position_model": "single_side",
@@ -9190,9 +7637,7 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             # max_drawdown_pct and mis-scaling the bar-level Sharpe. Both are direct
             # gate inputs. The kernel/vectorized paths already stamp this.
             "leverage": float(leverage),
-
             "regime": active_trade.get("regime", RANGE_BOUND),
-
         }
 
         trades.append(trade)
@@ -9210,48 +7655,26 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
         pnl_pct = ((exit_price - entry_price) / entry_price) * _trade_direction_sign(active_direction) * leverage - round_trip_drag
 
         trades.append(
-
             {
-
                 "entry_bar": int(active_trade["entry_bar"]),
-
                 "entry_price": entry_price,
-
                 "exit_price": exit_price,
-
                 "entry_time": str(active_trade["entry_time"]),
-
                 "exit_time": str(d.index[final_idx]),
-
                 "bars_held": max(0, final_idx - int(active_trade["entry_bar"])),
-
                 "pnl_pct": round(float(pnl_pct), 5),
-
                 "direction": active_direction,
                 "trade_mode": trade_mode,
                 "position_model": "single_side",
                 # Same stamp as the in-loop exit above — the force-close leg must not
                 # mark at 1x either (mtm-curve-ignores-leverage-on-slowpath-trades).
                 "leverage": float(leverage),
-
                 "regime": active_trade.get("regime", RANGE_BOUND),
-
                 "open_at_end": True,
-
             }
-
         )
 
     return trades
-
-
-
-
-
-
-
-
-
 
 
 def preview_strategy_signals(
@@ -9382,8 +7805,6 @@ def preview_strategy_signals(
 
 
 def backtest_all(bars: int = 720) -> dict:
-
-
     """Backtest all hardcoded strategies and return results."""
 
     if not isinstance(bars, int) or isinstance(bars, bool) or bars <= 0:
@@ -9396,21 +7817,13 @@ def backtest_all(bars: int = 720) -> dict:
         try:
 
             result = backtest_strategy(
-
                 strategy_id=strat_id,
-
                 asset=strat["asset"],
-
                 strategy_type=strat["type"],
-
                 params=strat["params"],
-
                 bars=bars,
-
                 leverage=strat["params"].get("leverage", 3.0),
-
                 regime_gate=False,
-
             )
 
             results[strat_id] = result
@@ -9426,15 +7839,7 @@ def backtest_all(bars: int = 720) -> dict:
     return results
 
 
-
-
-
-
-
-
 def save_backtest_results(results: dict):
-
-
     """Save backtest results to the strategies table in SQLite."""
 
     init_db()
@@ -9471,15 +7876,12 @@ def save_backtest_results(results: dict):
                     continue
 
                 conn.execute(
-
                     """UPDATE strategies
                        SET metrics = ?, updated_at = ?
                        WHERE id = ?
                          AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
                              ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
-
                     (json.dumps(metrics), now, strat_id),
-
                 )
 
             else:
@@ -9491,55 +7893,18 @@ def save_backtest_results(results: dict):
                 _cert = certify_execution_strategy(str(strat.get("type", "")), _strat_params)
 
                 created_id, _, _ = create_strategy_container(
-
                     conn=conn,
-
                     name=str(strat.get("name", strat_id)),
-
                     type_=str(strat.get("type", "")),
-
                     symbol=str(strat.get("asset", "")),
-
                     timeframe="1h",
-
                     params=_strat_params,
-
                     stage=resolve_initial_stage(_cert),
-
                 )
 
                 conn.execute(
-
                     "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
-
                     (json.dumps(metrics), now, created_id),
-
                 )
 
     log.info("Saved backtest results for %d strategies", len(results))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

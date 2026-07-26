@@ -13,19 +13,31 @@ behaviour-neutral four ways: identical non-blank line sequence, identical
 ``ast.dump(..., include_attributes=False)``, identical compiled opcode stream,
 and byte-identical docstrings and comments.
 
-These tests keep it collapsed. The invariant deliberately covers only blank runs
-INSIDE a function or method body:
+These tests keep it collapsed. The invariant here deliberately covers only blank
+runs INSIDE a function or method body:
 
-  * blank lines BETWEEN top-level definitions are left alone — PEP 8 wants two
-    there, and this suite must not fight the style guide;
+  * blank lines BETWEEN top-level definitions are not this file's business — but
+    they are no longer unguarded: a later pass found 70 runs of THREE OR MORE
+    between top-level defs (PEP 8 wants *exactly* two, and 58 of them were runs
+    of eight) and collapsed them. That property, the def-signature gap, and
+    blank lines inside brackets now live in ``tests/test_finish_formatting.py``;
   * blank lines inside string literals and docstrings are untouchable — they are
     payload, not formatting, so string regions are found with ``tokenize``
-    rather than a regex that cannot tell code from a triple-quoted block.
+    rather than a regex that cannot tell code from a triple-quoted block. This
+    is not hypothetical: the finishing pass's first draft rewrote a
+    whitespace-only line inside ``_kill_executor_processes``'s docstring, and
+    only the AST/docstring proof caught it.
 
-The equivalent linter rule is pycodestyle E303 (``too-many-blank-lines``), but
-in ruff 0.15 E303 is preview-gated, so enabling it means turning on preview for
-the whole repo. Until that config lands (see the ARCH-10 handoff note), this
-file is the gate.
+The equivalent linter rule is pycodestyle E303 (``too-many-blank-lines``). It is
+now measured for real, in a scoped subprocess, by
+``tests/test_finish_formatting.py`` — it is still not in pyproject's ``select``
+because reaching it requires repo-wide ``preview = true``, which switches ruff's
+concise output from rule CODES to rule NAMES and thereby breaks one ruff-output
+gate and silently blinds another. See that module's docstring for the evidence.
+
+These AST checks are NOT redundant with E303. E303 works on logical lines, so it
+is structurally blind to blank lines inside a bracketed continuation — the very
+shape that accounted for 1,082 of the engine's blank lines.
 """
 
 from __future__ import annotations
@@ -47,10 +59,15 @@ GUARDED = (
     "forven/scanner.py",
 )
 
-# backtest.py sits at 38.8% after the collapse. The ceiling leaves real headroom
-# for new docstrings and comments while still tripping long before the file can
-# drift back toward the 51.9% that hid the dead execution loop.
-MAX_BLANK_RATIO = {"forven/strategies/backtest.py": 0.45, "forven/scanner.py": 0.15}
+# backtest.py: 51.9% blank originally, 38.8% after the in-body collapse, 26.2%
+# (2,073 of 7,910) after the finishing pass took the top-level, def-signature,
+# in-bracket and EOF runs. The ceiling is ratcheted down with it — a ceiling
+# with 19 points of slack gates nothing. 0.35 still leaves room for ~1,000 new
+# blank lines of docstrings and comments before it trips.
+#
+# Ratchet these DOWN as the files improve; never up. If a legitimate change
+# needs more headroom, that is a conversation, not a one-line edit.
+MAX_BLANK_RATIO = {"forven/strategies/backtest.py": 0.35, "forven/scanner.py": 0.15}
 
 
 def _function_body_lines(tree: ast.AST) -> set[int]:

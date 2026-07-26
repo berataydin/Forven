@@ -102,6 +102,33 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
+# ARCH-10 — why E303 (`too-many-blank-lines`) is NOT in `select` below, even
+# though it is exactly the rule this repo wants. Measured on ruff 0.15.18:
+#
+#   * E303 is preview-gated, and ruff has no per-rule preview opt-in. Selecting
+#     it without `preview = true` is a FAKE GATE: ruff prints
+#     "warning: Selection `E303` has no effect because preview is not enabled"
+#     and exits 0. Worse than absent — it reads as enforced.
+#   * Turning on `preview = true` switches `--output-format concise` from rule
+#     CODES to rule NAMES ("F401 ..." becomes "unused-import: ..."). Two tests
+#     shell out to ruff and grep its output for a code:
+#       - tests/test_harden_infra.py::
+#           test_test9_api_core_blocking_sleep_stays_a_single_known_instance
+#         greps for "ASYNC251", finds 0, and HARD FAILS its `== 1` pin.
+#       - tests/test_arch_api_core.py::test_api_core_has_no_unused_locals_left
+#         greps for "F841" and asserts none — under preview it matches nothing,
+#         so it stays green while checking NOTHING. A silently blinded gate on
+#         the app's hottest module is the worse of the two outcomes.
+#     Preview also costs 3 new ASYNC119 diagnostics needing their own baseline.
+#
+# So enabling it is a three-file atomic change (this file + both test files),
+# and the ARCH-10 group owns none of the two test files — the same
+# "must land in the SAME commit" constraint already documented at the
+# api_core.py ASYNC251 sleep. Until that lands, the rule is enforced by
+# tests/test_finish_formatting.py, which runs the REAL E303 in its own
+# `ruff --preview --select E303` subprocess (so no preview leaks into the
+# tree-wide `ruff check` CI gate) against a shrink-only per-file baseline.
+
 # Bug-catching rules gate CI:
 #   TID251 = banned-api (https://docs.astral.sh/ruff/rules/banned-api/)
 #   F      = pyflakes — undefined names (F821, real NameErrors), unused imports,
