@@ -292,6 +292,20 @@ def _create_defaults():
     console.print("[bold green]Default workspace created from templates[/bold green]")
 
 
+def restore_default_documents() -> None:
+    """Recreate any missing default workspace document — the PUBLIC entry point.
+
+    Callers outside this module (``forven.db.factory_reset`` re-seeds the system
+    docs it just wiped) used to call ``_create_defaults`` directly. Reaching
+    across a module boundary into a private name means the callee cannot be
+    refactored without silently breaking a caller no grep for a public API would
+    find, and it is exactly the coupling the layering ratchet in
+    tests/test_finish_db_layering.py names. Existing files are never overwritten,
+    so this is safe to call on a live workspace.
+    """
+    _create_defaults()
+
+
 # ---------------------------------------------------------------------------
 # Operator profile (Phase 6 / P6-T01)
 # ---------------------------------------------------------------------------
@@ -528,6 +542,7 @@ __all__ = [
     "list_workspace_files",
     "read_operator_profile",
     "read_workspace",
+    "restore_default_documents",
     "safe_workspace_path",
     "today_memory_path",
     "write_operator_profile",

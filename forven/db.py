@@ -6611,9 +6611,12 @@ def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials
         seed_forven_jobs()
 
     if "system_docs" in wipe_set:
-        from forven.workspace import _create_defaults
+        # Public API on purpose: this used to call workspace._create_defaults,
+        # i.e. the storage layer reaching across a module boundary into another
+        # module's private name (see workspace.restore_default_documents).
+        from forven.workspace import restore_default_documents
 
-        _create_defaults()
+        restore_default_documents()
 
     # Queue a brain_invoke task so the orchestrator kicks off without
     # requiring a full bot restart.  The task_processor_loop (running
@@ -6789,93 +6792,28 @@ def migrate_from_openclaw(data_dir: Path):
 
 
 # ---------------------------------------------------------------------------
-# Best symbol/timeframe resolution from backtest results
+# Best symbol/timeframe resolution from backtest results (MOVED to forven.policy)
 # ---------------------------------------------------------------------------
-
-def _result_metric_float(metrics: dict, key: str, default: float = 0.0) -> float:
-    try:
-        return float(metrics.get(key, default))
-    except Exception:
-        return float(default)
-
-
-def _is_better_context_candidate(
-    candidate_fitness: float,
-    candidate_metrics: dict,
-    best_fitness: float,
-    best_metrics: dict,
-) -> bool:
-    if candidate_fitness > best_fitness:
-        return True
-    if candidate_fitness < best_fitness:
-        return False
-    candidate_sharpe = _result_metric_float(candidate_metrics, "sharpe", 0.0)
-    best_sharpe = _result_metric_float(best_metrics, "sharpe", 0.0)
-    if candidate_sharpe > best_sharpe:
-        return True
-    if candidate_sharpe < best_sharpe:
-        return False
-    candidate_return = _result_metric_float(candidate_metrics, "total_return_pct", 0.0)
-    best_return = _result_metric_float(best_metrics, "total_return_pct", 0.0)
-    return candidate_return > best_return
 
 
 def resolve_best_symbol_timeframe(strategy_id: str) -> tuple[str | None, str | None, float, dict]:
-    """Pick the best (symbol, timeframe) context for *strategy_id* from backtest results."""
-    from forven.policy import score_strategy
+    """DEPRECATED compatibility shim — call
+    ``forven.policy.resolve_best_symbol_timeframe`` instead.
 
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT br.symbol, br.timeframe, br.metrics_json, br.created_at
-            FROM backtest_results br
-            LEFT JOIN backtest_result_trash bt ON bt.result_id = br.result_id
-            WHERE br.strategy_id = ?
-              AND bt.result_id IS NULL
-              AND br.deleted_at IS NULL
-              AND TRIM(UPPER(br.symbol)) NOT IN ('', 'GENERIC')
-              AND TRIM(COALESCE(br.timeframe, '')) <> ''
-            ORDER BY br.created_at DESC
-            """,
-            (strategy_id,),
-        ).fetchall()
+    Ranking a strategy's stored backtest contexts by fitness is a SELECTION
+    POLICY, not storage. Living here forced db.py — the storage layer, fan-in
+    ~120 modules — to reach UP into ``forven.policy`` for ``score_strategy``
+    and for the sharpe/return tie-break, which is the layering inversion
+    tests/test_finish_db_layering.py now guards by name.
 
-    if not rows:
-        return None, None, 0.0, {}
+    The scorer, the tie-break and the query all moved to ``forven.policy``.
+    This shim (and :func:`resolve_best_symbol` below, which routes through it
+    so a monkeypatch of THIS name still takes effect) exists only so existing
+    importers keep working untouched. Point new code at forven.policy.
+    """
+    from forven.policy import resolve_best_symbol_timeframe as _policy_resolve
 
-    # Keep the newest result for each symbol/timeframe context.
-    latest_by_context: dict[str, tuple[str, str, dict]] = {}
-    for r in rows:
-        symbol = str(r["symbol"] or "").strip().upper()
-        timeframe = str(r["timeframe"] or "").strip().lower()
-        if not symbol or symbol == "GENERIC" or not timeframe:
-            continue
-        key = f"{symbol}:{timeframe}"
-        if key in latest_by_context:
-            continue
-        try:
-            metrics = json.loads(r["metrics_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            metrics = {}
-        if not isinstance(metrics, dict):
-            metrics = {}
-        latest_by_context[key] = (symbol, timeframe, metrics)
-
-    best_symbol: str | None = None
-    best_timeframe: str | None = None
-    best_fitness = 0.0
-    best_metrics: dict = {}
-    for symbol, timeframe, metrics in latest_by_context.values():
-        fitness = float(score_strategy(metrics))
-        if best_symbol is None or _is_better_context_candidate(fitness, metrics, best_fitness, best_metrics):
-            best_symbol = symbol
-            best_timeframe = timeframe
-            best_fitness = fitness
-            best_metrics = metrics
-
-    if best_symbol is None or best_timeframe is None:
-        return None, None, 0.0, {}
-    return best_symbol, best_timeframe, best_fitness, best_metrics
+    return _policy_resolve(strategy_id)
 
 
 def resolve_best_symbol(strategy_id: str) -> tuple[str | None, float, dict]:

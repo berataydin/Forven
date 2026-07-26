@@ -829,6 +829,111 @@ def score_strategy(metrics: dict) -> float:
 
     return round(fitness, 1)
 
+
+# ---------------------------------------------------------------------------
+# Best symbol/timeframe selection from stored backtest results
+# ---------------------------------------------------------------------------
+# Lifted out of forven.db (2026-07-25 layering pass). This is a SELECTION
+# POLICY, not storage: it ranks a strategy's stored backtest contexts by
+# ``score_strategy`` and breaks ties on sharpe, then total return. Living in
+# db.py forced the storage layer to reach UP into this module for the scorer —
+# the exact inversion the layering ratchet in tests/test_finish_db_layering.py
+# now guards. The SQL is a plain read through ``get_db``; policy reading
+# storage is the correct direction.
+#
+# ``forven.db.resolve_best_symbol_timeframe`` / ``resolve_best_symbol`` remain
+# as deprecated shims that forward here, so existing importers keep working.
+
+def _result_metric_float(metrics: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(metrics.get(key, default))
+    except Exception:
+        return float(default)
+
+
+def _is_better_context_candidate(
+    candidate_fitness: float,
+    candidate_metrics: dict,
+    best_fitness: float,
+    best_metrics: dict,
+) -> bool:
+    if candidate_fitness > best_fitness:
+        return True
+    if candidate_fitness < best_fitness:
+        return False
+    candidate_sharpe = _result_metric_float(candidate_metrics, "sharpe", 0.0)
+    best_sharpe = _result_metric_float(best_metrics, "sharpe", 0.0)
+    if candidate_sharpe > best_sharpe:
+        return True
+    if candidate_sharpe < best_sharpe:
+        return False
+    candidate_return = _result_metric_float(candidate_metrics, "total_return_pct", 0.0)
+    best_return = _result_metric_float(best_metrics, "total_return_pct", 0.0)
+    return candidate_return > best_return
+
+
+def resolve_best_symbol_timeframe(strategy_id: str) -> tuple[str | None, str | None, float, dict]:
+    """Pick the best (symbol, timeframe) context for *strategy_id* from backtest results."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT br.symbol, br.timeframe, br.metrics_json, br.created_at
+            FROM backtest_results br
+            LEFT JOIN backtest_result_trash bt ON bt.result_id = br.result_id
+            WHERE br.strategy_id = ?
+              AND bt.result_id IS NULL
+              AND br.deleted_at IS NULL
+              AND TRIM(UPPER(br.symbol)) NOT IN ('', 'GENERIC')
+              AND TRIM(COALESCE(br.timeframe, '')) <> ''
+            ORDER BY br.created_at DESC
+            """,
+            (strategy_id,),
+        ).fetchall()
+
+    if not rows:
+        return None, None, 0.0, {}
+
+    # Keep the newest result for each symbol/timeframe context.
+    latest_by_context: dict[str, tuple[str, str, dict]] = {}
+    for r in rows:
+        symbol = str(r["symbol"] or "").strip().upper()
+        timeframe = str(r["timeframe"] or "").strip().lower()
+        if not symbol or symbol == "GENERIC" or not timeframe:
+            continue
+        key = f"{symbol}:{timeframe}"
+        if key in latest_by_context:
+            continue
+        try:
+            metrics = json.loads(r["metrics_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metrics = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        latest_by_context[key] = (symbol, timeframe, metrics)
+
+    best_symbol: str | None = None
+    best_timeframe: str | None = None
+    best_fitness = 0.0
+    best_metrics: dict = {}
+    for symbol, timeframe, metrics in latest_by_context.values():
+        fitness = float(score_strategy(metrics))
+        if best_symbol is None or _is_better_context_candidate(fitness, metrics, best_fitness, best_metrics):
+            best_symbol = symbol
+            best_timeframe = timeframe
+            best_fitness = fitness
+            best_metrics = metrics
+
+    if best_symbol is None or best_timeframe is None:
+        return None, None, 0.0, {}
+    return best_symbol, best_timeframe, best_fitness, best_metrics
+
+
+def resolve_best_symbol(strategy_id: str) -> tuple[str | None, float, dict]:
+    """Compatibility wrapper returning only symbol selection information."""
+    symbol, _timeframe, fitness, metrics = resolve_best_symbol_timeframe(strategy_id)
+    return symbol, fitness, metrics
+
+
 def _normalize_pipeline_stage(value: str | None) -> str:
     return normalize_stage(value)
 
