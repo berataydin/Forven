@@ -4095,8 +4095,47 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
     except Exception as exc:
         return f"Live gate: robustness evidence unavailable: {exc}"
     if not isinstance(verdict_payloads, dict) or not verdict_payloads:
+        # Distinguish "never ran the gauntlet" from "ran it under a previous engine".
+        # Both fail closed — the decision is identical — but the operator's next
+        # action is not, and a strategy holding 33 artifacts told "no usable
+        # gauntlet artifacts" sends them hunting for missing data that is right
+        # there. The engine bump to 6 (per-print funding intervals changed cost
+        # magnitudes for every non-8h perp) invalidated every pre-bump verdict at
+        # once, so this is the COMMON case immediately after a re-baseline, not
+        # the rare one.
+        counts = {}
+        engine_version = "?"
+        try:
+            counts = _load_gauntlet_artifact_counts(strategy_id) or {}
+            # Local import: policy.py deliberately does not bind this at module
+            # level (see the other call sites) — it is part of the import cycle
+            # this codebase keeps at function scope.
+            from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
+            engine_version = str(BACKTEST_ENGINE_VERSION)
+        except Exception:  # noqa: BLE001 — diagnostics only; the rejection stands either way
+            pass
+        # Positive counts only: _load_gauntlet_artifact_counts returns the full
+        # key set with zeros for absent types, so a bare truthiness check on the
+        # dict reports "stale evidence" for a strategy that has none at all.
+        present = {k: v for k, v in counts.items() if isinstance(v, int) and v > 0}
+        if present:
+            summary = ", ".join(f"{k}x{v}" for k, v in sorted(present.items()))
+            return GateRejection(
+                f"Live gate: robustness evidence is STALE, not missing ({summary}) — the "
+                f"artifacts predate backtest engine v{engine_version} and were scored "
+                "under a different cost model. Re-run the gauntlet; failing closed before "
+                "real capital until then.",
+                # stale_engine_artifacts, NOT a new code. It is the existing taxonomy
+                # entry for exactly this condition and it is already in
+                # engine.RETRYABLE_BLOCK_REASON_CODES. Minting a fresh code here would
+                # have drained every affected strategy to failed_gate — which
+                # AUTO-ARCHIVES — so a clearer log message would have destroyed the
+                # paper cohort the message was written to explain.
+                reason_code="stale_engine_artifacts",
+            )
         return GateRejection(
-            "Live gate: robustness evidence unavailable (no usable gauntlet artifacts) — "
+            "Live gate: robustness evidence unavailable (no gauntlet artifacts at all) — "
             "failing closed before real capital",
             reason_code="missing_evidence",
         )

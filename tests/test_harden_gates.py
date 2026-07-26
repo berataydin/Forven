@@ -1259,3 +1259,76 @@ def test_inconclusive_probe_never_blocks_registration():
         assert "verifiability" not in used
         assert used & blocking_names
     assert checked, "initial_stage assignment not found — guard would be vacuous"
+
+
+def test_live_gate_distinguishes_stale_evidence_from_absent_evidence(forven_db):
+    """A strategy holding artifacts must not be told it has none.
+
+    Bumping BACKTEST_ENGINE_VERSION to 6 invalidated every pre-bump verdict blob
+    at once (policy discards a blob stamped by a different engine), and the
+    fail-closed live gate then rejected 145 paper strategies with "no usable
+    gauntlet artifacts" -- while S03523 held 33 of them. The DECISION was right
+    (that evidence was scored under the old funding model), but the message sent
+    the operator hunting for data that was right there.
+    """
+    import forven.policy as policy
+
+    cfg = {"gauntlet": {}, "robustness_thresholds": {}}
+    calls: list[str] = []
+
+    def _fake_counts(strategy_id):
+        calls.append(strategy_id)
+        return {"walk_forward": 9, "optimization": 9, "monte_carlo": 0}
+
+    original = policy._load_gauntlet_artifact_counts
+    policy._load_gauntlet_artifact_counts = _fake_counts
+    try:
+        stale = policy._strict_robustness_reject("S_HAS_ARTIFACTS", None, {}, cfg)
+    finally:
+        policy._load_gauntlet_artifact_counts = original
+
+    assert stale is not None
+    assert "STALE, not missing" in str(stale)
+    assert "walk_forwardx9" in str(stale)
+    # Zero-count types must not be reported as present: the counts helper returns
+    # the full key set with zeros, so a bare truthiness check on the dict called a
+    # strategy with NO artifacts "stale".
+    assert "monte_carlo" not in str(stale)
+
+    policy._load_gauntlet_artifact_counts = lambda _sid: {"walk_forward": 0, "optimization": 0}
+    try:
+        absent = policy._strict_robustness_reject("S_HAS_NOTHING", None, {}, cfg)
+    finally:
+        policy._load_gauntlet_artifact_counts = original
+    assert "no gauntlet artifacts at all" in str(absent)
+    assert getattr(absent, "reason_code", None) == "missing_evidence"
+
+
+def test_stale_evidence_rejection_never_auto_archives(forven_db):
+    """The stale-evidence code MUST stay in the retryable registry.
+
+    This is the trap that nearly shipped: improving the message above by minting a
+    fresh `stale_engine_evidence` code would have put it OUTSIDE
+    RETRYABLE_BLOCK_REASON_CODES, draining every affected strategy to failed_gate
+    -- which AUTO-ARCHIVES. A clearer log line would have destroyed the paper
+    cohort it was written to explain. Reuse the existing taxonomy entry.
+    """
+    import forven.policy as policy
+    from forven.gauntlet.engine import RETRYABLE_BLOCK_REASON_CODES
+
+    policy._load_gauntlet_artifact_counts = lambda _sid: {"walk_forward": 4}
+    try:
+        rejection = policy._strict_robustness_reject(
+            "S_STALE", None, {}, {"gauntlet": {}, "robustness_thresholds": {}}
+        )
+    finally:
+        import importlib
+
+        importlib.reload(policy)
+
+    code = getattr(rejection, "reason_code", None)
+    assert code == "stale_engine_artifacts", f"unexpected reason code {code!r}"
+    assert code in RETRYABLE_BLOCK_REASON_CODES, (
+        f"{code!r} is not retryable — a strategy blocked on stale-engine evidence "
+        "would drain to failed_gate and be auto-archived"
+    )

@@ -166,19 +166,55 @@ jobs:
 
       # TEST-3: THE GATE. Every test under tests/ runs, so a new test file is
       # covered the moment it is committed.
-      - name: Run full backend test suite
+      #
+      # Split into a parallel lane and a SERIAL lane. The serial lane exists
+      # because a handful of suites spawn real subprocesses (the strategy sandbox
+      # worker) and take minutes each; under xdist they contend for CPU with the
+      # other workers and fail INTERMITTENTLY. Measured on the maintainer's
+      # 12-core box: test_isolated_per_bar_matches_in_process passes in isolation
+      # (5m22s) and failed once at -n 6; test_code_class_import_is_sandboxed
+      # passes in isolation (45s) and failed once at -n 4. A CI runner has ~4
+      # cores, so `-n auto` there is tighter than either local run.
+      #
+      # These are NOT quarantined — they run, and a real regression in them still
+      # fails the build. They just run one at a time. That distinction matters:
+      # both are SANDBOX tests, the boundary that executes untrusted AI-authored
+      # strategy code, and skipping them to get a green tick would be the worst
+      # possible trade. An intermittently-red required gate is its own hazard —
+      # it teaches you to merge through red, which throws away the coverage this
+      # step was added to gain.
+      - name: Run full backend test suite (parallel lane)
         run: |
           # QUARANTINE is the ONLY sanctioned way to exclude a test from CI.
           # Add a fully-qualified `file::test` node id, on its own line, with a
           # comment naming the tracking issue and the date it was quarantined —
           # then remove it. An empty list is the correct steady state; anything
           # in here is a known-broken gate, not a passing build.
+          # NOTE: SERIAL_LANE below is NOT a quarantine — those tests still run.
           QUARANTINE=()
+          SERIAL_LANE=(
+            tests/test_strategy_worker_parity.py
+            tests/test_strategy_portability.py
+          )
           DESELECT=()
           for node in "${QUARANTINE[@]}"; do
             DESELECT+=(--deselect "$node")
           done
-          python -m pytest -q -n auto "${DESELECT[@]}"
+          IGNORE=()
+          for f in "${SERIAL_LANE[@]}"; do
+            IGNORE+=(--ignore "$f")
+          done
+          python -m pytest -q -n auto "${DESELECT[@]}" "${IGNORE[@]}"
+
+      - name: Run subprocess-heavy suites (serial lane)
+        run: |
+          # Same suites --ignore'd above, run without xdist so they are not
+          # competing with 3 other workers for cores. If this step starts failing
+          # consistently rather than intermittently, that is a REAL sandbox
+          # parity/isolation regression — investigate, do not quarantine.
+          python -m pytest -q \
+            tests/test_strategy_worker_parity.py \
+            tests/test_strategy_portability.py
 
   frontend:
     runs-on: ubuntu-latest
