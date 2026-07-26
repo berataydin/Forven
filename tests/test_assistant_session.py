@@ -207,7 +207,10 @@ def test_cost_cap_blocks_turn(forven_db, monkeypatch):
 
     async def boom(*a, **k):  # must never be iterated
         raise AssertionError("provider should not be invoked when cost cap is hit")
-        yield  # noqa: makes this an async generator matching _invoke_llm_stream
+        # Unreachable on purpose: the bare `yield` is what makes `boom` an async
+        # GENERATOR, so it matches _invoke_llm_stream's shape and the caller fails
+        # on the raise rather than on "object is not async iterable".
+        yield
 
     monkeypatch.setattr(asess, "_invoke_llm_stream", boom)
     events = _collect(thread["id"], user_text="hello")

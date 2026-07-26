@@ -124,7 +124,14 @@ def test_strict_reject_fails_closed_without_gauntlet_artifacts(forven_db):
     )
 
     assert reason is not None
-    assert "no usable gauntlet artifacts" in reason.lower()
+    # Assert the STRUCTURAL contract, not the prose. The gate now distinguishes
+    # "never ran the gauntlet" from "ran it under a previous engine" — both fail
+    # closed, but the operator's next action differs, so the wording moved. The
+    # reason_code is the stable contract and it is what the retry/drain logic
+    # keys on; pinning the sentence made this test fail on a message improvement.
+    assert getattr(reason, "reason_code", None) == "missing_evidence"
+    assert "robustness evidence unavailable" in reason.lower()
+    assert "failing closed" in reason.lower()
 
 
 # --- lean paper gate: strict failures do NOT block ->paper -----------------

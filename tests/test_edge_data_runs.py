@@ -128,7 +128,14 @@ class TestQualityGate:
         fresh_enough = check_series_quality(SYMBOL, "1m")
         assert fresh_enough.ok, fresh_enough.reasons
 
-        data_mod.save_parquet(_minute_bars(end_minutes_ago=300, count=300), SYMBOL, "1m")
+        # allow_shrink: this deliberately REPLACES the fixture with an older
+        # window (that is the point of the assertion below). save_parquet's
+        # shrink backstop exists to catch a production write that silently
+        # replaces stored history with one fetch window; a fixture rewrite is
+        # the escape hatch's stated purpose, not the failure it guards.
+        data_mod.save_parquet(
+            _minute_bars(end_minutes_ago=300, count=300), SYMBOL, "1m", allow_shrink=True
+        )
         genuinely_stale = check_series_quality(SYMBOL, "1m")
         assert not genuinely_stale.ok
         assert any(r.startswith("freshness") for r in genuinely_stale.reasons)

@@ -6,6 +6,7 @@ Per-trade: 2% max risk per trade.
 """
 
 import json
+import math
 import logging
 import sqlite3
 import threading
@@ -875,14 +876,23 @@ def _live_aggregate_equity() -> float | None:
     return None
 
 
-def live_portfolio_exposure() -> dict:
+def live_portfolio_exposure(exclude_trade_ids: "set[str] | None" = None) -> dict:
     """The live book's current dollar exposure, from OPEN live trade rows.
 
     Per row: notional = entry x units; risk = distance to the CURRENT stop x
     units, floored at 0 (a ratcheted trailing stop above a long's entry has
     locked profit — zero remaining risk). Rows with no stop are counted at the
-    conservative no-stop fallback and surfaced via ``stops_missing``."""
+    conservative no-stop fallback and surfaced via ``stops_missing``.
+
+    ``exclude_trade_ids`` drops specific OPEN rows from the tally. Needed by the
+    ORDER-BOUND-1 backstop in scanner._execute_direct: both the kernel and the
+    legacy path INSERT the trade row before the exchange call, so an admission
+    check run at the order itself would count the very order it is admitting
+    twice and refuse it. Excluding the row being placed makes the backstop
+    evaluate the same "book + this order" figure the pre-open callers do."""
     from forven.trade_state import parse_trade_signal_data as _parse_sd
+
+    excluded = {str(t) for t in (exclude_trade_ids or ()) if str(t or "").strip()}
 
     per_asset: dict[str, dict] = {}
     per_group: dict[str, dict] = {}
@@ -903,6 +913,8 @@ def live_portfolio_exposure() -> dict:
         db_rows = []
     for r in db_rows:
         row = dict(r)
+        if excluded and str(row.get("id")) in excluded:
+            continue
         asset_u = str(row.get("asset") or "").strip().upper()
         entry = _coerce_non_negative_float(row.get("fill_entry_price")) or _coerce_non_negative_float(row.get("entry_price"))
         size = _coerce_non_negative_float(row.get("size"))
@@ -970,6 +982,7 @@ def check_live_portfolio_budget(
     asset: str, direction: str, *,
     add_risk_usd: float, add_notional_usd: float, equity: float | None = None,
     book: str | None = None, book_equity_usd: float | None = None,
+    exclude_trade_ids: "set[str] | None" = None,
 ) -> tuple[bool, str]:
     """The account-level admission check for a NEW live position.
 
@@ -978,7 +991,11 @@ def check_live_portfolio_budget(
     for the order about to be placed. With direction books, pass ``book`` (the
     routed wallet's label) and ``book_equity_usd`` (its balance) so admission is
     also checked against THAT wallet's capacity — the aggregate caps alone
-    would let several strategies stack orders into one small wallet."""
+    would let several strategies stack orders into one small wallet.
+
+    ``exclude_trade_ids`` is for callers that already persisted the OPEN row for
+    the order they are admitting (see live_portfolio_exposure) — without it the
+    order would be counted both as existing exposure and as the addition."""
     settings = _load_risk_settings()
     if not bool(settings.get("live_portfolio_budget_enabled", True)):
         return True, "portfolio budget disabled"
@@ -988,7 +1005,7 @@ def check_live_portfolio_budget(
             "portfolio budget: account equity unavailable — refusing the live open "
             "(fail closed) until the daemon equity snapshot recovers"
         )
-    exposure = live_portfolio_exposure()
+    exposure = live_portfolio_exposure(exclude_trade_ids=exclude_trade_ids)
     asset_u = str(asset or "").strip().upper()
     direction = str(direction or "long").strip().lower()
     sign = -1.0 if direction == "short" else 1.0
@@ -1169,6 +1186,150 @@ def set_live_notional_ceiling(
 
 _TERMINAL_STRATEGY_STAGES = {"archived", "rejected", "backtest_failed"}
 
+# --------------------------------------------------------------------------- #
+# SLICE-1 — equal capital slices for the live cohort.
+#
+# Live sizing used to compute every order against the FULL account:
+#     units = equity * leverage * size_fraction / price
+# with `size_fraction = risk_per_trade / (stop_dist_pct * leverage)`. Leverage
+# cancels (so a stop-out loses ~risk_per_trade of the base, leverage-invariant --
+# that part was always right), but the BASE was the whole balance, and no
+# strategy knew that five others were sizing against the same dollars.
+#
+# The consequence was not theoretical. S06153 runs 3% risk with a ~2.95% stop, so
+# `999 * 0.03 / 0.0295` = $1,016 -- an order larger than the entire account, on a
+# $999 balance. It was refused 48 times by the hard notional cap, signalled again
+# five minutes later, and never traded for 13 days. S05665 the same, against its
+# go-live ceiling, 24 times. The caps were doing their job; the sizing was asking
+# a question no cap can answer, because "how much may I use?" is a question about
+# the OTHER strategies, and sizing could not see them.
+#
+# So the account is divided first: each live strategy gets `equity / N`, and sizes
+# within its own slice. Two properties fall out of that, both worth stating
+# because they are why this is simpler than bounding the same thing with caps:
+#
+#   * Worst-case portfolio risk is `risk_per_trade` of the ACCOUNT, no matter how
+#     many strategies run. N strategies each risking r of equity/N sum to r of
+#     equity. Adding a strategy divides the risk instead of adding to it.
+#   * `size_fraction` is already clamped to [0, 1], so a position can never exceed
+#     `slice * leverage` -- the "$100 slice at 2x is at most a $200 position"
+#     rule needs no new code.
+#
+# Deliberately NOT applied to paper or backtest sizing (operator decision): those
+# keep sizing off full equity, so existing paper track records stay comparable.
+# The promotion gates key on ratio metrics (Sharpe, profit factor, win rate) which
+# are scale-invariant, and the metric that DOES scale -- drawdown -- makes paper
+# look riskier than live will be, i.e. the gate errs conservative.
+# --------------------------------------------------------------------------- #
+
+#: Stages whose strategies can hold real-money positions, and therefore hold a slice.
+LIVE_COHORT_STAGES = ("live_graduated", "deployed")
+
+
+def live_cohort_ids() -> list[str] | None:
+    """Strategy ids currently eligible to open real-money positions.
+
+    Returns None when the cohort cannot be read. Callers MUST fail closed on
+    None rather than assuming a count: guessing low is the dangerous direction,
+    because N=1 hands a single strategy the entire account.
+    """
+    try:
+        placeholders = ",".join("?" * len(LIVE_COHORT_STAGES))
+        with get_db() as conn:
+            rows = conn.execute(
+                f"SELECT id FROM strategies "
+                f"WHERE LOWER(COALESCE(stage, status, '')) IN ({placeholders})",
+                list(LIVE_COHORT_STAGES),
+            ).fetchall()
+        return [str(r["id"]) for r in rows]
+    except Exception as exc:  # noqa: BLE001 — caller fails closed on None
+        log.warning("SLICE-1: could not enumerate the live cohort: %s", exc)
+        return None
+
+
+def live_equity_slice(account_equity: float | None) -> tuple[float | None, dict]:
+    """This strategy's equal share of the live account: ``equity / N``.
+
+    Returns ``(slice_usd, meta)``. ``slice_usd`` is None when the slice cannot be
+    resolved — an unreadable cohort or a non-positive equity — and the caller must
+    refuse the open, exactly as it already does when account equity is unavailable.
+
+    N is floored at 1: a strategy placing a live order is by definition in the
+    cohort, so a zero count means the read disagrees with reality, and dividing by
+    zero is not the way to find out.
+    """
+    meta: dict = {"cohort_size": None, "account_equity_usd": None, "slice_usd": None}
+    eq = None
+    try:
+        eq = float(account_equity) if account_equity is not None else None
+    except (TypeError, ValueError):
+        eq = None
+    if eq is None or eq <= 0:
+        return None, {**meta, "reason": "account equity unavailable"}
+
+    cohort = live_cohort_ids()
+    if cohort is None:
+        return None, {**meta, "account_equity_usd": round(eq, 2), "reason": "live cohort unreadable"}
+
+    n = max(len(cohort), 1)
+    slice_usd = eq / float(n)
+    return slice_usd, {
+        "cohort_size": n,
+        "account_equity_usd": round(eq, 2),
+        "slice_usd": round(slice_usd, 4),
+    }
+
+
+def apply_go_live_ceiling(
+    strategy_id: str, units: float, entry_price: float
+) -> tuple[float, dict | None]:
+    """Clamp an order DOWN to the strategy's go-live notional ceiling, if any.
+
+    SLICE-1 companion. The slice is the default allocation; an operator-typed
+    ceiling is an OPTIONAL tighter cap on top, and the smaller of the two wins.
+
+    It CLAMPS rather than refuses, and that is the whole point of the change: a
+    ceiling that refuses is a strategy-disabler, not a limiter. S05665 sized $475
+    against a $100 ceiling and was refused 24 times over three days rather than
+    trading at $100 — the operator's stated intent ("go live cautiously") was
+    unreachable through the very knob meant to express it.
+
+    Returns (units, clamp_meta|None). Only ever reduces: no ceiling, an
+    unreadable one, or an order already inside it are all exact no-ops, and the
+    result is floored so the resulting notional can never round back above the cap.
+    """
+    try:
+        px = float(entry_price)
+        u = float(units)
+        if u <= 0 or px <= 0:
+            return units, None
+        entry = (get_live_notional_ceilings() or {}).get(str(strategy_id).strip())
+        cap = float((entry or {}).get("ceiling_usd") or 0.0)
+        if cap <= 0:
+            return units, None
+        notional = u * px
+        if notional <= cap:
+            return units, None
+        # Floor at 6dp so the clamped notional is <= cap, never a hair above it.
+        capped = math.floor((cap / px) * 1e6) / 1e6
+        if capped <= 0:
+            return 0.0, {
+                "ceiling_usd": round(cap, 2),
+                "requested_notional_usd": round(notional, 2),
+                "clamped_notional_usd": 0.0,
+                "reason": "go-live ceiling is below one unit at this price",
+            }
+        return capped, {
+            "ceiling_usd": round(cap, 2),
+            "requested_notional_usd": round(notional, 2),
+            "clamped_notional_usd": round(capped * px, 2),
+            "requested_units": round(u, 6),
+            "clamped_units": capped,
+        }
+    except Exception as exc:  # noqa: BLE001 — never block an order on the clamp itself
+        log.warning("SLICE-1: go-live ceiling clamp failed for %s (%s) — leaving size unchanged", strategy_id, exc)
+        return units, None
+
 
 def _ceiling_stage_map(strategy_ids: list[str]) -> dict[str, str]:
     """Current stage per strategy id (lowercase); missing ids are absent."""
@@ -1219,6 +1380,77 @@ def revoke_dead_strategy_ceilings() -> list[str]:
     if dead:
         log.info("Revoked stale live ceilings for terminal strategies: %s", ", ".join(dead))
     return dead
+
+
+# --------------------------------------------------------------------------- #
+# LIVE-CLAMP-1: the per-trade loss-at-stop bound on a real-capital order.
+#
+# Conservative per-trade risk cap applied when the configured limits carry no
+# max_risk_per_trade (the pre-existing guard treated a missing cap as "skip the
+# check"; an unbounded live order is worse than a 2% clamp). Equity remaining
+# unresolvable still fails closed — with no equity figure there is nothing to
+# bound against.
+#
+# This lives here rather than in the scanner because it is the LAST hard bound
+# on a single real order's loss and MULTIPLE order paths need it: the scanner's
+# _execute_direct choke point and the manual live open in
+# api_domains/paper_control (which calls hyperliquid.market_order directly and
+# so never reached the scanner's copy — the manual-live-open-bypasses-order-caps
+# finding). One definition = the bound can't drift between them.
+# --------------------------------------------------------------------------- #
+
+LIVE_PER_TRADE_RISK_CAP_DEFAULT = 0.02
+# The conservative stop distance assumed when an order carries no stop price —
+# mirrors _BUDGET_NO_STOP_RISK_FRAC so both bounds price a stopless order the same.
+_CLAMP_NO_STOP_STOP_DIST_FRAC = 0.03
+# 2% slack + a cent so an order clamped exactly to the cap upstream cannot be
+# re-refused here on float noise.
+_CLAMP_SLACK_FRACTION = 0.02
+
+
+def resolve_live_per_trade_risk_cap() -> float:
+    """max_risk_per_trade from the live limits, or the conservative default."""
+    try:
+        cap = _coerce_non_negative_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
+    except Exception:
+        cap = None
+    return float(cap) if cap else LIVE_PER_TRADE_RISK_CAP_DEFAULT
+
+
+def check_live_loss_at_stop(
+    *, size: float, price: float, stop_loss: float | None,
+    equity: float | None, cap: float | None = None,
+) -> tuple[bool, str]:
+    """LIVE-CLAMP-1 backstop: may this real-capital order be placed?
+
+    Returns (allowed, reason). ``size`` x |price - stop_loss| is the order's
+    loss-at-stop; it may not exceed ``cap`` (default: the configured
+    max_risk_per_trade) of real account ``equity``. Kernel mirror-parity sizing
+    deliberately skips the risk-budget caps, so for those callers this is the
+    only per-trade bound. Fails CLOSED when equity can't resolve.
+
+    Callers scope this to REAL capital (not sim, not testnet) themselves — the
+    function has no view of the venue."""
+    resolved_cap = _coerce_non_negative_float(cap) or resolve_live_per_trade_risk_cap()
+    real_equity = _coerce_non_negative_float(equity)
+    if not real_equity:
+        return False, "live risk clamp cannot resolve real account equity — fail closed"
+    stop_dist = (
+        abs(float(price) - float(stop_loss))
+        if stop_loss is not None
+        else float(price) * _CLAMP_NO_STOP_STOP_DIST_FRAC
+    )
+    loss_at_stop = float(size) * stop_dist
+    risk_budget_usd = float(resolved_cap) * float(real_equity)
+    if loss_at_stop > risk_budget_usd * (1.0 + _CLAMP_SLACK_FRACTION) + 0.01:
+        return False, (
+            f"loss-at-stop ${loss_at_stop:,.2f} "
+            f"(size {float(size):g} x stop distance {stop_dist:g}) exceeds the "
+            f"per-trade cap {float(resolved_cap):.2%} of real equity ${float(real_equity):,.2f}"
+        )
+    return True, (
+        f"within the per-trade risk cap (${loss_at_stop:,.2f}/${risk_budget_usd:,.2f})"
+    )
 
 
 def check_live_strategy_ceiling(strategy_id: str, add_notional_usd: float) -> tuple[bool, str]:
@@ -1335,6 +1567,30 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         ceilings_missing = [sid for sid in live_ids if sid not in ceilings]
     except Exception as exc:
         log.debug("Could not enumerate live strategies for ceiling audit: %s", exc)
+        live_ids = []
+
+    # SLICE-1: per-strategy sizing, as the operator sees it. "No ceiling" is no
+    # longer a gap to warn about — it is the DEFAULT and recommended state
+    # (the account is divided equally), so the UI needs the slice figure to show
+    # what system sizing actually produces, not just the absence of an override.
+    slice_usd, slice_meta = live_equity_slice(eq if eq else None)
+    strategy_sizing: list[dict] = []
+    for sid in sorted(set(live_ids) | {s for s in ceilings if not str(s).startswith("bot:")}):
+        manual = ceilings.get(sid) or {}
+        manual_usd = _coerce_non_negative_float(manual.get("ceiling_usd")) or None
+        candidates = [c for c in (slice_usd, manual_usd) if c and c > 0]
+        strategy_sizing.append({
+            "strategy_id": sid,
+            "mode": "manual" if manual_usd else "system",
+            "manual_usd": round(manual_usd, 2) if manual_usd else None,
+            "slice_usd": round(slice_usd, 2) if slice_usd else None,
+            "effective_usd": round(min(candidates), 2) if candidates else None,
+            "binding": (
+                None if not candidates
+                else ("manual" if manual_usd and manual_usd == min(candidates) else "slice")
+            ),
+            "stage": ceiling_stages.get(sid),
+        })
     return {
         "enabled": bool(settings.get("live_portfolio_budget_enabled", True)),
         "equity_usd": round(eq, 2) if eq else None,
@@ -1342,6 +1598,15 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         "limits_pct": limits_pct,
         "strategy_ceilings": annotated_ceilings,
         "ceilings_missing": ceilings_missing,
+        # SLICE-1 sizing view. `strategy_sizing` is the operator-facing answer to
+        # "how big will this strategy trade?", per strategy, with the reason.
+        "capital_slice": {
+            "cohort_size": slice_meta.get("cohort_size"),
+            "slice_usd": round(slice_usd, 2) if slice_usd else None,
+            "account_equity_usd": slice_meta.get("account_equity_usd"),
+            "unavailable_reason": slice_meta.get("reason"),
+        },
+        "strategy_sizing": strategy_sizing,
         "total_open_risk_usd": exposure["total_risk_usd"],
         "total_open_risk_limit_usd": round(max_risk_usd, 2) if max_risk_usd else None,
         "total_open_risk_used_frac": (
@@ -4329,6 +4594,10 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
     # the very first breaching read, so the un-confirmed window blocks entries
     # without flattening the book on a phantom.
     kill_switch_enabled = kv_get("kill_switch_enabled", True)
+    # HALT-STREAK-1: set when a streak is cleared this tick — the clear is as
+    # un-reconstructible as an increment (a dropped reset would let a LATER
+    # breach latch off non-consecutive ticks), so it forces a blocking write too.
+    _streak_reset = False
     if drawdown_pct >= max_drawdown and kill_switch_enabled:
         _ks_streak = int(state.get("kill_switch_breach_streak") or 0) + 1
         state["kill_switch_breach_streak"] = _ks_streak
@@ -4355,6 +4624,7 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
         )
     elif state.get("kill_switch_breach_streak"):
         state["kill_switch_breach_streak"] = 0
+        _streak_reset = True
 
     if daily_pnl_pct <= -daily_loss_limit and not state.get("daily_loss_halt"):
         _dh_streak = int(state.get("daily_halt_breach_streak") or 0) + 1
@@ -4382,10 +4652,23 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
         )
     elif state.get("daily_halt_breach_streak"):
         state["daily_halt_breach_streak"] = 0
+        _streak_reset = True
 
-    # Routine tick: drawdown/daily-PnL decision is already in `result`, so a
-    # dropped snapshot under contention is harmless — the next tick refreshes.
-    _save_risk_state(state, best_effort=True)
+    # HALT-STREAK-1: a PENDING breach streak is the one piece of this snapshot
+    # that is NOT reconstructible from the next tick — it is the confirmation
+    # counter itself. Persisting it best-effort meant that under sustained SQLite
+    # exclusive-lock contention every increment was dropped, the streak could
+    # never reach _HALT_CONFIRM_TICKS, and the kill-switch latch (with its
+    # close_all_positions) stayed deferred for the whole contention window —
+    # exactly when a halt is most likely to be warranted. Block on the write
+    # while a streak is live; a clean tick keeps the droppable fast path since
+    # the drawdown/daily-PnL decision is already in `result`.
+    _streak_pending = bool(
+        int(state.get("kill_switch_breach_streak") or 0)
+        or int(state.get("daily_halt_breach_streak") or 0)
+        or _streak_reset
+    )
+    _save_risk_state(state, best_effort=not _streak_pending)
     return result
 
 

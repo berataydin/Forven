@@ -8,6 +8,9 @@
  */
 
 import { fetchApi } from './core';
+import type { MainnetArmingFields, MainnetArmingState } from './types';
+
+export type { MainnetArmingState };
 
 export type CheckStatus = 'pass' | 'warn' | 'fail';
 
@@ -35,12 +38,25 @@ export interface McpServerRow {
 	last_error_short: string | null;
 }
 
-export interface DiagnosticsSnapshot {
+export interface DiagnosticsSnapshot extends MainnetArmingFields {
 	generated_at: string;
 	overall: CheckStatus;
 	summary: DiagnosticsSummary;
 	checks: CheckResult[];
 	mcp_servers: McpServerRow[];
+}
+
+/**
+ * OPS-4: is this backend armed to spend REAL money?
+ *
+ * `mainnet_armed` is deliberately NOT defaulted to `false` when absent: an older
+ * backend that does not report it is UNKNOWN, and rendering unknown as "not
+ * armed" is the failure mode the flag exists to prevent. Callers get `null` and
+ * must show that as unknown.
+ */
+export function readMainnetArmed(snapshot: MainnetArmingFields | null | undefined): boolean | null {
+	if (!snapshot || typeof snapshot.mainnet_armed !== 'boolean') return null;
+	return snapshot.mainnet_armed;
 }
 
 export interface CheckpointSnapshot {

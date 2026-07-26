@@ -44,7 +44,10 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # TEST-3: the full suite (~5.8k tests) runs here now. Measured at 17m30s with
+    # `-n 6` on the maintainer's machine; a 4-vCPU hosted runner is slower, so the
+    # ceiling is generous. Raise it rather than re-shrinking the suite.
+    timeout-minutes: 50
 
     steps:
       - name: Check out repository
@@ -75,21 +78,155 @@ jobs:
       - name: Collect backend tests
         run: python -m pytest --collect-only -q
 
-      # The WHOLE suite gates now, not a hand-curated allowlist. It previously ran
-      # 44 of 546 files (810 of 5769 tests); the ungated 86% accumulated 69
-      # failures against deliberate product changes nobody was told about --
-      # including the only tests asserting that the kill switch fires, that the
-      # paper->live gate enforces its floors, and that the funding math is right.
-      # A curated list cannot notice the test it was never given.
+      # --------------------------------------------------------------------
+      # TEST-3: the themed steps below are FAST-FAIL ORDERING, not the gate.
+      # They used to BE the gate — a hand-maintained allowlist that covered 44
+      # of 547 test files (8%). Since the previous edit to this file, 21 new
+      # test files were added and none were wired in, including
+      # test_live_risk_clamp.py and test_propr_venue.py (28 tests guarding a
+      # real-money venue). The full suite at the bottom is now the gate; these
+      # run first only so a security or capital-integrity regression fails in
+      # ~30s instead of ~20 minutes. Adding a test file needs NO edit here.
+      # --------------------------------------------------------------------
+
+      # Security regression gate — locks in the 2026-06 security-hardening work so a
+      # regression fails the PR. Fast (~10s), no sandbox-worker subprocess / heavy data
+      # deps, so it is safe on the CI runner. Covers: the AST guard (every confirmed
+      # bypass family stays blocked; the R3-de-allowlisted forven.scanner/data/
+      # data_manager/sentiment stay rejected; the indicator facade stays allowed), the
+      # strategy-worker DB jail, the custom-module intake guard, secret redaction, the
+      # SIZE-1 stop-floor, and the KCOPY-3 impure-strategy fail-closed.
+      - name: Fast-fail — security regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_sandbox_ast_guard.py \
+            tests/test_ast_guard_bypasses.py \
+            tests/test_strategy_worker_db_jail.py \
+            tests/test_registry_custom_module_guard.py \
+            tests/test_redact.py \
+            tests/test_sizing.py \
+            tests/test_per_bar_kernel_adapter.py
+
+      # Real-money execution integrity: ambiguous/partial IOC responses must
+      # never release local exposure or remove the last protective order.
+      - name: Fast-fail — capital-integrity regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_execution_results.py \
+            tests/test_paper_control.py \
+            tests/test_open_trades_exchange_verification.py \
+            tests/test_live_entry_finalization.py \
+            tests/test_kill_switch_close_integrity.py \
+            tests/test_mtier_hardening.py \
+            tests/test_engine_audit_phase1.py
+
+      - name: Fast-fail — async runtime regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_daemon_price_freshness.py \
+            tests/test_loop_starvation_fixes.py
+
+      - name: Fast-fail — backend release stability tests
+        run: |
+          python -m pytest -q \
+            tests/test_db_kv_bootstrap.py \
+            tests/test_bot_loop_resilience.py \
+            tests/test_bot_stale_recovery_loop.py \
+            tests/test_discord_owner_guard.py \
+            tests/test_notification_renderers.py \
+            tests/test_brain_router.py \
+            tests/test_lab_worker_service.py \
+            tests/test_url_ingest.py \
+            tests/test_url_ingest_research_enqueue.py \
+            tests/test_scheduler_background_jobs.py \
+            tests/test_gauntlet_legitimacy.py \
+            tests/test_robustness_router.py \
+            tests/test_pipeline_hardening.py::test_failed_walk_forward_verdict_is_fold_rescued_when_oos_folds_pass \
+            tests/test_pipeline_hardening.py::test_evaluate_promotion_accepts_persisted_validation_artifacts_for_paper \
+            tests/test_pipeline_hardening.py::test_evaluate_promotion_blocks_failed_required_verdict_tests_for_paper
+
+      # Data-engine regression gate — locks in the 2026-07 data hardening + edge-data
+      # expansion (tail-append storage, perp canonicalization, causality shifts,
+      # quality gates, fingerprints, symbol registry, basis/IV streams, kernel
+      # intra-bar arbitration) AND the hub/legacy engine-on parity suite, which is the
+      # stated prerequisite for flipping data_engine.enabled. Network-free: the
+      # autobackfill/registry network paths are pytest-gated, everything runs on tmp
+      # lakes (~90s).
+      - name: Fast-fail — data-engine regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_data_hardening.py \
+            tests/test_data_remaining_phases.py \
+            tests/test_research_universe.py \
+            tests/test_edge_data_runs.py \
+            tests/test_data_manager.py \
+            tests/test_data_coverage.py \
+            tests/test_dataeng_foundation.py \
+            tests/test_enrichment_causality.py \
+            tests/test_enrich_backtest_frame.py \
+            tests/test_data_engine_p2_hardening.py \
+            tests/test_orderflow_lookahead.py \
+            tests/test_binance_vision.py \
+            tests/test_keepalive_staleness.py \
+            tests/test_ohlcv_keepalive_gate.py \
+            tests/test_data_root_unified.py
+
+      # TEST-3: THE GATE. Every test under tests/ runs, so a new test file is
+      # covered the moment it is committed.
       #
-      # -n auto shards across the runner's cores (the suite is ~28m serial).
-      # --dist loadfile keeps each FILE on one worker: several suites share
-      # module-level state (the HyperLiquid SDK fixtures rebuild
-      # forven.exchange.hyperliquid), so splitting a file across workers is not
-      # safe yet. Order-independence is not something this suite has earned;
-      # revisit --dist load once it has.
-      - name: Run backend test suite
-        run: python -m pytest -q -n auto --dist loadfile
+      # Split into a parallel lane and a SERIAL lane. The serial lane exists
+      # because a handful of suites spawn real subprocesses (the strategy sandbox
+      # worker) and take minutes each; under xdist they contend for CPU with the
+      # other workers and fail INTERMITTENTLY. Measured on the maintainer's
+      # 12-core box: test_isolated_per_bar_matches_in_process passes in isolation
+      # (5m22s) and failed once at -n 6; test_code_class_import_is_sandboxed
+      # passes in isolation (45s) and failed once at -n 4. A CI runner has ~4
+      # cores, so `-n auto` there is tighter than either local run.
+      #
+      # These are NOT quarantined — they run, and a real regression in them still
+      # fails the build. They just run one at a time. That distinction matters:
+      # both are SANDBOX tests, the boundary that executes untrusted AI-authored
+      # strategy code, and skipping them to get a green tick would be the worst
+      # possible trade. An intermittently-red required gate is its own hazard —
+      # it teaches you to merge through red, which throws away the coverage this
+      # step was added to gain.
+      - name: Run full backend test suite (parallel lane)
+        run: |
+          # QUARANTINE is the ONLY sanctioned way to exclude a test from CI.
+          # Add a fully-qualified `file::test` node id, on its own line, with a
+          # comment naming the tracking issue and the date it was quarantined —
+          # then remove it. An empty list is the correct steady state; anything
+          # in here is a known-broken gate, not a passing build.
+          # NOTE: SERIAL_LANE below is NOT a quarantine — those tests still run.
+          QUARANTINE=()
+          SERIAL_LANE=(
+            tests/test_strategy_worker_parity.py
+            tests/test_strategy_portability.py
+          )
+          DESELECT=()
+          for node in "${QUARANTINE[@]}"; do
+            DESELECT+=(--deselect "$node")
+          done
+          IGNORE=()
+          for f in "${SERIAL_LANE[@]}"; do
+            IGNORE+=(--ignore "$f")
+          done
+          # --dist loadfile (from #104) keeps each FILE on one worker: several
+          # suites share module-level state — the HyperLiquid SDK fixtures rebuild
+          # forven.exchange.hyperliquid — so splitting a file across workers is not
+          # safe yet. That is orthogonal to the serial lane above, which is about
+          # CPU contention rather than shared state, and both are needed.
+          python -m pytest -q -n auto --dist loadfile "${DESELECT[@]}" "${IGNORE[@]}"
+
+      - name: Run subprocess-heavy suites (serial lane)
+        run: |
+          # Same suites --ignore'd above, run without xdist so they are not
+          # competing with 3 other workers for cores. If this step starts failing
+          # consistently rather than intermittently, that is a REAL sandbox
+          # parity/isolation regression — investigate, do not quarantine.
+          python -m pytest -q \
+            tests/test_strategy_worker_parity.py \
+            tests/test_strategy_portability.py
 
   frontend:
     runs-on: ubuntu-latest

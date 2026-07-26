@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -16,6 +17,8 @@ import pandas as pd
 from forven import config as forven_config
 from forven.dataeng.identity import SymbolRef, to_ref
 
+
+log = logging.getLogger("forven.dataeng.catalog")
 
 CATALOG_SCHEMA_VERSION = 1
 
@@ -224,6 +227,44 @@ class Catalog:
                 ],
             )
 
+    def delete_series_coverage(
+        self,
+        *,
+        path: str | Path | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        stream: str = "candles",
+    ) -> int:
+        """Drop coverage rows for a series that no longer exists. Returns rows deleted.
+
+        HARDEN-DATA-OPS (ghost-coverage-rows-block-catchup): coverage rows were
+        insert-only, so deleting a dataset left a permanent GHOST. Its end_ts
+        never advances, which makes it the most-stale row in the catalog and
+        therefore top of the staleness-ordered catch-up plan — it consumes a
+        batch slot on every run forever, and because the planner counts it as
+        "covered" it also suppresses the bootstrap task that would re-create the
+        series. Match by path when known (exact), else by symbol/timeframe.
+        """
+        clauses: list[str] = ["stream = ?"]
+        params: list[Any] = [stream]
+        if path is not None:
+            clauses.append("path = ?")
+            params.append(str(path))
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(str(symbol))
+        if timeframe is not None:
+            clauses.append("timeframe = ?")
+            params.append(str(timeframe))
+        if len(clauses) == 1:
+            return 0  # never allow a bare "delete every candle row"
+        with self.connect() as con:
+            before = con.execute(
+                f"SELECT count(*) FROM series_coverage WHERE {' AND '.join(clauses)}", params
+            ).fetchone()[0]
+            con.execute(f"DELETE FROM series_coverage WHERE {' AND '.join(clauses)}", params)
+        return int(before or 0)
+
     def list_coverage(self) -> list[dict[str, Any]]:
         with self.connect() as con:
             rows = con.execute(
@@ -280,11 +321,13 @@ class Catalog:
 
         rows: list[CoverageRow] = []
         changed: list[tuple[CoverageRow, str]] = []
+        seen_paths: set[str] = set()
         for path in sorted(ohlcv_root.rglob("*.parquet")):
             parsed = _parse_ohlcv_path(ohlcv_root, path)
             if parsed is None:
                 continue
             ref, timeframe = parsed
+            seen_paths.add(str(path))
             fingerprint = _file_fingerprint(path)
             prior = cached.get(str(path))
             if prior is not None and prior[0] is not None and prior[0] == fingerprint:
@@ -336,6 +379,24 @@ class Catalog:
                         for row, fingerprint in changed
                     ],
                 )
+
+        # HARDEN-DATA-OPS (ghost-coverage-rows-block-catchup): the walk is the
+        # ground truth for what exists. Any stored candle row whose parquet was
+        # not seen is a ghost — a deleted/renamed series that would otherwise
+        # sit at the top of the staleness-ordered catch-up plan forever AND
+        # suppress its own re-bootstrap. Self-reconcile here so the catalog can
+        # never drift ahead of the lake, whatever deleted the file.
+        stale_paths = [stored_path for stored_path in cached if stored_path not in seen_paths]
+        if stale_paths:
+            with self.connect() as con:
+                con.executemany(
+                    "DELETE FROM series_coverage WHERE stream = 'candles' AND path = ?",
+                    [[stale_path] for stale_path in stale_paths],
+                )
+            log.info(
+                "catalog scan_lake: dropped %d coverage row(s) with no backing parquet",
+                len(stale_paths),
+            )
         return rows
 
     def upsert_symbol_registry(

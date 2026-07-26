@@ -50,11 +50,14 @@ def _arm(capital=10_000.0):
 class _Exchange:
     """Mock venue: records calls, returns configurable mids/positions."""
 
-    def __init__(self, mids=None, positions=None):
+    def __init__(self, mids=None, positions=None, close_fill="full"):
         self.mids = mids or {"AAA": 10.0, "BBB": 20.0}
         self.positions = positions or []
         self.market_orders: list[dict] = []
         self.closes: list[dict] = []
+        # "full" -> confirmed complete fill; a float -> partial fill of that many
+        # units; None -> the AMBIGUOUS receipt (no filled_size at all).
+        self.close_fill = close_fill
 
     def install(self, monkeypatch):
         import forven.exchange.hyperliquid as hl
@@ -88,7 +91,18 @@ class _Exchange:
 
         def _close_position(asset, size, side="sell", **kw):
             self.closes.append({"asset": asset, "side": side, "size": size, **kw})
-            return {"order_id": "X2", "exit_price": self.mids.get(asset)}
+            # A SUCCESSFUL close reports the filled quantity. Returning only
+            # order_id + exit_price models the AMBIGUOUS receipt, which
+            # execution_results.parse_close_receipt classifies as "unknown" —
+            # exit_price is a request-time price, not proof that the IOC executed.
+            # The fake previously returned that shape and the disarm test asserted
+            # ok=True on it, i.e. it asserted the exact bug HL-CLOSE-1 exists to
+            # stop. Default to a confirmed full fill; set close_fill=None below to
+            # exercise the ambiguous path deliberately.
+            if self.close_fill is None:
+                return {"order_id": "X2", "exit_price": self.mids.get(asset)}
+            filled = size if self.close_fill == "full" else float(self.close_fill)
+            return {"order_id": "X2", "exit_price": self.mids.get(asset), "filled_size": filled}
 
         monkeypatch.setattr(hl, "market_order", _market_order)
         monkeypatch.setattr(hl, "close_position", _close_position)
@@ -171,6 +185,46 @@ def test_disarm_clears_ceiling_and_optionally_flattens(forven_db, monkeypatch):
     assert len(venue.closes) == 1 and venue.closes[0]["asset"] == "AAA"
     assert venue.closes[0]["vault_address"] == WALLET_ADDR
     assert result["flattened"][0]["ok"]
+    assert result["flattened"][0]["close_outcome"] == "filled"
+
+
+def test_disarm_flatten_does_not_report_ok_on_an_unconfirmed_close(forven_db, monkeypatch):
+    """HL-CLOSE-1: on DISARM there is no next reconcile, so 'unknown' is a failure.
+
+    The reconcile loop may treat an ambiguous receipt as ok because the next pass
+    re-reads the venue and re-issues whatever is left. The disarm flatten has no
+    next pass — the wallet stops being watched the moment it returns. Reporting
+    'flattened 1 positions' on an unconfirmed close is how a leveraged leg gets
+    abandoned in an unwatched wallet.
+    """
+    _settings()
+    _paper_book()
+    _arm()
+    venue = _Exchange(
+        positions=[{"asset": "AAA", "size": 100.0, "direction": "long"}],
+        close_fill=None,  # ambiguous receipt: no filled_size
+    ).install(monkeypatch)
+    result = disarm_basket_live(actor="test", flatten=True)
+    leg = result["flattened"][0]
+    assert leg["close_outcome"] == "unknown"
+    assert not leg["ok"], "an unconfirmed close must not count as flattened on disarm"
+    assert "not confirmed" in (leg.get("error") or "")
+    assert len(venue.closes) == 1
+
+
+def test_disarm_flatten_reports_a_partial_close_as_failure(forven_db, monkeypatch):
+    _settings()
+    _paper_book()
+    _arm()
+    venue = _Exchange(
+        positions=[{"asset": "AAA", "size": 100.0, "direction": "long"}],
+        close_fill=40.0,
+    ).install(monkeypatch)
+    leg = disarm_basket_live(actor="test", flatten=True)["flattened"][0]
+    assert leg["close_outcome"] == "partial"
+    assert not leg["ok"]
+    assert leg["residual_units"] == 60.0
+    assert len(venue.closes) == 1
 
 
 # ----------------------------------------------------------------- reconcile

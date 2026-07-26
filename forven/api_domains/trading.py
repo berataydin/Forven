@@ -993,6 +993,56 @@ def _cancel_reduce_only_orders_for_asset(asset: str, *, testnet: bool) -> list[d
     return results
 
 
+def _close_rejected(
+    trade_id: str, asset: str, direction: str, size: float, *, error: str, source: str
+) -> dict[str, object]:
+    """The venue refused / did not fill the close — the position is STILL OPEN.
+
+    HL-CLOSE-1 caller side. ``close_position`` used to return a success-shaped
+    payload carrying a fabricated ``close_price`` when a reduce-only IOC was
+    rejected, so a caller checking only ``result["error"]`` booked a still-open
+    position as closed at a price that never traded. It now fails closed, which
+    means this branch is reached by a real "we are still exposed" event, not only
+    by a pre-flight refusal. Recorded as an operator-visible activity row and
+    returned with the exposure spelled out — a rejected close on a live position is
+    an incident, not a form-validation error.
+
+    Deliberately does NOT mark the trade pending-close-reconcile: nothing was
+    filled, so there is no exchange state to reconcile toward. The row stays OPEN
+    with its protective orders intact and the operator retries.
+    """
+    log.error(
+        "Force-close REJECTED for %s (%s %s size=%s): %s — position remains OPEN",
+        trade_id, asset, direction, size, error,
+    )
+    try:
+        log_activity(
+            "error",
+            "api",
+            f"Manual force-close REJECTED for {trade_id}; position is still open",
+            {
+                "trade_id": trade_id,
+                "asset": asset,
+                "direction": direction,
+                "size": float(size),
+                "error": error,
+                "source": source,
+            },
+        )
+    except Exception:  # noqa: BLE001 — the error response matters more than the audit row
+        pass
+    return {
+        "ok": False,
+        "error": error,
+        "close_rejected": True,
+        "position_still_open": True,
+        "trade_id": trade_id,
+        "asset": asset,
+        "direction": direction,
+        "source": source,
+    }
+
+
 def _force_close_exchange_backed_trade(trade_id: str, body) -> dict[str, object]:
     parsed = _parse_exchange_backed_trade_id(trade_id)
     if not parsed:
@@ -1026,7 +1076,16 @@ def _force_close_exchange_backed_trade(trade_id: str, body) -> dict[str, object]
 
         close_result = close_position(asset, float(size), close_side, testnet=testnet)
         if isinstance(close_result, dict) and close_result.get("error"):
-            return {"ok": False, "error": str(close_result["error"])}
+            # HL-CLOSE-1: this branch now also catches a reduce-only IOC that came
+            # back with NO FILL under a success-shaped payload — close_position fails
+            # closed on that instead of returning a fabricated exit at the 3%-through-mid
+            # limit that never traded. Nothing is booked and nothing is cancelled: the
+            # position is still OPEN on the venue with its protective orders intact, and
+            # the operator has to see that rather than a bare toast.
+            return _close_rejected(
+                trade_id, asset, direction, float(size),
+                error=str(close_result["error"]), source="exchange",
+            )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -1128,7 +1187,14 @@ def force_close_trade(trade_id: str, body):
 
         close_result = close_position(asset, size, close_side, testnet=testnet)
         if isinstance(close_result, dict) and close_result.get("error"):
-            return {"ok": False, "error": str(close_result["error"])}
+            # HL-CLOSE-1 (see _force_close_exchange_backed_trade): a rejected /
+            # zero-fill reduce-only IOC arrives here as an error. The trade row stays
+            # OPEN and is NOT marked pending-close — nothing was sent to reconcile
+            # against; the operator retries an explicitly failed close.
+            return _close_rejected(
+                trade_id, asset, direction, size,
+                error=str(close_result["error"]), source="sqlite",
+            )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 

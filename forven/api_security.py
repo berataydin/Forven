@@ -207,7 +207,23 @@ async def require_api_access_ws(ws: HTTPConnection) -> bool:
     IS configured, require it via a ``?key=``/``?api_key=`` query param, the
     ``x-api-key`` header, or a Bearer token. Returns True if allowed; on mismatch
     it closes the socket (1008) and returns False so the caller just returns.
+
+    ws-no-origin-check: the key was the ONLY thing checked here, so in the keyless
+    localhost default any browsed page could stream live positions/PnL over a WS
+    upgrade (no preflight, no CORS). The Origin check below runs FIRST and
+    unconditionally — a missing key is exactly the case that needed it most.
     """
+    if _csrf_protection_enabled() and is_cross_site_ws_handshake(ws):
+        log.warning(
+            "CSRF: rejected cross-site WebSocket handshake from origin %r",
+            _normalize_secret(ws.headers.get("origin")),
+        )
+        try:
+            await ws.close(code=1008)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
     expected = _read_env_secret("FORVEN_API_KEY")
     if not expected:
         return True
@@ -300,14 +316,51 @@ def _csrf_protection_enabled() -> bool:
     return value.lower() in _TRUTHY
 
 
-def _request_target_origin(request: Request) -> str:
-    """The origin the request was actually addressed to, from the (already
-    TrustedHost-validated) Host header. Used to recognise same-origin requests."""
-    host = _normalize_secret(request.headers.get("host"))
+def _connection_target_origin(conn: HTTPConnection) -> str:
+    """The origin the connection was actually addressed to, from the (already
+    TrustedHost-validated) Host header. Used to recognise same-origin traffic.
+
+    A WebSocket connection's own scheme is ``ws``/``wss`` while the browser stamps
+    the ORIGIN as ``http``/``https``, so normalise back to the HTTP scheme —
+    otherwise a same-origin WS handshake would never compare equal.
+    """
+    host = _normalize_secret(conn.headers.get("host"))
     if not host:
         return ""
-    scheme = (request.url.scheme or "http")
+    scheme = (conn.url.scheme or "http")
+    scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
     return f"{scheme}://{host}".rstrip("/")
+
+
+def _request_target_origin(request: Request) -> str:
+    return _connection_target_origin(request)
+
+
+def is_cross_site_ws_handshake(ws: HTTPConnection) -> bool:
+    """True iff a WebSocket handshake carries a browser Origin we do not trust.
+
+    SECURITY (ws-no-origin-check): the live WS handshake enforced the API key and
+    nothing else, and a WebSocket upgrade is NOT subject to the same-origin policy
+    — no preflight, no CORS. So any page the operator happened to be browsing
+    could open ``ws://127.0.0.1:<port>/api/ws/live`` and stream their live
+    positions, equity and PnL, in the default keyless localhost setup especially.
+
+    Mirrors ``is_cross_site_state_change``, including its deliberate exemption: an
+    ABSENT Origin is allowed. Non-browser clients (the launcher, CLI, MCP, the
+    testnet harness) never send one, and a hostile page cannot suppress it —
+    browsers stamp Origin on every WebSocket handshake. The packaged app serves
+    the SPA from the API origin itself, so it is same-origin; the dev server is
+    CORS-allowlisted. This can therefore never be stricter than CORS already is.
+    """
+    stated = _normalize_secret(ws.headers.get("origin"))
+    if not stated:
+        return False  # non-browser client — not a drive-by vector
+    source = _normalize_origin(stated)
+    if not source:
+        return False
+    if source == _connection_target_origin(ws):
+        return False  # same-origin is not cross-site by definition
+    return source not in set(get_allowed_cors_origins())
 
 
 def is_cross_site_state_change(request: Request) -> bool:

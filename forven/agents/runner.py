@@ -76,6 +76,132 @@ _TRANSIENT_PROVIDER_BACKOFF_MINUTES = (2, 5, 10)
 _MISSING_CREDENTIALS_BACKOFF_MINUTES = (15, 30, 60, 120)
 _MAX_MISSING_CREDENTIALS_RETRIES = 10_000  # effectively "wait, don't dead-letter"
 
+# AI-02 (audit 2026-07-25): inputs to _tools_context_for_task_type (below), which
+# is the single place the per-task tools_context is decided.
+#
+# Fallback for any task type not named there. 'scheduled' is the most restrictive
+# of VALID_CONTEXTS (denies research + codegen + catastrophic) and is the honest
+# description of an unattended, planner-dispatched task. Anything that genuinely
+# needs a denied category must be listed EXPLICITLY — the default has to fail
+# closed, because a new task type added later inherits this line.
+_DEFAULT_TOOLS_CONTEXT = "scheduled"
+
+# Task types a human asks for by hand (Discord !task/!engineer, an approval the
+# operator is troubleshooting, a notification repair the operator sees fail).
+# These run the full-stack-engineer's documented read-only diagnosis workflow,
+# which uses run_code — codegen — so they must not inherit the scheduled deny set.
+_OPERATOR_TRIGGERED_TASK_TYPES: frozenset[str] = frozenset({
+    "manual",
+    "approval_troubleshoot",
+    "notification_repair",
+})
+
+# Types that INGEST untrusted external content and reason over it, but author no
+# code → 'research' (denies codegen + catastrophic, keeps the research tools).
+#
+# 'analysis' is here because it is the highest-volume brain-dispatched type in
+# the live DB and it feeds the idea funnel: routing it to 'scheduled' would strip
+# create_hypothesis and every discover_/inspect_ tool. 'research' is still
+# strictly tighter than the pre-AI-02 behaviour (which was NO gating at all) —
+# codegen stays denied. The scheduled-context autonomy boundary that
+# tools_research.py's create_hypothesis comment protects is the ROUTINE/cron
+# brain-cycle path (runtime_worker resolves that context from the routine row),
+# which this mapping does not touch.
+_INVESTIGATION_TASK_TYPES: frozenset[str] = frozenset({
+    "research",
+    "analysis",
+})
+
+# Types that AUTHOR strategy code → 'develop' (denies catastrophic only, so
+# codegen + research stay available).
+#
+# Assembled from the three lists that already exist in the codebase, because
+# nothing normalizes task_type — `assign_agent_task` takes a free-form string
+# straight from the Brain, so the observed vocabulary is wider than any single
+# list:
+#   * forven.brain._STRATEGY_CREATION_TASK_TYPES (merged in at call time by
+#     ``_strategy_creation_task_types`` so the two cannot drift);
+#   * forven.agents.ownership._check_task_owner's "strategy-developer codes
+#     containers" set — code_strategy_container / coding_cycle / phantom_repair;
+#   * phantom_recovery.py, which dispatches 'phantom_repair' with the literal
+#     instruction "You may edit strategy code and params" — stripping codegen
+#     there breaks the one thing that loop exists to do, silently;
+#   * the free-form aliases the Brain actually emits (observed in agent_tasks:
+#     development / strategy / develop / strategy_development).
+#
+# Being generous here costs little: task_type is chosen by the Brain, so this
+# list is not the containment boundary for a prompt-injected orchestrator. The
+# real boundaries are the per-agent permission set, the 'catastrophic' deny that
+# EVERY context keeps, the AST guard on run_code/register_strategy, and
+# out-of-process execution. What a too-narrow list DOES buy is silent breakage
+# of live authoring flows, which is why it is drawn wide.
+_DEVELOP_TASK_TYPES: frozenset[str] = frozenset({
+    "code_strategy",
+    "code_strategy_container",
+    "coding_cycle",
+    "develop",
+    "develop_candidate",
+    "development",
+    "generate_strategies",
+    "phantom_repair",
+    "strategy",
+    "strategy_development",
+})
+
+
+_DEVELOP_TASK_TYPES_CACHE: frozenset[str] | None = None
+
+
+def _strategy_creation_task_types() -> frozenset[str]:
+    """``_DEVELOP_TASK_TYPES`` widened by the Brain's own canonical list.
+
+    Read lazily rather than imported at module scope: forven.brain does not
+    import forven.agents today, and this keeps it that way so the edge can never
+    become a cycle. The local literal is the FLOOR — if the import fails for any
+    reason we still return the full hard-coded set rather than silently narrowing
+    back to the bug this fixes. Only a SUCCESSFUL read is cached, so a transient
+    partial-import can't pin the floor for the life of the process.
+    """
+    global _DEVELOP_TASK_TYPES_CACHE
+    if _DEVELOP_TASK_TYPES_CACHE is not None:
+        return _DEVELOP_TASK_TYPES_CACHE
+    # 'research' lives in the brain list but is an INGEST type here, and is
+    # matched earlier anyway; drop it so the intent stays legible.
+    try:
+        from forven.brain import _STRATEGY_CREATION_TASK_TYPES
+
+        extra = frozenset(str(t).strip().lower() for t in _STRATEGY_CREATION_TASK_TYPES)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("could not read brain._STRATEGY_CREATION_TASK_TYPES (%s)", exc)
+        return _DEVELOP_TASK_TYPES - _INVESTIGATION_TASK_TYPES
+    _DEVELOP_TASK_TYPES_CACHE = (_DEVELOP_TASK_TYPES | extra) - _INVESTIGATION_TASK_TYPES
+    return _DEVELOP_TASK_TYPES_CACHE
+
+
+def _tools_context_for_task_type(task_type: str | None) -> str:
+    """Map an agent-task type to its tool-gating context (AI-02).
+
+    Research/analysis tasks ingest the most untrusted content → 'research'
+    (denies codegen + catastrophic). Code-authoring flows need codegen +
+    research but must never reach a catastrophic primitive → 'develop' (denies
+    catastrophic). Operator-triggered triage keeps its documented run_code
+    diagnosis path → 'interactive'. Everything else — including task types added
+    after this line was written — gets the most restrictive context.
+    (audit P1.1, AI-02)
+
+    NEVER returns None: a None context makes ``get_tools_for_agent`` skip context
+    resolution entirely, so both ``_CONTEXT_DEFAULT_DENY`` and the operator's
+    per-context overrides go silently inert. That was the defect.
+    """
+    normalized = str(task_type or "").strip().lower()
+    if normalized in _INVESTIGATION_TASK_TYPES:
+        return "research"
+    if normalized in _strategy_creation_task_types():
+        return "develop"
+    if normalized in _OPERATOR_TRIGGERED_TASK_TYPES:
+        return "interactive"
+    return _DEFAULT_TOOLS_CONTEXT
+
 
 def _is_missing_credentials_error(error: Exception) -> bool:
     """True when a task failed purely because a provider has no usable creds."""
@@ -1305,18 +1431,10 @@ async def _run_agent_task_inner(
     tool_context_tokens: tuple[Token, ...] | None = None
     try:
         # Set per-task tool context for permission gating and tool audit logging.
-        # Research tasks ingest the most untrusted content → 'research' context
-        # (denies codegen + catastrophic). Code-authoring autonomous tasks need
-        # codegen + research, but a prompt-injected one must never reach a
-        # catastrophic primitive → 'develop' context (denies catastrophic only).
-        # Other task types stay ungated to preserve existing behavior. (audit P1.1)
+        # See _tools_context_for_task_type for the mapping + why it never returns
+        # None any more (audit P1.1, AI-02).
         task_display_id = str(task.get("display_id") or "").strip()
-        if task_type == "research":
-            task_tools_context = "research"
-        elif task_type in {"develop_candidate", "code_strategy"}:
-            task_tools_context = "develop"
-        else:
-            task_tools_context = None
+        task_tools_context = _tools_context_for_task_type(task_type)
         tool_context_tokens = set_tool_context(
             agent_id,
             task_display_id or format_prefixed_id("T", int(task_id)),

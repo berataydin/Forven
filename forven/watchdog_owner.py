@@ -31,17 +31,25 @@ def _watchdog_owner_path(repo_root: str | Path | None = None) -> Path:
 
 
 def _process_exists(pid: int | None) -> bool:
+    """Is `pid` alive? Delegates to the ONE liveness implementation.
+
+    HARDEN-DATA-OPS (watchdog-oskill-windows): this used to hand-roll
+    ``os.kill(pid, 0)``. CORRECTION to the audit note that motivated this — the
+    probe does NOT terminate the target: CPython's Windows os.kill special-cases
+    signal 0 (OpenProcess, then return; verified on 3.11.9, where sig 0 leaves
+    the process running and sig 9 kills it). What IS wrong with it is the access
+    mask: os.kill opens the handle with PROCESS_ALL_ACCESS, which
+    ACCESS_DENIEDs on a process owned by another user or running elevated, so
+    liveness came back only via the PermissionError branch. runtime_health's
+    ``pid_exists`` probes with PROCESS_QUERY_LIMITED_INFORMATION (and keeps the
+    os.kill(0) branch for POSIX) — one implementation, correct across integrity
+    levels, instead of a fifth private copy here.
+    """
     if not isinstance(pid, int) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    from forven.runtime_health import pid_exists
+
+    return bool(pid_exists(pid))
 
 
 def _coerce_int(value: Any) -> int | None:

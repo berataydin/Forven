@@ -200,6 +200,12 @@ class HyperliquidInfoClient(Protocol):
     def user_state(self, address: str, dex: str = "") -> Any:
         ...
 
+    def user_fills(self, address: str) -> Any:
+        ...
+
+    def user_fills_by_time(self, address: str, start_time: int, end_time: int | None = None) -> Any:
+        ...
+
 
 class _HyperliquidDirectInfoClient:
     """Direct `/info` client used when the SDK bootstrap fails on malformed metadata."""
@@ -237,6 +243,25 @@ class _HyperliquidDirectInfoClient:
 
     def user_state(self, address: str, dex: str = "") -> Any:
         return self._post({"type": "clearinghouseState", "user": address, "dex": dex})
+
+    # HL-FILLS-1: the fill ledger was MISSING from this client, so every
+    # get_user_fills() call on the direct-/info fallback path (the DOCUMENTED
+    # normal path on testnet, whose spot-meta quirk breaks the SDK bootstrap)
+    # raised AttributeError and returned [] — silently disabling exit-price
+    # recovery, which stamps ghost-recovered closes at the reconcile-time mid
+    # instead of the true fill.
+    def user_fills(self, address: str) -> Any:
+        return self._post({"type": "userFills", "user": address})
+
+    def user_fills_by_time(self, address: str, start_time: int, end_time: int | None = None) -> Any:
+        payload: dict[str, Any] = {
+            "type": "userFillsByTime",
+            "user": address,
+            "startTime": int(start_time),
+        }
+        if end_time is not None:
+            payload["endTime"] = int(end_time)
+        return self._post(payload)
 
 
 def _warn_once(key: str, message: str, *args: object) -> None:
@@ -416,7 +441,95 @@ def _is_truthy(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-def _assert_execution_allowed(testnet: bool) -> None:
+_MAINNET_ARMING_WARNED = False
+
+
+def mainnet_arming_state() -> dict:
+    """Whether REAL-MONEY order placement is armed, and what that permits.
+
+    OPS-4: ``FORVEN_ALLOW_MAINNET`` is the single switch between "every order is
+    refused unless it resolves to testnet" and "orders can spend real funds", but
+    it was read exactly once, deep inside ``_assert_execution_allowed`` — never
+    logged, never surfaced. A live-armed instance was indistinguishable from a
+    testnet-only one. This is the read-only export for the health surface;
+    ``_assert_execution_allowed`` additionally logs a WARNING the first time it
+    observes the flag armed on a real mainnet order.
+    """
+    armed = _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET"))
+    master_key_override = _is_truthy(os.environ.get("FORVEN_HL_ALLOW_MASTER_KEY"))
+    state = {
+        "flag": "FORVEN_ALLOW_MAINNET",
+        "armed": armed,
+        "permits": (
+            "REAL-MONEY orders on the Hyperliquid MAINNET endpoint"
+            if armed
+            else "testnet orders only — any mainnet-resolving order is refused"
+        ),
+        "master_key_override_flag": "FORVEN_HL_ALLOW_MASTER_KEY",
+        "master_key_override_armed": master_key_override,
+    }
+    state.update(_mainnet_arming_age())
+    return state
+
+
+# OPS-4 (second half). Visibility alone does not answer "should this STILL be
+# armed?". FORVEN_ALLOW_MAINNET is a user-level env var, so an arming done for one
+# deliberate session outlives every restart afterwards, and the failure mode is
+# forgetting rather than deciding.
+#
+# A hard `armed_until` expiry was the audit's suggestion, and it is NOT the default
+# here. This system runs UNATTENDED: an expiry that lapses at 03:00 stops live
+# ENTRIES with nobody present to re-arm, converting a disclosure problem into a
+# silent trading outage. (Exits are unaffected either way — the arming refusal is
+# an entry guard only; see _assert_execution_allowed's exit_only contract.) So the
+# expiry is available and opt-in, while the thing that is ALWAYS on is the age:
+# how long this instance has been armed, surfaced in /api/health so a months-old
+# arming is visible rather than inferred.
+_ARMED_SINCE_KEY = "forven:mainnet:armed_since"
+
+
+def _mainnet_arming_age() -> dict:
+    """First-observation timestamp + age for the arming flag. Never raises."""
+    from datetime import datetime, timezone
+
+    if not _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET")):
+        return {"armed_since": None, "armed_age_hours": None, "armed_expires_at": None}
+    try:
+        from forven.db import kv_get, kv_set_best_effort
+
+        now = datetime.now(timezone.utc)
+        since_raw = kv_get(_ARMED_SINCE_KEY)
+        if not since_raw:
+            # First time this instance has seen the flag armed. Record it rather
+            # than the env var's mtime, which does not exist on Windows.
+            since_raw = now.isoformat()
+            kv_set_best_effort(_ARMED_SINCE_KEY, since_raw)
+        since = datetime.fromisoformat(str(since_raw))
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        age_hours = round((now - since).total_seconds() / 3600.0, 1)
+
+        expires_at = None
+        try:
+            from forven.config import get_settings
+
+            window = float((get_settings() or {}).get("mainnet_arming_expiry_hours") or 0)
+        except Exception:  # noqa: BLE001 — an unreadable setting means "no expiry"
+            window = 0.0
+        if window > 0:
+            from datetime import timedelta
+
+            expires_at = (since + timedelta(hours=window)).isoformat()
+        return {
+            "armed_since": since.isoformat(),
+            "armed_age_hours": age_hours,
+            "armed_expires_at": expires_at,
+        }
+    except Exception:  # noqa: BLE001 — diagnostics must never break the order path
+        return {"armed_since": None, "armed_age_hours": None, "armed_expires_at": None}
+
+
+def _assert_execution_allowed(testnet: bool, *, exit_only: bool = False) -> None:
     """Single chokepoint guarding every order-placing/cancelling call.
 
     Paper AND live modes both trade on Hyperliquid TESTNET (paper *is* testnet
@@ -426,10 +539,72 @@ def _assert_execution_allowed(testnet: bool) -> None:
     previous multi-caller "everyone remembers to pass testnet=True" convention into
     one auditable, unbypassable guard. Read-only functions (positions/account/mids)
     deliberately do NOT call this — they may legitimately read mainnet state.
+
+    MAINNET-GUARD-1: callers MUST pass the CREDENTIAL-RESOLVED network
+    (``_effective_testnet``), never their own requested flag — see that helper for
+    the near-miss this closes.
+
+    ``exit_only`` (MAINNET-GUARD-2): the arming REFUSAL is an entry guard, never an
+    exit guard. Resolving the real network correctly widened this guard onto
+    ``close_position`` — the reduce-only flatten the kill-switch calls WITHOUT a
+    testnet kwarg (``risk.close_all_positions``), which previously sailed past on
+    the ``testnet=True`` default. On a mainnet deployment that turned every
+    emergency flatten into ``RuntimeError`` unless the operator had armed the flag,
+    i.e. a system that cannot get OUT of a real position. Being unable to exit is
+    strictly more dangerous than entering unarmed, so a reduce-only exit is always
+    permitted; it is logged CRITICAL instead of raised. ONLY ``close_position``
+    may pass this — never market/limit/stop/take-profit/cancel/leverage.
     """
     if testnet:
         return
+    # Opt-in arming expiry (default OFF — see _mainnet_arming_age for why an
+    # unattended system does not get a hard cutoff by default). When configured
+    # and lapsed, the flag stops authorizing ENTRIES and this falls through to the
+    # same refusal an unarmed instance gets. Exits are unaffected: the exit_only
+    # carve-out below is evaluated after this, so a reduce-only flatten is still
+    # permitted on an expired arming. An expiry that could strand real capital
+    # would be worse than the staleness it guards against.
+    _expired = False
     if _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET")):
+        try:
+            from datetime import datetime, timezone
+
+            _exp = _mainnet_arming_age().get("armed_expires_at")
+            if _exp:
+                _deadline = datetime.fromisoformat(str(_exp))
+                if _deadline.tzinfo is None:
+                    _deadline = _deadline.replace(tzinfo=timezone.utc)
+                _expired = datetime.now(timezone.utc) > _deadline
+        except Exception:  # noqa: BLE001 — an unreadable expiry must not disarm a live instance
+            _expired = False
+        if _expired and not exit_only:
+            raise RuntimeError(
+                "Refusing to place a MAINNET order: FORVEN_ALLOW_MAINNET is set but the "
+                "configured arming window (mainnet_arming_expiry_hours) has LAPSED. "
+                "Re-arm deliberately by clearing the 'forven:mainnet:armed_since' key, or "
+                "set mainnet_arming_expiry_hours to 0 to disable the expiry. Exits are "
+                "still permitted."
+            )
+    if _is_truthy(os.environ.get("FORVEN_ALLOW_MAINNET")) and not _expired:
+        # OPS-4: make the arming visible at least once per process, at the moment
+        # it actually authorizes real money, rather than only in a config file.
+        global _MAINNET_ARMING_WARNED
+        if not _MAINNET_ARMING_WARNED:
+            _MAINNET_ARMING_WARNED = True
+            log.warning(
+                "REAL-MONEY TRADING ARMED: a MAINNET order just passed the execution guard "
+                "because FORVEN_ALLOW_MAINNET is set. Orders from this process can spend real "
+                "funds. Unset the env var (and restart) to return to testnet-only."
+            )
+        return
+    if exit_only:
+        log.critical(
+            "UNARMED MAINNET EXIT PERMITTED: a reduce-only close resolved to the MAINNET "
+            "endpoint while FORVEN_ALLOW_MAINNET is NOT set. Refusing it would strand real "
+            "capital, so the exit proceeds. Real MAINNET funds are at risk on this instance — "
+            "flatten and reconcile, then either arm the flag deliberately or repoint the "
+            "credentials at testnet."
+        )
         return
     raise RuntimeError(
         "Refusing to place a MAINNET order: resolved testnet=False but "
@@ -758,6 +933,25 @@ def resolve_configured_testnet(default_testnet: bool | None = None) -> bool:
     except Exception:
         creds = None
     return _resolve_testnet_flag(bool(default_testnet), creds)
+
+
+def _effective_testnet(requested_testnet: bool) -> bool:
+    """The network an order will ACTUALLY hit — resolved exactly like get_exchange.
+
+    MAINNET-GUARD-1: the mainnet guard used to gate on the REQUESTED flag while
+    ``get_exchange`` picks the endpoint from the CREDENTIAL-resolved flag
+    (``_resolve_testnet_flag`` — a configured ``USE_TESTNET`` overrides the
+    caller's argument). A caller passing ``testnet=True`` against
+    mainnet-resolving credentials therefore sailed straight past
+    ``_assert_execution_allowed`` and placed REAL MAINNET orders, with every log
+    line and payload saying "testnet". Every execution path now resolves the
+    network ONCE through here and gates (and prices, and routes) on THAT value,
+    so the guard and the endpoint can never disagree again.
+
+    A credential-load failure resolves to the requested flag, which is safe:
+    ``get_exchange`` raises on the same failure, so no order is placed.
+    """
+    return resolve_configured_testnet(bool(requested_testnet))
 
 
 # Hard timeout on every Hyperliquid HTTP call. The SDK defaults to NO timeout,
@@ -1353,6 +1547,8 @@ def market_order(
         from forven.sim.mock_exchange import sim_market_order
         return sim_market_order(asset, side, size, stop_loss_price, take_profit_price)
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route/price off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     is_buy = side.upper() in ("B", "BUY", "LONG")
@@ -1514,6 +1710,8 @@ def limit_order(
         from forven.sim.mock_exchange import sim_market_order
         return sim_market_order(asset, side, size, stop_loss_price, take_profit_price)
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route/price off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     is_buy = side.upper() in ("B", "BUY", "LONG")
@@ -1635,6 +1833,8 @@ def cancel_order(asset: str, oid: int, testnet: bool = True, vault_address: str 
     if is_sim_active():
         return {"status": "ok", "cancelled": True, "oid": oid}
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     result = _submit("order_cancel", hl_trade_breaker, exchange.cancel, asset.upper(), oid)
@@ -1680,6 +1880,8 @@ def place_protective_stop(
     if normalized_stop <= 0:
         return {"error": "Protective stop requires a positive stop price"}
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     asset = asset.upper()
@@ -1774,6 +1976,8 @@ def place_take_profit(
     if normalized_tp <= 0:
         return {"error": "Take-profit requires a positive price"}
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     asset = asset.upper()
@@ -1853,6 +2057,8 @@ def set_leverage(
     if is_sim_active():
         return {"status": "ok", "sim": True}
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     cross = configured_margin_is_cross() if is_cross is None else bool(is_cross)
@@ -1895,6 +2101,8 @@ def cancel_all_orders(asset: str | None = None, testnet: bool = True, vault_addr
     if is_sim_active():
         return []
 
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route off it.
+    testnet = _effective_testnet(testnet)
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     # HL-5: read open orders through the breaker/retry wrapper (like every other account
@@ -1938,7 +2146,12 @@ def close_position(
         from forven.sim.mock_exchange import sim_close_position
         return sim_close_position(asset, size, side)
 
-    _assert_execution_allowed(testnet)
+    # MAINNET-GUARD-1: resolve the network ONCE, then guard/route/price off it.
+    # MAINNET-GUARD-2: exit_only — a reduce-only flatten is NEVER refused for want
+    # of the arming flag (see _assert_execution_allowed). The resolved flag is still
+    # what routes and prices the order, so the guard and the endpoint stay in sync.
+    testnet = _effective_testnet(testnet)
+    _assert_execution_allowed(testnet, exit_only=True)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
     asset = asset.upper()
     is_buy = side.lower() in ("b", "buy")
@@ -1958,6 +2171,14 @@ def close_position(
     # so a degraded price API can't hang the order path and an emergency close
     # can still price off the last cached mid.
     mid = float(get_all_mids(testnet).get(asset, 0) or 0)
+    if mid == 0 and not hl_price_breaker.can_execute():
+        # PRICE-STALE-1's EXIT carve-out. The staleness bound must never be the
+        # thing that strands an open position: this close is a marketable IOC
+        # whose limit is protective (a floor on a sell, a ceiling on a buy), so a
+        # stale mid can only make it fail to fill — which now surfaces as an error
+        # below — never fill worse. Refusing to price it, by contrast, guarantees
+        # the position stays open. Entries and marks keep failing closed.
+        mid = float(_cached_mids_snapshot(allow_stale=True).get(asset, 0) or 0)
     if mid == 0:
         return {"error": f"Could not get mid price for {asset}"}
 
@@ -1981,7 +2202,7 @@ def close_position(
     # leaving a residual position that must stay protected (H3).
     fill_price = _extract_fill_price(result)
     filled_size = _extract_fill_size(result)
-    return {
+    payload = {
         **result,
         "mid": mid,
         "close_price": price,
@@ -1990,6 +2211,24 @@ def close_position(
         "filled_size": filled_size,
         "slippage_bps": round(frac * 10000.0, 2),
     }
+    # HL-CLOSE-1: NOTHING filled. HyperLiquid reports a rejected reduce-only IOC as
+    # a per-status {"error": ...} under a top-level status:"ok", which this returned
+    # verbatim inside a success-shaped payload — so a caller checking only
+    # result.get("error") marked a STILL-OPEN position CLOSED and booked
+    # close_price, the 3%-through-mid aggressive limit that never traded. Fail
+    # CLOSED, exactly like place_protective_stop, so every caller sees the
+    # rejection. Any evidence of a fill (avgPx or a positive totalSz) keeps the
+    # success shape untouched — a real partial fill must never read as an error.
+    if fill_price is None and not (filled_size and filled_size > 0) and not payload.get("error"):
+        payload["error"] = (
+            _first_status_error(result)
+            or "close order returned no fill (rejected by exchange)"
+        )
+        log.error(
+            "close_position %s %s size=%s: no fill returned — %s",
+            asset, side, size, payload["error"],
+        )
+    return payload
 
 
 def get_positions(testnet: bool = True, *, account_address: str | None = None) -> dict:
@@ -2159,6 +2398,17 @@ def get_user_fills(
             )
         else:
             fills = _with_breaker("account", hl_account_breaker, info.user_fills, address)
+    except AttributeError as exc:
+        # HL-FILLS-1: an info client without a fills API is a MISSING CAPABILITY,
+        # not a transient error — every exit-price recovery silently degrades to
+        # the reconcile-time mid for as long as it lasts. Debug hid that for the
+        # whole life of the direct-/info fallback client; warn so it is visible.
+        log.warning(
+            "get_user_fills: info client %s exposes no fills API (%s) — exit-price "
+            "recovery from the fill ledger is DISABLED",
+            type(info).__name__, exc,
+        )
+        return []
     except Exception as exc:
         log.debug("get_user_fills: query failed (%s)", exc)
         return []
@@ -2166,18 +2416,127 @@ def get_user_fills(
     return list(fills) if isinstance(fills, (list, tuple)) else []
 
 
+# PRICE-STALE-1: how old a cached mid may be before the breaker-open fallback
+# refuses to serve it. Matches the scanner's _PRICE_CACHE_STALE_SECONDS so every
+# consumer of a cached mark uses the same freshness contract.
+_CACHED_MID_MAX_AGE_SECONDS = 120.0
+_CACHED_MID_UNDATED_WARNED = False
+
+# PRICE-STALE-2: the wall-clock of the last SUCCESSFUL LIVE ``all_mids`` fetch —
+# the only clock in this process that a degraded HyperLiquid price API cannot
+# refresh. ``daemon_state.last_tick_ts`` looked like the natural freshness stamp
+# but is CIRCULAR: while the breaker is open the daemon's fallback poll
+# (daemon.py, every 15s) and HyperLiquidFeed._run_http_fallback (every 5s) both
+# call get_all_mids, receive THIS cache back, and the resulting tick re-stamps
+# last_tick_ts + republishes market:prices with a fresh updated_at. The same
+# cached numbers therefore looked <15s old forever and the bound never tripped —
+# it only ever detected a DEAD DAEMON, never the dead price API it is scoped to.
+# None = no live fetch has ever succeeded in this process (so the HL API has been
+# unreachable from here since start); the daemon stamp is then the only signal we
+# have, and it is still worth enforcing because another process may be feeding
+# genuinely fresh prices (e.g. the binance-source config) into the same cache.
+_LAST_LIVE_MIDS_TS: float | None = None
+
+
+def _cached_mids_age_seconds(state: dict) -> float | None:
+    """Age of the breaker-open cache: the WORST of every clock we can resolve."""
+    ages: list[float] = []
+
+    if _LAST_LIVE_MIDS_TS is not None:
+        # PRICE-STALE-2: the non-circular bound. Once this process has seen the
+        # live API work, how long ago that was IS the staleness of anything the
+        # breaker-open path can serve.
+        ages.append(max(0.0, time.time() - _LAST_LIVE_MIDS_TS))
+
+    daemon_age: float | None = None
+    tick_ts = state.get("last_tick_ts") if isinstance(state, dict) else None
+    if tick_ts is not None:
+        try:
+            daemon_age = max(0.0, time.time() - float(tick_ts))
+        except (TypeError, ValueError):
+            daemon_age = None
+    if daemon_age is None:
+        # Same snapshot, written by the same daemon tick, but with a publish-time
+        # stamp — read only when daemon_state carries no usable tick timestamp, so
+        # the healthy path stays a single KV read.
+        try:
+            from forven.market_cache import load_price_snapshot
+
+            _snapshot_prices, daemon_age = load_price_snapshot()
+        except Exception:
+            daemon_age = None
+    if daemon_age is not None:
+        ages.append(float(daemon_age))
+
+    # WORST clock wins: the daemon stamp alone is defeatable (circular), and the
+    # live stamp alone says nothing about a daemon that stopped writing.
+    return max(ages) if ages else None
+
+
+def _cached_mids_snapshot(*, allow_stale: bool = False) -> dict[str, float]:
+    """The daemon's last-known mids for the breaker-open path, bounded by AGE.
+
+    PRICE-STALE-1: this fallback exists so an emergency close can still price
+    itself while the price API is degraded — but it had NO age check, so a daemon
+    that had been down for hours happily priced live orders (and contaminated
+    mark_price) off hours-old mids. Past the bound we return {} and let the caller
+    fail closed (callers already handle an empty mid map by refusing the order).
+
+    ``allow_stale`` is the EXIT carve-out: refusing to price a reduce-only close
+    would strand real capital, and the close is a marketable IOC whose limit is a
+    floor/ceiling in the protective direction — a stale mid can only make it fail
+    to fill (which now surfaces as an error), never fill worse. Entries and marks
+    keep failing closed.
+    """
+    state = kv_get("daemon_state", {}) or {}
+    cached = state.get("last_prices") if isinstance(state, dict) else None
+    if not isinstance(cached, dict) or not cached:
+        return {}
+
+    age_seconds = _cached_mids_age_seconds(state if isinstance(state, dict) else {})
+    if age_seconds is not None and age_seconds > _CACHED_MID_MAX_AGE_SECONDS:
+        if not allow_stale:
+            log.warning(
+                "get_all_mids: price breaker open and the cached mids are %.0fs old "
+                "(limit %.0fs) — returning no prices rather than pricing off a stale mark",
+                age_seconds, _CACHED_MID_MAX_AGE_SECONDS,
+            )
+            return {}
+        log.critical(
+            "get_all_mids: serving %.0fs-old cached mids (limit %.0fs) to an EXIT path — "
+            "refusing would strand an open position. The resulting close is a marketable "
+            "IOC, so a stale mid can only fail to fill, never fill worse.",
+            age_seconds, _CACHED_MID_MAX_AGE_SECONDS,
+        )
+    if age_seconds is None:
+        # Undatable snapshot (a legacy/hand-written daemon_state blob, with no live
+        # fetch yet in this process). Serving it preserves the emergency-close fast
+        # path this fallback exists for, but it is unverifiable freshness — say so once.
+        global _CACHED_MID_UNDATED_WARNED
+        if not _CACHED_MID_UNDATED_WARNED:
+            _CACHED_MID_UNDATED_WARNED = True
+            log.warning(
+                "get_all_mids: cached mids carry no timestamp (daemon_state.last_tick_ts "
+                "and market:prices both missing) — serving them UNVERIFIED"
+            )
+    return {str(k): float(v) for k, v in cached.items() if _is_valid_price(v)}
+
+
 def get_all_mids(testnet: bool = True) -> dict[str, float]:
-    """Get all mid prices."""
+    """Get all mid prices.
+
+    Fails CLOSED on a stale breaker-open cache. EXIT paths that must not be
+    blocked by that call ``_cached_mids_snapshot(allow_stale=True)`` themselves
+    (see ``close_position``) — the signature stays as every caller in the repo
+    already binds it.
+    """
     from forven.sim.clock import is_sim_active
     if is_sim_active():
         from forven.sim.mock_exchange import sim_get_all_mids
         return sim_get_all_mids()
 
     if not hl_price_breaker.can_execute():
-        cached = kv_get("daemon_state", {}).get("last_prices")
-        if isinstance(cached, dict):
-            return {str(k): float(v) for k, v in cached.items() if _is_valid_price(v)}
-        return {}
+        return _cached_mids_snapshot()
 
     try:
         _, info, _ = get_exchange(testnet)
@@ -2195,6 +2554,11 @@ def get_all_mids(testnet: bool = True) -> dict[str, float]:
             continue
         if _is_valid_price(price):
             prices[str(k).upper()] = price
+    if prices:
+        # PRICE-STALE-2: the one clock the degraded-API fallback cannot refresh.
+        # Stamped only on a LIVE fetch that actually returned usable prices.
+        global _LAST_LIVE_MIDS_TS
+        _LAST_LIVE_MIDS_TS = time.time()
     return prices
 
 
@@ -2252,6 +2616,14 @@ def _is_clean_ws_close(exc: Exception) -> bool:
     return "1000 (ok)" in text or "received 1000" in text
 
 
+# WS-RECONNECT-1: a websocket session counts as PRODUCTIVE once it dispatched a
+# price or simply stayed up this long. A clean close of a productive session is
+# HyperLiquid's routine ~12-min allMids rotation (reconnect immediately); a clean
+# close that arrives before this is a server refusing us, and reconnecting with
+# zero delay turns it into an unthrottled connect loop.
+_WS_PRODUCTIVE_SESSION_SECONDS = 5.0
+
+
 class HyperLiquidFeed:
     """Async price feed with websocket priority and HTTP fallback."""
 
@@ -2268,10 +2640,13 @@ class HyperLiquidFeed:
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
         self._fallback_counter = 0
+        self._session_dispatched = False
 
     async def start(self):
         """Start websocket loop with fallback to HTTP when needed."""
         while True:
+            self._session_dispatched = False
+            session_started = time.monotonic()
             try:
                 await self._run_websocket()
             except Exception as exc:
@@ -2282,10 +2657,31 @@ class HyperLiquidFeed:
                 # the feed and spammed a misleading WARNING every cycle). Only
                 # genuine connect/recv errors take the fallback + backoff path.
                 if _is_clean_ws_close(exc):
-                    log.debug(
-                        "HyperLiquidFeed websocket closed cleanly (%s); reconnecting", exc
+                    session_seconds = time.monotonic() - session_started
+                    productive = (
+                        self._session_dispatched
+                        or session_seconds >= _WS_PRODUCTIVE_SESSION_SECONDS
                     )
-                    self._reconnect_delay = 1.0
+                    if productive:
+                        log.debug(
+                            "HyperLiquidFeed websocket closed cleanly after %.1fs (%s); reconnecting",
+                            session_seconds, exc,
+                        )
+                        self._reconnect_delay = 1.0
+                        continue
+                    # WS-RECONNECT-1: clean close of an UNPRODUCTIVE session — a
+                    # server closing us out immediately. The zero-delay reconnect
+                    # above would spin this into an unthrottled connect loop, so
+                    # apply the same exponential backoff a hard failure gets
+                    # (without dropping to the HTTP fallback: the close is still
+                    # clean, so the socket may well come back).
+                    log.warning(
+                        "HyperLiquidFeed websocket closed cleanly after only %.1fs with no prices "
+                        "(%s); backing off %.1fs before reconnecting",
+                        session_seconds, exc, self._reconnect_delay,
+                    )
+                    await asyncio.sleep(self._reconnect_delay)
+                    self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
                     continue
                 log.warning("HyperLiquidFeed websocket failed, switching to HTTP fallback: %s", exc)
                 self._ws_failed = True
@@ -2323,7 +2719,10 @@ class HyperLiquidFeed:
                 "method": "subscribe",
                 "subscription": {"type": "allMids"},
             }))
-            self._reconnect_delay = 1.0
+            # WS-RECONNECT-1: connecting alone no longer clears the backoff — a
+            # server that accepts and instantly closes would otherwise reset the
+            # delay to 1s on every attempt and defeat the throttle. The FIRST
+            # dispatched price (below) is what proves the session productive.
             self._ws_failed = False
             self._fallback_counter = 0
             while True:
@@ -2337,6 +2736,9 @@ class HyperLiquidFeed:
                         for coin in active
                         if coin in prices and _is_valid_price(prices[coin])
                     }
+                if prices:
+                    self._session_dispatched = True
+                    self._reconnect_delay = 1.0
                 await self._dispatch_prices(prices)
 
     async def _run_http_fallback(self):

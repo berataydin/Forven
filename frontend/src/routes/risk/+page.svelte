@@ -21,6 +21,13 @@
 	let resetBusy = false;
 	let haltBusy = false;
 	let realtime: RealtimeRefreshController | null = null;
+	// FE-01/FE-03: per-source freshness. `*Stale` = that read failed on the most
+	// recent poll (we may still be rendering its last-good payload);
+	// `lastTelemetryAt` = the last time BOTH landed, rendered as a visible stamp so
+	// a frozen page is obvious instead of looking like a calm one.
+	let dashboardStale = false;
+	let riskStale = false;
+	let lastTelemetryAt: Date | null = null;
 
 	$: limits = risk?.limits ?? {};
 	$: portfolio = (scope === 'paper' ? risk?.portfolio_paper : risk?.portfolio) ?? {};
@@ -78,9 +85,14 @@
 	$: liveBudgetGroups = Object.entries(liveBudget?.per_group ?? {});
 	// BOOK-BUDGET-1: per-wallet (direction book) capacity vs usage.
 	$: liveBudgetBooks = Object.entries(liveBudget?.per_book ?? {});
-	// GO-LIVE-1: per-strategy notional ceilings accepted at go-live.
-	$: liveCeilings = Object.entries(liveBudget?.strategy_ceilings ?? {});
-	$: ceilingsMissing = liveBudget?.ceilings_missing ?? [];
+	// SLICE-1: "no ceiling" is no longer a gap to warn about — it is the DEFAULT
+	// (the account is split equally across the live cohort). Only warn when the
+	// slice itself cannot be resolved, which is the case that genuinely leaves a
+	// strategy bounded by nothing but the account-wide caps.
+	$: capitalSlice = liveBudget?.capital_slice ?? null;
+	$: sliceUnavailable = Boolean(capitalSlice && !capitalSlice.slice_usd);
+	$: ceilingsMissing = sliceUnavailable ? (liveBudget?.ceilings_missing ?? []) : [];
+	$: strategySizing = liveBudget?.strategy_sizing ?? [];
 	// LIQ-1: order-time liquidity guard state + recent admit/block decisions.
 	$: liquidityGuard = risk?.liquidity_guard_live ?? null;
 	$: liquidityDecisions = liquidityGuard?.recent_decisions ?? [];
@@ -97,9 +109,20 @@
 			].filter((cb) => cb.state)
 		: [];
 
-	// Distinguish "no telemetry yet" from a genuine all-zero/safe reading. Both
-	// upstream calls populate `dashboard`/`risk`; if neither resolved we have no data.
-	$: hasRiskData = dashboard !== null || risk !== null;
+	// FE-01: the gauges need BOTH sources. Drawdown/daily-loss come from
+	// /api/dashboard, but every LIMIT they are graded against (`risk.limits`) and
+	// the portfolio risk figure come from /api/risk. With `||` here, a failed
+	// /api/risk while /api/dashboard succeeded rendered three confident 0.00%
+	// gauges against fabricated default limits and NO error banner — the page
+	// claimed "no drawdown, no risk" precisely when it had stopped knowing.
+	$: hasRiskData = dashboard !== null && risk !== null;
+	// A source that failed on the LAST poll while we still hold its previous
+	// payload: the numbers on screen are real but no longer current. Never
+	// substitute zeros for this — say so instead.
+	$: telemetryStale = dashboardStale || riskStale;
+	$: staleSources = [dashboardStale ? 'dashboard' : '', riskStale ? 'risk' : '']
+		.filter(Boolean)
+		.join(' + ');
 
 	$: gauges = [
 		{ label: 'Drawdown', value: currentDrawdown, max: Number(limits.max_drawdown ?? 0.1) },
@@ -162,15 +185,25 @@
 
 		if (dashboardResult.status === 'fulfilled') {
 			dashboard = dashboardResult.value;
+			dashboardStale = false;
+		} else {
+			dashboardStale = true;
 		}
 
 		if (riskResult.status === 'fulfilled') {
 			risk = riskResult.value;
+			riskStale = false;
+		} else {
+			riskStale = true;
 		}
 
 		if (dashboardResult.status === 'rejected' && riskResult.status === 'rejected') {
 			error = 'Risk telemetry unavailable.';
 		}
+
+		// FE-03: only stamp when BOTH reads landed — the gauges are a joint
+		// product, so a half-fresh page is a stale page.
+		if (!dashboardStale && !riskStale) lastTelemetryAt = new Date();
 
 		loading = false;
 	}
@@ -200,10 +233,42 @@
 
 	// GO-LIVE-1: adjust (or add) a live strategy's per-asset notional ceiling
 	// after go-live. 0 clears it — only the account-wide budget caps remain.
+	// SLICE-1: switch a strategy back to system sizing (its equal share of the
+	// account). Clearing the manual cap IS system sizing — there is no separate
+	// "on" state to set.
+	async function useSystemSizing(strategyId: string) {
+		const sliceLabel = capitalSlice?.slice_usd
+			? `~${formatBudgetUsd(Number(capitalSlice.slice_usd))} (1/${capitalSlice.cohort_size} of the account)`
+			: 'its equal share of the account';
+		if (
+			typeof window !== 'undefined' &&
+			!window.confirm(
+				`Let the system size ${strategyId}?\n\nIt will trade at ${sliceLabel}, ` +
+					`re-divided automatically as the account changes or strategies are added.\n\n` +
+					`This removes your manual cap.`
+			)
+		)
+			return;
+		error = '';
+		try {
+			await setLiveNotionalCeiling(strategyId, null);
+			actionMessage = `${strategyId} now uses system sizing.`;
+			await loadRiskData();
+		} catch (e) {
+			error = e instanceof Error ? e.message : `Failed to update sizing for ${strategyId}`;
+		}
+	}
+
 	async function editCeiling(strategyId: string, current?: number) {
+		const sliceHint = capitalSlice?.slice_usd
+			? `\n\nSystem sizing would give it ${formatBudgetUsd(Number(capitalSlice.slice_usd))} ` +
+				`(1/${capitalSlice.cohort_size} of the account). A manual cap only ever makes it SMALLER — ` +
+				`the lower of the two always wins.`
+			: '';
 		const raw = window.prompt(
-			`Per-asset live notional ceiling (USD) for ${strategyId} — the largest live position it may hold, enforced on every order.\n\nEnter 0 to clear the ceiling.`,
-			String(current && current > 0 ? current : 1000)
+			`Largest live position (USD) for ${strategyId}.\n\nThis caps the POSITION SIZE, not the loss — ` +
+				`the stop bounds the loss and is much closer.${sliceHint}\n\nEnter 0 to return to system sizing.`,
+			String(current && current > 0 ? current : Math.round(Number(capitalSlice?.slice_usd ?? 1000)))
 		);
 		if (raw === null) return;
 		const value = Number(raw);
@@ -216,8 +281,8 @@
 			await setLiveNotionalCeiling(strategyId, value === 0 ? null : value);
 			actionMessage =
 				value === 0
-					? `Ceiling cleared for ${strategyId}.`
-					: `Ceiling for ${strategyId} set to $${value.toLocaleString()}.`;
+					? `${strategyId} now uses system sizing.`
+					: `${strategyId} capped at $${value.toLocaleString()} per position.`;
 			await loadRiskData();
 		} catch (e) {
 			error = e instanceof Error ? e.message : `Failed to update ceiling for ${strategyId}`;
@@ -296,9 +361,15 @@
 			/* ignore */
 		}
 		void loadRiskData();
+		// FE-03: keep the interval poller running EVEN while the websocket is
+		// connected. Drawdown, equity and daily PnL move with the mark, and mark
+		// movement emits none of the whitelisted WS events — with the default
+		// (poll only while WS is offline) these gauges froze for hours on a
+		// healthy socket, which is exactly when an operator trusts them most.
 		realtime = createRealtimeRefresh(loadRiskData, {
 			fallbackMs: 20_000,
 			wsDebounceMs: 1200,
+			pollWhenWsOfflineOnly: false,
 		});
 		realtime.start();
 	});
@@ -416,6 +487,21 @@
 		</div>
 	{/if}
 
+	<!-- FE-01/FE-03: staleness strip + explicit "as of" stamp. A risk page that
+	     silently stops updating is worse than one that admits it. -->
+	<div class="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+		<span class="text-[#666]">
+			Telemetry as of
+			<span class="text-[#888]">{lastTelemetryAt ? lastTelemetryAt.toLocaleTimeString() : '—'}</span>
+		</span>
+		{#if telemetryStale}
+			<span class="border border-[#3a2f1a] bg-[#161208] px-2 py-1 text-yellow-200">
+				STALE — the {staleSources} read failed on the last refresh; figures shown are the
+				last known values, not current ones.
+			</span>
+		{/if}
+	</div>
+
 	{#if circuitBreakers.length > 0}
 		<div class="flex flex-wrap items-center gap-2">
 			<span class="text-[10px] uppercase tracking-wider text-[#666]">Circuit Breakers</span>
@@ -510,7 +596,9 @@
 	</div>
 	{:else if !loading}
 		<div class="border border-[#3a2f1a] bg-[#161208] p-4 text-sm text-yellow-200">
-			Risk telemetry is unavailable. Gauges and limits cannot be displayed — the values below are not safe-zero readings.
+			Risk telemetry is incomplete{staleSources ? ` (${staleSources} unavailable)` : ''}. Gauges and
+			limits are hidden on purpose — rendering them from a partial read would show 0.00% where the
+			true value is simply unknown.
 		</div>
 	{/if}
 
@@ -560,36 +648,92 @@
 				</div>
 			</div>
 		{/if}
-		{#if liveCeilings.length > 0}
+		{#if strategySizing.length > 0}
 			<div class="pt-1">
-				<div class="text-[10px] uppercase tracking-wider text-[#666] mb-1">Go-live notional ceilings</div>
+				<div class="flex items-baseline justify-between mb-1">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">Position sizing</div>
+					{#if capitalSlice?.slice_usd}
+						<div class="text-[10px] text-[#666]">
+							account split {capitalSlice.cohort_size} ways &middot;
+							<span class="text-[#888]">{formatBudgetUsd(Number(capitalSlice.slice_usd))}</span> each
+						</div>
+					{/if}
+				</div>
 				<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
-					{#each liveCeilings as [sid, ceiling]}
-						{@const ceilingStage = String(ceiling.stage ?? '')}
-						<div class="border border-[#222] bg-[#050505] px-3 py-2 flex items-center justify-between text-[11px]">
-							<span class="flex items-center gap-2 min-w-0">
-								<a href={`/lab/strategy/${sid}`} class="font-mono text-white hover:text-[#888]">{sid}</a>
-								{#if ceilingStage}
-									<span
-										class="border px-1 py-0.5 text-[9px] uppercase tracking-wider {ceilingStage === 'live_graduated' ? 'border-red-900 text-red-400' : 'border-[#333] text-[#666]'}"
-										title={ceilingStage === 'live_graduated'
-											? 'Live strategy'
-											: `Armed for live while at ${ceilingStage} stage — clear the ceiling to disarm`}
+					{#each strategySizing as row}
+						{@const stage = String(row.stage ?? '')}
+						{@const isManual = row.mode === 'manual'}
+						<div class="border border-[#222] bg-[#050505] px-3 py-2 text-[11px]">
+							<div class="flex items-center justify-between gap-2">
+								<span class="flex items-center gap-2 min-w-0">
+									<a
+										href={`/lab/strategy/${row.strategy_id}`}
+										class="font-mono text-white hover:text-[#888]">{row.strategy_id}</a
 									>
-										{ceilingStage === 'live_graduated' ? 'LIVE' : ceilingStage}
-									</span>
-								{/if}
-							</span>
-							<span class="flex items-center gap-2 text-[#888]">
-								{formatBudgetUsd(Number(ceiling.ceiling_usd ?? 0))} max/asset
-								<button
-									type="button"
-									class="border border-[#2b2b2b] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[#666] transition hover:text-white"
-									on:click={() => void editCeiling(sid, Number(ceiling.ceiling_usd ?? 0))}
-								>Edit</button>
-							</span>
+									{#if stage}
+										<span
+											class="border px-1 py-0.5 text-[9px] uppercase tracking-wider {stage ===
+											'live_graduated'
+												? 'border-red-900 text-red-400'
+												: 'border-[#333] text-[#666]'}"
+											title={stage === 'live_graduated'
+												? 'Live strategy'
+												: `Armed for live while at ${stage} stage`}
+										>
+											{stage === 'live_graduated' ? 'LIVE' : stage}
+										</span>
+									{/if}
+								</span>
+								<span
+									class="border px-1 py-0.5 text-[9px] uppercase tracking-wider {isManual
+										? 'border-[#3a3a1a] text-yellow-500'
+										: 'border-[#1a3a2a] text-emerald-500'}"
+									title={isManual
+										? 'You set a fixed cap for this strategy'
+										: 'The system divides the account equally and re-divides it automatically'}
+								>
+									{isManual ? 'Manual' : 'System'}
+								</span>
+							</div>
+							<div class="mt-1.5 flex items-center justify-between gap-2">
+								<span class="text-[#888]">
+									{#if row.effective_usd}
+										<span class="text-white">{formatBudgetUsd(Number(row.effective_usd))}</span>
+										max position
+										{#if isManual && row.slice_usd}
+											<span class="text-[#555]">
+												&middot; system would give {formatBudgetUsd(Number(row.slice_usd))}
+											</span>
+										{/if}
+									{:else}
+										<span class="text-yellow-500">size unavailable</span>
+									{/if}
+								</span>
+								<span class="flex items-center gap-1.5">
+									{#if isManual}
+										<button
+											type="button"
+											class="border border-[#2b2b2b] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[#666] transition hover:text-white"
+											on:click={() => void useSystemSizing(row.strategy_id)}
+											title="Remove the manual cap and use this strategy's equal share of the account"
+										>Use system</button>
+									{/if}
+									<button
+										type="button"
+										class="border border-[#2b2b2b] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-[#666] transition hover:text-white"
+										on:click={() =>
+											void editCeiling(row.strategy_id, Number(row.manual_usd ?? 0))}
+									>{isManual ? 'Edit' : 'Set my own'}</button>
+								</span>
+							</div>
 						</div>
 					{/each}
+				</div>
+				<div class="mt-1.5 text-[10px] text-[#555]">
+					System sizing gives each live strategy an equal share of the account, re-divided as the
+					balance moves or strategies are added. A manual cap only ever makes a position smaller —
+					the lower of the two wins. Either way the figure is POSITION SIZE, not the amount at risk:
+					the stop bounds the loss and sits much closer.
 				</div>
 			</div>
 		{/if}

@@ -245,6 +245,34 @@ def evaluate_graduation_candidate(strategy: dict, settings: dict | None = None) 
     if not cost_ok:
         reasons.append(f"measured-cost gate: {cost_detail}")
 
+    # ENGINE-FRESHNESS (2026-07-26). This ladder does NOT route through
+    # policy.evaluate_promotion / _strict_robustness_reject, so the live gate's
+    # stale-engine refusal does not reach it. Without this check the recommender
+    # can tell the operator a strategy is READY on evidence the actual promotion
+    # gate will then refuse — recommending something un-promotable is worse than
+    # recommending nothing, because it burns the operator's trust in the signal.
+    #
+    # It matters right now: bumping BACKTEST_ENGINE_VERSION to 6 (per-print
+    # funding intervals; every non-8h perp was mispriced before it) invalidated
+    # every pre-bump verdict at once, so the whole paper cohort is currently
+    # judged on evidence scored under a different cost model.
+    # Reuses policy._check_engine_artifact_freshness rather than re-deriving the
+    # rule: it already applies the deleted_at filter, the required-type set and
+    # the unstamped-artifact grandfathering, and a second implementation of a
+    # capital gate is a second thing to drift.
+    try:
+        from forven.policy import _check_engine_artifact_freshness
+
+        fresh, freshness_detail = _check_engine_artifact_freshness(sid)
+        evidence["engine_artifacts_fresh"] = bool(fresh)
+        evidence["engine_artifacts_detail"] = str(freshness_detail)
+        if not fresh:
+            reasons.append(f"engine freshness: {freshness_detail}")
+    except Exception as exc:  # noqa: BLE001 — fail CLOSED: unverifiable provenance blocks
+        evidence["engine_artifacts_fresh"] = False
+        evidence["engine_artifacts_detail"] = f"unverifiable: {exc}"
+        reasons.append(f"engine freshness unverifiable ({exc}) — failing closed")
+
     multiplier = 1.0
     try:
         from forven.portfolio_allocator import live_risk_multiplier

@@ -404,9 +404,49 @@ def _tool_run_backtest(params: dict) -> str:
     except Exception as e:
         return f"Backtest failed: {e}"
 
+# AI-01 review (2026-07-25): explicit, recorded decision about the ruleset —
+# do not re-litigate this without reading the alternative that was rejected.
+#
+# `run_code` is a NUMERIC SCRATCHPAD, not an inspection tool. The AST guard it
+# runs is `ast_guard`'s strategy-module allowlist, so `from forven.db import
+# get_db`, `import sqlite3`, `import os`, `import pathlib` and friends are all
+# rejected; pandas/numpy/scipy/sklearn arithmetic is what survives.
+#
+# The rejected alternative was to widen the import allowlist in the 'interactive'
+# tools_context so the full-stack-engineer's diagnosis workflow could keep using
+# run_code to poke at the live system. It was rejected because the widening it
+# needs is exactly the capability set this system has already been burned by:
+# `forven.db` in an LLM-authored script is a WRITE path to strategies/trades/
+# settings, and an agent writing that table out-of-band (bypassing the approval
+# gate) is a defect class this repo has shipped a fix for before. A sandbox that
+# denies the network but hands the child the live database is not a sandbox.
+#
+# Diagnosis therefore uses the tools built for it — read_file, the log tools,
+# and the read-only inspect/query tools — which are permission-gated and audited
+# per call. The rejection message below names them so an agent that reaches for
+# run_code out of habit redirects in one round instead of retrying.
+#
+# FOLLOW-UP (not this group's file): bot.py:596 still tells the full-stack
+# engineer to use "run_code for diagnosis". That line should be dropped.
+_RUN_CODE_SCOPE_HINT = (
+    "run_code is a numeric scratchpad: only pandas/numpy/scipy/sklearn/pandas_ta, "
+    "pure-computation stdlib and the strategy-facing forven API may be imported. "
+    "It cannot inspect the system — use read_file / the log and status tools for that."
+)
+
+
 @register_tool(
     name="run_code",
-    description="Execute Python code in a sandboxed subprocess with resource limits (30s CPU, 512MB RAM). Use for testing strategy logic or data analysis. No network access.",
+    description=(
+        "Execute Python code in a sandboxed subprocess with resource limits (30s CPU, 512MB RAM). "
+        "Use for strategy-logic and numeric data analysis ONLY — this is a computation scratchpad, "
+        "not a system-inspection tool (use read_file and the log/status tools for that). "
+        "Outbound network access is denied and the child runs in a throwaway working directory. "
+        "The source is statically scanned first: imports are restricted to an allowlist "
+        "(pandas/numpy/scipy/sklearn/pandas_ta + pure-computation stdlib + the strategy-facing "
+        "forven API) and dynamic-execution / filesystem primitives are rejected. Code that imports "
+        "os, sqlite3, pathlib, requests or forven.db WILL be refused."
+    ),
     input_schema={
         "type": "object",
         "properties": {
@@ -421,6 +461,29 @@ def _tool_run_code(code: str) -> str:
     If the code looks like a strategy class, run it through the self-healer first
     (lint + auto-fix + test harness). Otherwise, execute directly in sandbox.
     """
+    # AI-01 (audit 2026-07-25): the AST guard used to run ONLY when the submitted
+    # source looked like a strategy ("BaseStrategy"/"generate_signal" substring),
+    # so any other LLM-authored Python — the common case for this tool — reached
+    # the interpreter with NO static validation at all. The strategy heuristic
+    # below chooses WHICH EXTRA validation runs; it must never decide WHETHER the
+    # guard runs. Imported fresh from forven.sandbox.ast_guard so the tool always
+    # gets the current ruleset (the guard was hardened for ANNOT-EVAL-1 the same
+    # day). Not a complete trust boundary on its own — the subprocess isolation in
+    # forven.sandbox.run_code is the real one — but it closes the obvious
+    # os/eval/file-read/exfil one-liners before anything executes.
+    #
+    # The guard is UNCONDITIONAL and context-independent — see the scope note
+    # above the decorator for why the ruleset is not widened per tools_context.
+    from forven.sandbox.ast_guard import scan_source
+
+    report = scan_source(code)
+    if not report.ok:
+        findings = "; ".join(
+            f"line {f.lineno}: {f.message}" for f in report.findings[:5]
+        )
+        log.warning("run_code rejected by AST guard: %s", findings)
+        return f"AST guard blocked execution: {findings}\n{_RUN_CODE_SCOPE_HINT}"
+
     # Check if this looks like strategy code
     is_strategy_code = "BaseStrategy" in code or "generate_signal" in code
 

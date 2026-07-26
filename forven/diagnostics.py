@@ -405,6 +405,28 @@ def _mcp_servers_section() -> list[dict]:
     return rows
 
 
+def _mainnet_arming_section() -> dict:
+    """OPS-4: whether REAL-MONEY order placement is armed on this process.
+
+    ``FORVEN_ALLOW_MAINNET`` is the single switch between "every mainnet order is
+    refused" and "orders spend real funds". It was read exactly once, deep inside
+    ``exchange.hyperliquid._assert_execution_allowed``, so `forven doctor` and the
+    /diagnostics page could not tell an armed instance from a testnet-only one.
+    Imported lazily and fail-soft: a diagnostics snapshot must never be the thing
+    that breaks because an exchange module failed to import.
+    """
+    try:
+        from forven import api_core as core
+
+        return dict(core.mainnet_arming_snapshot())
+    except Exception as exc:  # noqa: BLE001 — diagnostics must not hard-fail
+        log.debug("diagnostics.mainnet_arming: %s", exc)
+        armed = str(os.environ.get("FORVEN_ALLOW_MAINNET") or "").strip().lower() in {
+            "1", "true", "yes", "on", "y",
+        }
+        return {"flag": "FORVEN_ALLOW_MAINNET", "armed": armed, "source": "env_fallback"}
+
+
 def snapshot() -> dict:
     """Full diagnostics payload — what the API and CLI both consume."""
     results = run_all_checks()
@@ -412,12 +434,15 @@ def snapshot() -> dict:
     for r in results:
         by_status[r.status] = by_status.get(r.status, 0) + 1
     overall = FAIL if by_status[FAIL] else (WARN if by_status[WARN] else PASS)
+    arming = _mainnet_arming_section()
     return {
         "generated_at": _now().isoformat(),
         "overall": overall,
         "summary": by_status,
         "checks": [asdict(r) for r in results],
         "mcp_servers": _mcp_servers_section(),
+        "mainnet_armed": bool(arming.get("armed")),
+        "mainnet_arming": arming,
     }
 
 

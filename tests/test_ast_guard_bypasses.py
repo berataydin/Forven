@@ -122,6 +122,55 @@ BYPASS_PAYLOADS = {
     # Builtins-dict subscript callee.
     "subscript_dunder_globals": "d = {}\n_ = d['__globals__']\n",
     "subscript_exec_key": "d = {}\n_ = d['exec']\n",
+    # ANNOT-EVAL-1 (audit 2026-07-25): `typing` and `functools` were allowlisted as
+    # "pure-computation stdlib ... no dynamic-exec primitive". False. get_type_hints,
+    # ForwardRef._evaluate and singledispatch.register each route a STRING CONSTANT
+    # into eval(), and the scanner never inspected string constants — so every one of
+    # these returned ok=True with zero findings and executed arbitrary code in the HOST
+    # process on import. Reproduced live on this repo's Python 3.11.9.
+    "annot_eval_get_type_hints": (
+        "import typing\n"
+        "class C:\n"
+        "    x: \"__import__('os').getcwd()\"\n"
+        "typing.get_type_hints(C)\n"
+    ),
+    "annot_eval_forwardref_evaluate": (
+        "import typing\n"
+        "f = typing.ForwardRef(\"__import__('os').getcwd()\")\n"
+        "f._evaluate(globals(), locals(), frozenset())\n"
+    ),
+    "annot_eval_singledispatch_register": (
+        "import functools\n"
+        "@functools.singledispatch\n"
+        "def g(x): ...\n"
+        "@g.register\n"
+        "def h(x: \"__import__('os').getcwd()\"): ...\n"
+    ),
+    "annot_eval_from_typing_import": (
+        "from typing import get_type_hints\n"
+        "class C:\n"
+        "    x: \"__import__('os').getcwd()\"\n"
+        "get_type_hints(C)\n"
+    ),
+    "annot_eval_nested_forward_ref": (
+        "import typing\n"
+        "class C:\n"
+        "    x: typing.Optional[\"__import__('os').getcwd()\"]\n"
+        "typing.get_type_hints(C)\n"
+    ),
+    "annot_eval_return_position": (
+        "import pandas as pd\n"
+        "def f(df: pd.DataFrame) -> \"__import__('os').getcwd()\":\n"
+        "    return df\n"
+    ),
+    "annot_eval_dunder_forward_ref": (
+        "import pandas as pd\n"
+        "def f(x: \"pd.DataFrame.__class__\"): ...\n"
+    ),
+    "annot_eval_lambda_forward_ref": (
+        "import pandas as pd\n"
+        "def f(x: \"(lambda: __import__('os'))()\"): ...\n"
+    ),
 }
 
 LEGIT_PAYLOADS = {
@@ -186,6 +235,45 @@ LEGIT_PAYLOADS = {
     "numpy_random_submodule_ok": "import numpy as np\n_ = np.random.default_rng(0)\n",
     "scipy_signal_submodule_ok": "from scipy import signal\n_ = signal.argrelextrema\n",
     "to_dict_in_memory_ok": "def g(df):\n    return df.tail().to_dict()\n",
+    # ANNOT-EVAL-1 must not cost the corpus anything: 22 files legitimately write a
+    # forward reference to a REAL type and 33 use Literal[...] string VALUES (which
+    # get_type_hints never eval()s). Verified: 0 regressions over 6,147 corpus files.
+    "forward_ref_real_type_ok": (
+        "import pandas as pd\n"
+        "class S:\n"
+        "    def compute(self, series: \"pd.Series\", n: int) -> \"pd.Series\":\n"
+        "        return series.rolling(n).mean()\n"
+    ),
+    "typing_literal_values_ok": (
+        "from typing import Literal, Optional, Dict, Any\n"
+        "def f(mode: Literal[\"long\", \"short\"], n: Optional[int] = None) -> Dict[str, Any]:\n"
+        "    return {}\n"
+    ),
+    "forward_ref_pep604_union_ok": (
+        "import pandas as pd\n"
+        "def f(x: \"pd.Series | None\") -> \"int | None\":\n"
+        "    return None\n"
+    ),
+    "forward_ref_subscripted_ok": (
+        "from typing import Dict\n"
+        "def f(x: \"Dict[str, int]\") -> None:\n"
+        "    return None\n"
+    ),
+    "functools_lru_cache_ok": (
+        "import functools\n"
+        "@functools.lru_cache(maxsize=8)\n"
+        "def f(x: int) -> int:\n"
+        "    return x * 2\n"
+    ),
+    # `_evaluate` / `register` are deliberately NOT blocked as bare names: the live
+    # corpus defines its own `_evaluate()` on strategy classes (same reasoning the
+    # guard already applies to `.run`/`.call`).
+    "strategy_defines_own_evaluate_ok": (
+        "import pandas as pd\n"
+        "class S:\n"
+        "    def _evaluate(self, df: pd.DataFrame) -> pd.Series:\n"
+        "        return df['close']\n"
+    ),
 }
 
 

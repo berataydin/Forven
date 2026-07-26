@@ -206,6 +206,108 @@ def emit_notification(
     return _deliver_notification(stored)
 
 
+# ---------------------------------------------------------------------------
+# Unarmed-mainnet-exit alert (MAINNET-GUARD-2 caller side)
+# ---------------------------------------------------------------------------
+# `exchange.hyperliquid._assert_execution_allowed` logs CRITICAL and PERMITS a
+# reduce-only close that resolved to the MAINNET endpoint while
+# FORVEN_ALLOW_MAINNET is unset — being unable to EXIT is strictly more dangerous
+# than entering unarmed, so refusing was never an option. But that means the one
+# moment we learn "this instance is moving REAL money and was never armed for it"
+# reached nothing but a log file nobody tails.
+#
+# The bridge below turns that record into an operator notification. It is a log
+# HANDLER rather than a direct call from the exchange module on purpose: the guard
+# sits in the emergency-exit path, and a DB write inline there would put SQLite
+# lock contention between an open real-money position and its close. As a handler
+# the work is still synchronous, so it is kept minimal and TOTALLY fail-soft —
+# anything that goes wrong here is swallowed, never propagated into the close.
+_UNARMED_MAINNET_EXIT_MARKER = "UNARMED MAINNET EXIT PERMITTED"
+# The connector's logger is "forven.exchange.hl", NOT "...hyperliquid" — see
+# forven/exchange/hyperliquid.py:28. The two are SIBLINGS in the logging
+# hierarchy, not parent/child, so a handler attached to "forven.exchange.hyperliquid"
+# never sees the connector's records and this bridge silently never fires. That is
+# exactly what happened on the first cut of this alert, and it is the worst kind of
+# monitoring bug: the alert that tells you real mainnet money moved from an unarmed
+# system reports healthy precisely because it is dead.
+_EXCHANGE_ALERT_LOGGER = "forven.exchange.hl"
+_alert_bridge_installed = False
+_alert_bridge_reentrant = False
+
+
+def notify_unarmed_mainnet_exit(detail: str, *, source: str = "exchange") -> dict[str, Any] | None:
+    """Raise the operator alert for a permitted-but-unarmed MAINNET exit.
+
+    Deliberately NOT deduped per-message: the dedupe key is the flag + day, so a
+    flatten that walks ten positions raises one alert, but a recurrence tomorrow
+    raises a fresh one. Returns None if the notification could not be stored —
+    callers are alert paths and must never fail because alerting failed.
+    """
+    try:
+        return emit_notification(
+            "mainnet_unarmed_exit",
+            severity="critical",
+            source=source,
+            title="REAL MAINNET funds moved by an UNARMED instance",
+            summary=(
+                "A reduce-only close resolved to the Hyperliquid MAINNET endpoint while "
+                "FORVEN_ALLOW_MAINNET is not set. The exit was permitted (refusing would "
+                "strand real capital) — this instance holds real money it was never armed for."
+            ),
+            body=str(detail or "")[:4000] or None,
+            metadata={"flag": "FORVEN_ALLOW_MAINNET", "armed": False, "exit_only": True},
+            dedupe_key=f"mainnet-unarmed-exit:{_utc_now().strftime('%Y-%m-%d')}",
+        )
+    except Exception:  # noqa: BLE001 — an alert path must not raise into its caller
+        log.debug("notify_unarmed_mainnet_exit failed", exc_info=True)
+        return None
+
+
+class _UnarmedMainnetExitHandler(logging.Handler):
+    """Turn the guard's CRITICAL log record into an operator notification."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global _alert_bridge_reentrant
+        if _alert_bridge_reentrant:
+            # emit_notification logs; without this a failure inside it that logged
+            # a matching record would recurse. A plain module flag, not thread-local:
+            # a concurrent second exit losing the race is harmless (the day-scoped
+            # dedupe key would have suppressed its notification anyway).
+            return
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if _UNARMED_MAINNET_EXIT_MARKER not in message:
+            return
+        _alert_bridge_reentrant = True
+        try:
+            notify_unarmed_mainnet_exit(message)
+        finally:
+            _alert_bridge_reentrant = False
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        # Never let an alerting fault surface as a logging error on the exit path.
+        return
+
+
+def install_exchange_alert_bridge() -> bool:
+    """Attach the unarmed-mainnet-exit alert bridge. Idempotent; returns True once.
+
+    Call from long-lived process startup (the daemon does). Any process that
+    places orders should call it — a close can be issued from the API worker too;
+    until every entrypoint does, the alert is only as wide as its installers.
+    """
+    global _alert_bridge_installed
+    if _alert_bridge_installed:
+        return False
+    handler = _UnarmedMainnetExitHandler(level=logging.CRITICAL)
+    handler.set_name("forven-unarmed-mainnet-exit-alert")
+    logging.getLogger(_EXCHANGE_ALERT_LOGGER).addHandler(handler)
+    _alert_bridge_installed = True
+    return True
+
+
 def list_notifications(
     *,
     limit: int = 50,

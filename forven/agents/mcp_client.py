@@ -458,10 +458,24 @@ async def close(session: MCPSession) -> None:
 # ---------------------------------------------------------------------------
 
 def _mcp_tool_name(server: str, tool: str) -> str:
-    """Forven-namespaced tool name: ``mcp_<server>_<tool>``.
+    """Forven-namespaced tool name: ``mcp_<server>_<tool>`` (AUTHORITATIVE).
 
     Server and tool names from MCP spec are typically [a-z0-9_-]; we
     keep them as-is so the namespace stays human-recognizable.
+
+    AI-05 (audit 2026-07-25): this single-underscore join is the one true
+    convention — the ``mcp_`` categorization prefix already matches it. The
+    toolset-override resolver used to *parse* the server back out by splitting on
+    ``__``, which this name never contains, so every per-server ``mcp:<server>``
+    disable silently did nothing.
+
+    The name is NOT parseable back into (server, tool) — both may contain
+    underscores, so ``mcp_jira_prod_create_issue`` is ambiguous between server
+    ``jira``/tool ``prod_create_issue`` and server ``jira_prod``/tool
+    ``create_issue``. Nothing may infer the server from it. Consumers read the
+    ``mcp:<server>`` entry that ``register_server_tools`` stamps into every MCP
+    ToolDef's ``permissions`` instead (``tool_registry._mcp_server_of``). Do not
+    "fix" this by inventing a separator: use the stamp.
     """
     return f"mcp_{server}_{tool}"
 
@@ -563,15 +577,32 @@ def _make_mcp_handler(server_name: str, tool_name: str):
 
 
 def unregister_server_tools(name: str) -> int:
-    """Remove all ``mcp_<name>_*`` entries from the tool registry.
+    """Remove every tool registered by MCP server *name* from the tool registry.
 
     Returns the number removed. Safe to call when the server was never
     registered.
+
+    AI-05 review (2026-07-25): this used to select purely on the
+    ``mcp_<name>_`` name prefix, which is ambiguous — disabling server ``jira``
+    also deregistered every tool of server ``jira_prod``. Ownership is matched on
+    the ``mcp:<server>`` permission stamp ``register_server_tools`` writes, which
+    is exact. The prefix scan survives only for entries that carry no stamp, so a
+    disabled server can never be left with live tools in the registry (that
+    direction is the security-relevant one).
     """
-    from forven.agents.tool_registry import _REGISTRY
+    from forven.agents.tool_registry import _REGISTRY, _mcp_server_of
 
     prefix = f"mcp_{name}_"
-    removed = [k for k in _REGISTRY.keys() if k.startswith(prefix)]
+    removed: list[str] = []
+    for key, tool in _REGISTRY.items():
+        if not key.startswith("mcp_"):
+            continue
+        stamped_server = _mcp_server_of(tool)
+        if stamped_server is not None:
+            if stamped_server == name:
+                removed.append(key)
+        elif key.startswith(prefix):
+            removed.append(key)
     for key in removed:
         _REGISTRY.pop(key, None)
     if removed:

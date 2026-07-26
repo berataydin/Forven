@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import shutil
@@ -412,9 +413,20 @@ def _warn_market_mismatch(symbol: str, timeframe: str, incoming_source: str) -> 
     disagrees with the stored series' recorded market. Deliberately NOT a
     rejection during the Phase-1 transition — rejecting would stop data flow
     for every legacy spot series the moment perp-canonical fetch lands. The
-    reconcile tool (scripts/reconcile_market_mix.py) is the fix."""
+    reconcile tool (scripts/reconcile_market_mix.py) is the fix.
+
+    HARDEN-DATA-OPS (csv-upload-relabels-series-provenance): an "unknown"
+    incoming market used to return early here, so the one write that CANNOT
+    vouch for its own venue — a CSV patch spliced into a years-long exchange
+    series — was the only write that never warned. Unknown-into-known is exactly
+    the splice an operator needs to see."""
     incoming = market_for_source(incoming_source)
-    if incoming == "unknown":
+    normalized_source = str(incoming_source or "").strip().lower()
+    if incoming == "unknown" and normalized_source not in _SOURCE_MARKET:
+        # An UNMAPPED exchange id (bybit/okx/kraken/coinbase/...) is not a known
+        # market-less source — we just haven't classified it, and warning on
+        # every such write would be pure noise. Only a source DECLARED
+        # market-less in _SOURCE_MARKET (csv) is worth surfacing.
         return
     try:
         existing = get_dataset_market(symbol, timeframe)
@@ -739,18 +751,181 @@ def load_parquet(symbol: str, timeframe: str, *, as_of: object | None = None) ->
     return frame
 
 
-def save_parquet(df: pd.DataFrame, symbol: str, timeframe: str, source: str = "ccxt") -> None:
+class LakeShrinkRefused(RuntimeError):
+    """A full-replace save would have destroyed stored history (HARDEN-DATA-OPS)."""
+
+
+# How far a full save may walk the stored bounds back before it reads as
+# destruction rather than a normal merge. TRAILING is 1 bar because
+# _drop_unclosed_bars legitimately removes a previously-persisted forming
+# candle. LEADING allows the larger of 3 bars (the _reject_invalid_ohlc
+# quarantine trimming a bad head row) or 0.5% of the stored span, so a long
+# series is never refused over a handful of rows — while the failure this
+# guards (years of history replaced by one fetch window) is always refused.
+_SHRINK_GUARD_TRAILING_BARS = 1
+_SHRINK_GUARD_LEADING_BARS = 3
+_SHRINK_GUARD_LEADING_FRACTION = 0.005
+
+
+def _stored_series_bounds(symbol: str, timeframe: str) -> tuple[int | None, int | None]:
+    """(first_ms, last_ms) across cold+tail read from parquet FOOTERS only.
+
+    Raises if a stored file exists but cannot be read — that IS the condition
+    this guard exists for, so it must fail closed rather than report "absent".
+    """
+    first_ms: int | None = None
+    last_ms: int | None = None
+    for candidate in (parquet_path(symbol, timeframe), tail_path(symbol, timeframe)):
+        if not candidate.exists():
+            continue
+        _, lo, hi = _footer_bounds(candidate)
+        if lo is not None:
+            first_ms = lo if first_ms is None else min(first_ms, lo)
+        if hi is not None:
+            last_ms = hi if last_ms is None else max(last_ms, hi)
+    return first_ms, last_ms
+
+
+def _guard_series_shrink(symbol: str, timeframe: str, out: pd.DataFrame) -> None:
+    """Refuse a full-replace save that would SHRINK the stored series.
+
+    HARDEN-DATA-OPS (lake-overwrite-on-unreadable-read). save_parquet is
+    REPLACEMENT semantics — it rewrites cold and unlinks the tail — and every
+    production caller hands it ``merge_and_dedup(current, fetched)``. So a frame
+    that no longer covers the stored range means ``current`` came back empty
+    when it should not have: historically an unreadable cold parquet was
+    swallowed by ``except Exception: current = None``, and the next write
+    replaced years of OHLCV with one fetch window, unlinked the tail, and left
+    only a DEBUG line behind. Every backtest and live signal is scored on this
+    lake, and there is no undo — so the write is refused here as a backstop even
+    though the read sites now propagate their exceptions too.
+
+    ``allow_shrink=True`` is for the deliberate rebuild tools (they take their
+    own backup first); nothing on the ingestion path may set it.
+    """
+    first_ms, last_ms = _stored_series_bounds(symbol, timeframe)
+    if first_ms is None or last_ms is None:
+        return  # nothing stored yet (or an empty stored series) — nothing to lose
+    if out is None or out.empty:
+        raise LakeShrinkRefused(
+            f"Refusing to replace stored {symbol} {timeframe} series with an EMPTY frame"
+        )
+    tf_ms = max(1, int(_timeframe_to_ms(timeframe)))
+    new_first = _to_ms(out["timestamp"].iloc[0])
+    new_last = _to_ms(out["timestamp"].iloc[-1])
+    stored_bars = max(1.0, (last_ms - first_ms) / tf_ms)
+    lost_leading = (new_first - first_ms) / tf_ms
+    lost_trailing = (last_ms - new_last) / tf_ms
+    leading_allowance = max(_SHRINK_GUARD_LEADING_BARS, _SHRINK_GUARD_LEADING_FRACTION * stored_bars)
+    if lost_leading > leading_allowance or lost_trailing > _SHRINK_GUARD_TRAILING_BARS:
+        raise LakeShrinkRefused(
+            f"Refusing full-replace save of {symbol} {timeframe}: stored series covers "
+            f"[{first_ms}, {last_ms}] but the incoming frame covers [{new_first}, {new_last}] "
+            f"({lost_leading:.0f} leading / {lost_trailing:.0f} trailing bars would be lost). "
+            "This is the signature of an unreadable existing series being treated as absent."
+        )
+    if lost_leading > 0 or lost_trailing > 0:
+        log.warning(
+            "Full-replace save of %s %s trims %.0f leading / %.0f trailing bar(s) "
+            "(within the shrink-guard allowance)",
+            symbol, timeframe, max(0.0, lost_leading), max(0.0, lost_trailing),
+        )
+
+
+def _fabricated_bar_ranges(
+    before: pd.DataFrame | None, after: pd.DataFrame | None
+) -> list[tuple[int, int]]:
+    """Contiguous [start_ms, end_ms] runs of bars in ``after`` that ``before``
+    did not have — i.e. the bars _forward_fill_ohlcv fabricated.
+
+    HARDEN-DATA-OPS (forward-filled-bars-unmarked): flat synthetic bars used to
+    go into the lake indistinguishable from real ones, permanently hiding real
+    exchange gaps from the quality gate. save_parquet stamps these ranges into
+    the parquet key-value metadata so the fabrication stays auditable.
+    """
+    if after is None or after.empty:
+        return []
+    existing = set()
+    if before is not None and not before.empty:
+        existing = {_to_ms(ts) for ts in before["timestamp"]}
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    prev: int | None = None
+    for ts in after["timestamp"]:
+        ms = _to_ms(ts)
+        if ms in existing:
+            if start is not None:
+                runs.append((start, prev))  # type: ignore[arg-type]
+                start = None
+            prev = ms
+            continue
+        if start is None:
+            start = ms
+        prev = ms
+    if start is not None and prev is not None:
+        runs.append((start, prev))
+    return runs
+
+
+# Bounded so a pathologically gappy series can't grow the parquet footer without
+# limit; the newest ranges are the ones worth keeping.
+_SYNTHETIC_RANGE_CAP = 500
+
+
+def _read_synthetic_ranges(path: Path) -> list[tuple[int, int]]:
+    """Previously-stamped fabricated-bar ranges from a series' parquet metadata."""
+    try:
+        if not path.exists() or not _using_pyarrow():
+            return []
+        raw = (pq.read_metadata(path).metadata or {}).get(b"forven_synthetic_ranges")
+        if not raw:
+            return []
+        parsed = json.loads(raw.decode("utf-8", errors="ignore"))
+        return [(int(pair[0]), int(pair[1])) for pair in parsed if len(pair) == 2]
+    except Exception:
+        return []
+
+
+def synthetic_bar_ranges(symbol: str, timeframe: str) -> list[tuple[int, int]]:
+    """Public: [start_ms, end_ms] ranges of FABRICATED (forward-filled) bars in a
+    stored series. Empty when the series carries none. Lets a quality gate tell a
+    real continuous series from one whose gaps were papered over."""
+    return _read_synthetic_ranges(parquet_path(symbol, timeframe))
+
+
+def _merge_synthetic_ranges(
+    stored: list[tuple[int, int]], incoming: list[tuple[int, int]] | None
+) -> list[tuple[int, int]]:
+    merged = sorted({(int(a), int(b)) for a, b in [*stored, *(incoming or [])] if b >= a})
+    return merged[-_SYNTHETIC_RANGE_CAP:]
+
+
+def save_parquet(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str,
+    source: str = "ccxt",
+    *,
+    allow_shrink: bool = False,
+    synthetic_ranges: list[tuple[int, int]] | None = None,
+) -> None:
     path = parquet_path(symbol, timeframe)
     _warn_market_mismatch(symbol, timeframe, source)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     out = _normalize_ohlcv_frame(df)
     out = _reject_invalid_ohlc(out, symbol, timeframe)
+    if not allow_shrink:
+        _guard_series_shrink(symbol, timeframe, out)
     # Point-in-time (T1.6): before this frame overwrites the lake file, append the
     # prior values of any restated bars to the append-only revision log. Additive
     # and best-effort — it only ever writes the separate revisions/ parquet and must
     # never break the lake write.
     _capture_ohlcv_revisions(symbol, timeframe, out)
+    # Carry forward any fabrication already recorded on this series: a
+    # compaction/re-save must not launder previously-marked synthetic bars back
+    # into "real exchange data".
+    stamped_ranges = _merge_synthetic_ranges(_read_synthetic_ranges(path), synthetic_ranges)
     tmp_path = Path(str(path) + ".tmp")
     if _using_pyarrow():
         table = pa.Table.from_pandas(out, preserve_index=False)
@@ -764,6 +939,10 @@ def save_parquet(df: pd.DataFrame, symbol: str, timeframe: str, source: str = "c
                 b"forven_updated_at": _now_iso().encode("utf-8"),
             }
         )
+        if stamped_ranges:
+            meta[b"forven_synthetic_ranges"] = json.dumps(
+                [[int(a), int(b)] for a, b in stamped_ranges]
+            ).encode("utf-8")
         table = table.replace_schema_metadata(meta)
         pq.write_table(table, tmp_path, compression="zstd")
     else:
@@ -1756,7 +1935,13 @@ def _forward_fill_ohlcv(frame: pd.DataFrame, tf_ms: int) -> pd.DataFrame:
     trades, so thin/early history is riddled with holes that fail the gauntlet's
     gap gate. Exchange OHLC endpoints instead forward-fill empty periods with a
     flat bar; this makes a trade-built series follow that same convention
-    (continuous, gap-free) — and heals an already-stored gappy series on merge.
+    (continuous, gap-free).
+
+    HARDEN-DATA-OPS: callers apply this to the NEWLY-FETCHED window only, never
+    to the merged series, and record what it fabricated via
+    ``_fabricated_bar_ranges`` so the invented bars are marked in the lake
+    metadata. Filling the merged frame also papered over every real exchange
+    outage already in storage — permanently invisible to the quality gate.
     """
     if frame is None or frame.empty or len(frame) < 2:
         return frame
@@ -1837,10 +2022,12 @@ def _fetch_ohlcv_polygon(
 
     lock = _get_dataset_lock(fs_symbol, timeframe)
     with lock:
-        try:
-            current = load_parquet(fs_symbol, timeframe)
-        except Exception:
-            current = None
+        # HARDEN-DATA-OPS (lake-overwrite-on-unreadable-read): the read LEADS a
+        # replacing write, so an unreadable existing series must NOT be
+        # swallowed into `current = None` — that silently replaced the whole
+        # stored series with this one fetch window. Let it propagate; the
+        # ingestion run reports FAILED and the lake is untouched.
+        current = load_parquet(fs_symbol, timeframe)
         merged = merge_and_dedup(current, fetched)
         if merged.empty:
             raise RuntimeError(f"No OHLCV data fetched for {symbol} {timeframe} from Polygon")
@@ -1890,11 +2077,11 @@ def fetch_ohlcv_chunked(
     # loading it here was a pure full-file read wasted on every keep-alive.
     snapshot: pd.DataFrame | None = None
     if all_available:
-        try:
-            snapshot = load_parquet(fs_symbol, timeframe)
-        except Exception as exc:
-            log.debug("Ignoring unreadable OHLCV snapshot for %s %s before remote fetch: %s", fs_symbol, timeframe, exc)
-            snapshot = None
+        # Also propagates (HARDEN-DATA-OPS): treating an unreadable series as
+        # absent here used to send the run off to re-download the FULL history
+        # before the merge read below hit the same corruption and failed anyway.
+        # Fail fast on the read instead of paying for a doomed backfill.
+        snapshot = load_parquet(fs_symbol, timeframe)
     fetched_blocks: list[pd.DataFrame] = []
 
     end_ms_to_use = until_ms if until_ms is not None else (now_ms + tf_ms)
@@ -1968,10 +2155,11 @@ def fetch_ohlcv_chunked(
             return
         cp_lock = _get_dataset_lock(fs_symbol, timeframe)
         with cp_lock:
-            try:
-                cp_current = load_parquet(fs_symbol, timeframe)
-            except Exception:
-                cp_current = None
+            # Propagates on an unreadable snapshot (HARDEN-DATA-OPS): this
+            # checkpoint SAVES, so treating a corrupt cold file as absent would
+            # replace the stored series mid-build. Raising aborts the trades
+            # build and the ingestion run reports FAILED.
+            cp_current = load_parquet(fs_symbol, timeframe)
             cp_merged = _drop_unclosed_bars(merge_and_dedup(cp_current, partial), tf_ms, now_ms)
             if not cp_merged.empty:
                 save_parquet(cp_merged, fs_symbol, timeframe, source=exchange_id)
@@ -2030,6 +2218,28 @@ def fetch_ohlcv_chunked(
         raise
     breaker.record_success()
 
+    # HARDEN-DATA-OPS (forward-filled-bars-unmarked): trade-reconstructed candles
+    # skip no-trade buckets, so each fetched WINDOW is forward-filled to a
+    # continuous series (exchange-OHLC convention) before it is merged.
+    #
+    # Per block, and BEFORE the merge, deliberately — the fill used to run on the
+    # whole merged frame. That healed an already-stored gappy trade-built series,
+    # but it also (a) fabricated flat bars across every real exchange outage in
+    # the stored history, hiding it from the gap gate forever, and (b) is unsafe
+    # once blocks are filled separately: the gap-fill shape here is two windows
+    # either side of the existing snapshot, and filling their concatenation would
+    # manufacture flat bars right across the snapshot's own range. Healing a
+    # stored gappy series is now the backfill/gap-repair path's job, which
+    # re-fetches the missing bars instead of inventing them.
+    synthetic_ranges: list[tuple[int, int]] = []
+    if use_trades and fetched_blocks:
+        filled_blocks: list[pd.DataFrame] = []
+        for block in fetched_blocks:
+            filled = _forward_fill_ohlcv(block, tf_ms)
+            synthetic_ranges.extend(_fabricated_bar_ranges(block, filled))
+            filled_blocks.append(filled)
+        fetched_blocks = filled_blocks
+
     fetched = merge_and_dedup(None, pd.concat(fetched_blocks, ignore_index=True) if fetched_blocks else None)
 
     lock = _get_dataset_lock(fs_symbol, timeframe)
@@ -2061,25 +2271,27 @@ def fetch_ohlcv_chunked(
                 record["bars_new"] = int(appended)
                 return record
 
-        try:
-            current = load_parquet(fs_symbol, timeframe)
-        except Exception as exc:
-            log.debug("Ignoring unreadable OHLCV snapshot for %s %s while merging remote fetch: %s", fs_symbol, timeframe, exc)
-            current = None
+        # HARDEN-DATA-OPS (lake-overwrite-on-unreadable-read): this read leads a
+        # REPLACING write. Swallowing the exception into `current = None` turned
+        # a transiently-locked or corrupt cold parquet into "series absent", and
+        # the save below then overwrote years of OHLCV with this one fetch window
+        # and unlinked the tail — silent, unrecoverable, traced only by the DEBUG
+        # line that used to sit here. Propagate instead: the ingestion run
+        # already surfaces FAILED, and the lake is left intact.
+        current = load_parquet(fs_symbol, timeframe)
         merged = merge_and_dedup(current, fetched)
-        # Trade-reconstructed candles skip no-trade buckets; forward-fill them to
-        # a continuous series (exchange-OHLC convention) so thin history doesn't
-        # fail the gap gate. Applied to the whole merged series, so re-running
-        # "all available" also heals an already-stored gappy trade-built dataset.
-        if use_trades:
-            merged = _forward_fill_ohlcv(merged, tf_ms)
+        # (The forward fill now runs per fetched BLOCK, before this merge — see
+        # the synthetic_ranges build above.)
         # Never persist the in-progress bar: a fetch reaches now+tf, so the last
         # row is typically the forming candle. Drop any unclosed bar (and clean a
         # previously-persisted one) before writing the lake.
         merged = _drop_unclosed_bars(merged, tf_ms, now_ms)
         if merged.empty:
             raise RuntimeError(f"No OHLCV data fetched for {ccxt_symbol} {timeframe}")
-        save_parquet(merged, fs_symbol, timeframe, source=exchange_id)
+        save_parquet(
+            merged, fs_symbol, timeframe, source=exchange_id,
+            synthetic_ranges=synthetic_ranges or None,
+        )
 
     base = _build_dataset_record(fs_symbol, timeframe, exchange_id, merged)
     base["bars_fetched"] = int(len(fetched))
@@ -2270,6 +2482,28 @@ def get_dataset_detail(symbol: str, timeframe: str) -> dict[str, Any]:
     }
 
 
+def _drop_catalog_coverage(symbol: str, timeframe: str, path: Path) -> None:
+    """Remove a deleted series' DuckDB coverage rows (HARDEN-DATA-OPS).
+
+    Coverage rows used to outlive the parquet forever: the ghost's end_ts never
+    advances, so it sat at the head of the staleness-ordered catch-up plan and
+    burned a batch slot on every run — while ALSO counting as "covered", which
+    suppressed the bootstrap task that would have re-created the series. Purely
+    best-effort: the data-engine catalog is an accelerator, never a gate on a
+    delete the operator asked for."""
+    try:
+        from forven.dataeng.catalog import Catalog
+
+        catalog = Catalog()
+        # Two passes on purpose: the exact stored path is the precise match, but
+        # a row written under a differently-normalized path would survive it, so
+        # sweep the (symbol, timeframe) as well.
+        catalog.delete_series_coverage(path=path)
+        catalog.delete_series_coverage(symbol=symbol_to_fs(symbol), timeframe=str(timeframe))
+    except Exception as exc:
+        log.debug("catalog coverage cleanup skipped for %s %s: %s", symbol, timeframe, exc)
+
+
 def delete_dataset(symbol: str, timeframe: str) -> bool:
     path = parquet_path(symbol, timeframe)
     if not path.exists():
@@ -2284,6 +2518,7 @@ def delete_dataset(symbol: str, timeframe: str) -> bool:
                 tail.unlink()
             except OSError:
                 pass
+    _drop_catalog_coverage(symbol, timeframe, path)
     # Remove now-empty symbol directories for cleanliness.
     parent = path.parent
     if parent.exists() and not any(parent.glob("*.parquet")):
@@ -2855,7 +3090,25 @@ def process_csv_upload(
         # the current forming bar must not persist it (would repaint / leak lookahead
         # into backtests) — same gate fetch_ohlcv_chunked applies.
         merged = _drop_unclosed_bars(merged, _timeframe_to_ms(timeframe), int(time.time() * 1000))
-        save_parquet(merged, fs_symbol, timeframe, source="csv")
+        # HARDEN-DATA-OPS (csv-upload-relabels-series-provenance): a CSV patch is
+        # usually a few hundred bars spliced into a multi-year exchange series,
+        # but save_parquet stamps the WHOLE file with the writer's source — so a
+        # small upload used to relabel years of Binance perp history as
+        # source=csv / market=unknown, destroying the provenance the promotion
+        # gate compares validated-on against traded-on. CSV resolves to an
+        # unknown market, i.e. it knows nothing the stored stamp doesn't, so
+        # keep the stored source whenever there is one.
+        existing_source = get_dataset_source(fs_symbol, timeframe)
+        write_source = "csv"
+        if existing_source and market_for_source(existing_source) != "unknown":
+            write_source = existing_source
+            log.info(
+                "CSV upload into %s %s keeps the stored provenance (source=%s); "
+                "the upload patches an existing series rather than defining it",
+                fs_symbol, timeframe, existing_source,
+            )
+        _warn_market_mismatch(fs_symbol, timeframe, "csv")
+        save_parquet(merged, fs_symbol, timeframe, source=write_source)
 
     result = _build_dataset_record(fs_symbol, timeframe, "csv", merged)
     result["filename"] = filename

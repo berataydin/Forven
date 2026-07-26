@@ -27,7 +27,10 @@ when the strategy's origin hypothesis is known.
 
 from __future__ import annotations
 
+import logging
 import math
+
+log = logging.getLogger(__name__)
 
 # Euler-Mascheroni constant (used in the expected-maximum-Sharpe estimator).
 _EULER_GAMMA = 0.5772156649015329
@@ -209,6 +212,42 @@ def _latest_n_trials(opt_metrics: dict | None, opt_config: dict | None, default_
     return max(int(default_trials), 1)
 
 
+def _row_n_trials(opt_metrics: dict | None, opt_config: dict | None) -> int:
+    """n_trials declared by ONE optimization row (0 when the row declares none)."""
+    for blob in (opt_metrics, opt_config):
+        if isinstance(blob, dict) and blob.get("n_trials") is not None:
+            try:
+                n = int(float(blob.get("n_trials")))
+                if n > 0:
+                    return n
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _cumulative_n_trials(
+    parsed_rows: list[tuple[dict | None, dict | None]], default_trials: int
+) -> tuple[int, int]:
+    """Total optimizer trials across EVERY non-deleted optimization run, + run count.
+
+    dsr-trials-only-latest-optimization (2026-07-25): the deflation used to count
+    only the NEWEST optimization row's ``n_trials``. A strategy re-optimized three
+    times before promotion had been selected from 3xN parameter draws but was
+    deflated for N — under-deflated in exactly the direction that promotes an
+    overfit survivor. Selection bias accumulates across runs, so the counts add.
+    ``max(sum, latest)`` keeps the old floor when older rows declare nothing, and
+    the run count is surfaced so a reject can say "3 runs x N combos".
+    """
+    per_row = [_row_n_trials(m, c) for m, c in parsed_rows]
+    counted = [n for n in per_row if n > 0]
+    latest = _latest_n_trials(
+        parsed_rows[0][0] if parsed_rows else None,
+        parsed_rows[0][1] if parsed_rows else None,
+        default_trials,
+    )
+    return max(sum(counted), latest, 1), len(counted)
+
+
 def _swarm_cluster_attempts(strategy_id: str, lookback_days: int) -> int:
     """Disproven same-cluster (family x asset) hypothesis siblings of the strategy's
     origin hypothesis — the swarm-level selection pressure behind this survivor.
@@ -248,13 +287,38 @@ def _swarm_cluster_attempts(strategy_id: str, lookback_days: int) -> int:
         return 0
 
 
-def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None) -> dict | None:
+def _unavailable(reason: str, with_reason: bool) -> dict | None:
+    """Uniform "DSR could not be computed" value (dsr-gate-fails-open).
+
+    Legacy callers (``with_reason=False``) keep the historical bare ``None``; the
+    promotion gate asks for the dict so it can name WHY in its block message.
+    """
+    if not with_reason:
+        return None
+    return {"dsr": None, "reason": reason, "unavailable": True}
+
+
+def compute_strategy_dsr(
+    strategy_id: str,
+    *,
+    default_trials: int | None = None,
+    with_reason: bool = False,
+) -> dict | None:
     """Best-effort DSR for a strategy's latest backtest. Returns None on any issue.
 
     Pulls per-trade returns from the latest backtest result and the trial count
     from the latest optimization result (falling back to the configured default),
     then scales the trial count by the swarm-level cluster attempts (issue #17).
     Never raises — DSR is advisory, not on the critical path.
+
+    dsr-gate-fails-open (2026-07-25): pass ``with_reason=True`` and every
+    unavailability path returns ``{"dsr": None, "reason": <code>, "unavailable": True}``
+    instead of a bare ``None``, so the opt-in reject gate in
+    ``policy._evaluate_gauntlet_gate`` can BLOCK with an actionable reason. An
+    uncomputable DSR (compacted trades artifact, missing backtest row, locked stage
+    with no stamp) used to read at that gate as "silently pass" — a false green for
+    exactly the strategies whose evidence is thinnest. The default stays ``None`` so
+    the display callers (gauntlet/status.py) and their tests are unchanged.
     """
     try:
         import json
@@ -294,7 +358,7 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
             if stage_is_param_locked(strat["stage"] or strat["status"]):
                 stored = strat["deflated_sharpe"]
                 if stored is None:
-                    return None
+                    return _unavailable("locked_stage_without_stamp", with_reason)
                 return {
                     "dsr": float(stored),
                     "frozen_stamp": True,
@@ -311,35 +375,49 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
                    ORDER BY datetime(created_at) DESC LIMIT 1""",
                 (strategy_id,),
             ).fetchone()
-            opt = conn.execute(
+            # ALL non-deleted optimization runs (newest first), not just the latest:
+            # selection bias accumulates across re-optimizations (see
+            # _cumulative_n_trials). The latest row still drives trial_sharpe_var.
+            opt_rows = conn.execute(
                 """SELECT metrics_json, config_json FROM backtest_results
                    WHERE strategy_id = ?
                      AND LOWER(TRIM(COALESCE(result_type, ''))) = 'optimization'
                      AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-                   ORDER BY datetime(created_at) DESC LIMIT 1""",
+                   ORDER BY datetime(created_at) DESC""",
                 (strategy_id,),
-            ).fetchone()
+            ).fetchall()
+            opt = opt_rows[0] if opt_rows else None
 
         if not bt:
-            return None
+            return _unavailable("no_backtest_result", with_reason)
         from forven.api_core import get_backtest_result
 
         detail = get_backtest_result(bt["result_id"], remote_skip=True)
         trades = detail.get("trades") if isinstance(detail, dict) else None
         if not isinstance(trades, list) or not trades:
-            return None
+            # Canonical case: the trades artifact was COMPACTED away, so the
+            # per-trade return series the DSR needs no longer exists.
+            return _unavailable("no_trades_in_artifact", with_reason)
 
         returns = _extract_trade_returns(trades)
         if len(returns) < 2:
-            return None
+            return _unavailable("insufficient_trade_returns", with_reason)
 
-        opt_metrics = json.loads(opt["metrics_json"]) if opt and opt["metrics_json"] else None
-        opt_config = json.loads(opt["config_json"]) if opt and opt["config_json"] else None
-        n_trials_base = _latest_n_trials(
-            opt_metrics if isinstance(opt_metrics, dict) else None,
-            opt_config if isinstance(opt_config, dict) else None,
-            default_trials,
-        )
+        def _parse_opt_row(row) -> tuple[dict | None, dict | None]:
+            try:
+                m = json.loads(row["metrics_json"]) if row["metrics_json"] else None
+            except (TypeError, ValueError):
+                m = None
+            try:
+                c = json.loads(row["config_json"]) if row["config_json"] else None
+            except (TypeError, ValueError):
+                c = None
+            return (m if isinstance(m, dict) else None, c if isinstance(c, dict) else None)
+
+        parsed_opt_rows = [_parse_opt_row(row) for row in opt_rows]
+        opt_metrics = parsed_opt_rows[0][0] if parsed_opt_rows else None
+        opt_config = parsed_opt_rows[0][1] if parsed_opt_rows else None
+        n_trials_base, n_optimization_runs = _cumulative_n_trials(parsed_opt_rows, default_trials)
 
         # Effective trials = optimizer trials x cluster attempts (the survivor
         # itself + disproven same-cluster siblings). 0 siblings -> unchanged.
@@ -352,15 +430,13 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
             swarm_attempts = _swarm_cluster_attempts(strategy_id, lookback)
 
         n_trials = n_trials_base * (1 + swarm_attempts)
-        trial_var = _latest_trial_sharpe_var(
-            opt_metrics if isinstance(opt_metrics, dict) else None,
-            opt_config if isinstance(opt_config, dict) else None,
-        )
+        trial_var = _latest_trial_sharpe_var(opt_metrics, opt_config)
         result = deflated_sharpe_ratio(returns, n_trials, trial_var)
         result["trials_source"] = ("optimization_result" if opt else "default") + (
             "+swarm" if swarm_attempts > 0 else ""
         )
         result["n_trials_base"] = int(n_trials_base)
+        result["n_optimization_runs"] = int(n_optimization_runs)
         result["swarm_cluster_attempts"] = int(swarm_attempts)
         # Write-through snapshot: list views display the last computed DSR
         # without ever paying this function's cost per row. Strategies whose
@@ -377,6 +453,12 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
                     )
         except Exception:
             pass
+        if result.get("dsr") is None and with_reason:
+            # deflated_sharpe_ratio's own no-verdict paths (insufficient_returns /
+            # zero_variance) already carry a reason; mark them unavailable so the
+            # gate treats them the same as the lookup failures above.
+            result["unavailable"] = True
         return result
-    except Exception:
-        return None
+    except Exception as exc:
+        log.warning("DSR computation failed for %s (treated as unavailable): %s", strategy_id, exc)
+        return _unavailable("internal_error", with_reason)

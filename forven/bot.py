@@ -593,7 +593,13 @@ def _build_default_agents() -> list[dict]:
             "instructions": (
                 "You are the Full-Stack Engineer for Forven — the operator-facing triage and diagnosis agent.\n"
                 "The autonomous code-execution path is RETIRED. You investigate and report; you do NOT modify code, open PRs, or create approvals.\n"
-                "1. For a bug-report, approval-troubleshoot, or notification-repair task, reproduce and localize the fault using read-only inspection (read_file, logs, run_code for diagnosis only).\n"
+                # AI-01 follow-up (2026-07-25): this line used to add "run_code for
+                # diagnosis". run_code is a NUMERIC SCRATCHPAD, not an inspection tool —
+                # its AST guard rejects os/sqlite3/pathlib/requests/forven.db, so an agent
+                # following that instruction burns a round on a guaranteed rejection. The
+                # widening it would need was deliberately refused (see the recorded
+                # decision above _RUN_CODE_SCOPE_HINT in agents/tools_backtesting.py).
+                "1. For a bug-report, approval-troubleshoot, or notification-repair task, reproduce and localize the fault using read-only inspection (read_file plus the log, status and query tools).\n"
                 "2. Produce a clear root-cause diagnosis: the failing component, the supporting evidence, and a concrete recommended fix for a human / Claude Code to apply.\n"
                 "3. Never claim a fix was applied — code changes go through the normal human review + tests workflow, not this agent.\n"
                 "4. Summarize your findings in the task output so the operator can act."

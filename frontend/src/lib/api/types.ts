@@ -301,6 +301,43 @@ export interface HealthStatusResponse {
 	monitor_running: boolean;
 }
 
+/**
+ * OPS-4: whether REAL-MONEY order placement is armed on the backend process.
+ *
+ * `FORVEN_ALLOW_MAINNET` is the single switch between "every mainnet order is
+ * refused" and "orders spend real funds". It used to be read exactly once, deep
+ * inside `exchange.hyperliquid._assert_execution_allowed`, so a live-armed
+ * instance was indistinguishable from a testnet-only one on every status surface.
+ * Shape is fixed by `forven/exchange/hyperliquid.py::mainnet_arming_state`.
+ */
+export interface MainnetArmingState {
+	/** Always 'FORVEN_ALLOW_MAINNET' — named so the UI can tell the operator what to unset. */
+	flag: string;
+	armed: boolean;
+	/** Where the answer came from ('env', 'env_fallback', …) — diagnostic, not a contract. */
+	source?: string;
+	[key: string]: unknown;
+}
+
+/**
+ * Carried by BOTH `GET /api/health` (control_plane/status.py::health_check) and
+ * the diagnostics snapshot. `mainnet_armed` is the flattened boolean; the nested
+ * record is the detail. Optional because an older backend omits them — treat a
+ * missing value as UNKNOWN, never as "safe/disarmed".
+ */
+export interface MainnetArmingFields {
+	mainnet_armed?: boolean;
+	mainnet_arming?: MainnetArmingState;
+}
+
+export interface HealthCheckResponse extends MainnetArmingFields {
+	status: string;
+	time?: string;
+	issues?: string[];
+	details?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+
 export interface HealthAlertsResponse {
 	alerts: HealthAlert[];
 	count: number;

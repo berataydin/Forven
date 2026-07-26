@@ -302,9 +302,19 @@ def test_ceiling_rejects_nonpositive(forven_db):
         risk.set_live_notional_ceiling("", 100.0)
 
 
-def test_kernel_live_open_blocked_by_go_live_ceiling(forven_db, monkeypatch):
-    """An order over the strategy's go-live notional ceiling is refused before any
-    trade row or exchange order exists."""
+def test_kernel_live_open_clamped_to_go_live_ceiling(forven_db, monkeypatch):
+    """An order over the go-live ceiling is SIZED DOWN to it, not refused.
+
+    SLICE-1 changed this contract deliberately, and the old assertion (BLOCKED,
+    no trade row) is preserved in git history. The reason: a ceiling that refuses
+    is a strategy-disabler rather than a limiter. S05665 sized $475 against a $100
+    ceiling and was refused 24 times across three days instead of trading at $100 —
+    the operator set that ceiling meaning "go live cautiously", and the knob meant
+    to express that intent made it unreachable.
+
+    What must still hold, and is asserted below: the clamp only ever REDUCES, and
+    the resulting notional is never a hair above the cap.
+    """
     import forven.scanner as scanner
     from forven.strategies.paper_reconcile import ReconcileAction
 
@@ -319,18 +329,20 @@ def test_kernel_live_open_blocked_by_go_live_ceiling(forven_db, monkeypatch):
     action = ReconcileAction("open", "long", "2024-01-01T00:00:00+00:00",
                              position={"entry_price": 100.0, "size_fraction": 0.05, "stop_price": 95.0,
                                        "target_price": None, "entry_bar": 10})
-    # units = 10000*2*0.05/100 = 10 → notional $1000 > $500 ceiling
+    # units = 10000*2*0.05/100 = 10 → notional $1000, over the $500 ceiling.
     msg = scanner._kernel_open_live_trade("S-NEW", {"asset": "ETH", "params": {}}, action,
                                           sizing_equity=10_000.0, leverage=2.0)
-    assert msg and "BLOCKED" in msg and "go-live notional ceiling" in msg
-    assert "x" not in placed
+    assert msg and "BLOCKED" not in msg, f"the order should have opened, got: {msg}"
+    assert placed.get("x"), "a clamped order must still reach the exchange"
+
     with get_db() as conn:
-        rows = conn.execute("SELECT COUNT(*) AS n FROM trades WHERE asset='ETH'").fetchone()
-    assert rows["n"] == 0
-    # LOUD: ceiling blocks alert the operator too, under their own dedupe class.
-    from forven.notifications import list_notifications
-    notes = list_notifications(event_type="trade_blocked")
-    assert len(notes) == 1 and "ceiling" in str(notes[0].get("summary"))
+        row = conn.execute(
+            "SELECT size FROM trades WHERE asset='ETH' ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None, "the clamped order must produce a trade row"
+    notional = float(row["size"]) * 100.0
+    assert notional <= 500.0 + 1e-6, f"clamped notional ${notional:.2f} exceeds the $500 ceiling"
+    assert notional == pytest.approx(500.0, abs=0.01), "should size TO the ceiling, not below it"
 
 
 # ---------------------------------------------------------------- can_open coarse gate

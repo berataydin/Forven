@@ -223,6 +223,32 @@ def set_execution_mode(mode: str):
     save_config(cfg)
 
 
+def propr_enabled() -> bool:
+    """Hidden Propr.xyz prop-firm integration switch (PROPR-1).
+
+    Deliberately NOT in the settings manifest or the Settings UI — like the
+    FORVEN_ALLOW_MAINNET guard, an operator must already know this exists to
+    turn it on: set FORVEN_PROPR_ENABLED=1 in the environment, or hand-write
+    "propr_enabled": true into config.json. The flag controls VISIBILITY only
+    (the Propr nav page + /api/propr routes); actually placing a Propr order
+    additionally requires FORVEN_ALLOW_PROPR_LIVE=1 (see forven.exchange.propr —
+    Propr has no testnet, every order is real challenge-account money).
+
+    Beta builds are unconditionally OFF, same reasoning as the paper lock in
+    get_execution_mode: a packaged-build tester must not be able to reach a
+    real-money venue no matter what got written to config.
+    """
+    if is_beta_build():
+        return False
+    env = os.environ.get("FORVEN_PROPR_ENABLED")
+    if env is not None and str(env).strip():
+        return _parse_bool(env)
+    try:
+        return _parse_bool(load_config().get("propr_enabled"))
+    except Exception:
+        return False
+
+
 def _parse_float(value, default: float) -> float:
     """Parse float-like values with fallback."""
     if isinstance(value, (int, float)):

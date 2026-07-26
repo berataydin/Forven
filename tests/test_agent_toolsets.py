@@ -22,6 +22,7 @@ import pytest
 
 from forven.agents import tool_registry as tr
 from forven.agents.context import reset_tool_context, set_tool_context
+from forven.agents.mcp_client import _mcp_tool_name
 from forven.agents.tool_registry import (
     ToolDef,
     VALID_CONTEXTS,
@@ -60,9 +61,21 @@ def synthetic_registry(forven_db, monkeypatch):
     _add("research_news", category="research")
     _add("archive_strategy", category="destructive")
     _add("get_market_data", category="exchange")
-    _add("mcp_jira__create_issue", category="mcp")
-    _add("mcp_jira__list_issues", category="mcp")
-    _add("mcp_slack__post_msg", category="mcp")
+    # AI-05: build the synthetic MCP entries through the REGISTRAR's own name +
+    # permission convention so this fixture can never drift from what the runtime
+    # actually produces. The names used to be hand-written
+    # ``mcp_jira__create_issue`` (double underscore) — a spelling mcp_client never
+    # emits, which is exactly how the broken ``split("__")`` resolver passed its
+    # tests while the real per-server override was inert in production. The
+    # ``mcp:<server>`` permission is likewise what ``register_server_tools``
+    # stamps, and is now the AUTHORITATIVE source the override resolver reads the
+    # server from (agent-x is granted both servers below).
+    def _add_mcp(server: str, tool: str) -> None:
+        _add(_mcp_tool_name(server, tool), category="mcp", permissions=(f"mcp:{server}",))
+
+    _add_mcp("jira", "create_issue")
+    _add_mcp("jira", "list_issues")
+    _add_mcp("slack", "post_msg")
 
     monkeypatch.setattr(tr, "_REGISTRY", test_registry)
     # Insert a minimal agent row so permission_subjects can read role.
@@ -208,16 +221,20 @@ def test_mcp_server_override_filters_specific_server(synthetic_registry) -> None
     """mcp:<server> rule applies to all tools from that MCP server."""
     _add_override("agent-x", "interactive", "mcp:jira", enabled=False)
     names = {t["name"] for t in get_tools_for_agent("agent-x", context="interactive")}
-    assert "mcp_jira__create_issue" not in names
-    assert "mcp_jira__list_issues" not in names
+    assert _mcp_tool_name("jira", "create_issue") not in names
+    assert _mcp_tool_name("jira", "list_issues") not in names
     # Other MCP servers untouched.
-    assert "mcp_slack__post_msg" in names
+    assert _mcp_tool_name("slack", "post_msg") in names
 
 
 def test_mcp_wildcard_override_disables_all_mcp(synthetic_registry) -> None:
     _add_override("agent-x", "interactive", "mcp:*", enabled=False)
     names = {t["name"] for t in get_tools_for_agent("agent-x", context="interactive")}
-    for name in ("mcp_jira__create_issue", "mcp_jira__list_issues", "mcp_slack__post_msg"):
+    for name in (
+        _mcp_tool_name("jira", "create_issue"),
+        _mcp_tool_name("jira", "list_issues"),
+        _mcp_tool_name("slack", "post_msg"),
+    ):
         assert name not in names
 
 
@@ -226,8 +243,8 @@ def test_specific_mcp_overrides_wildcard(synthetic_registry) -> None:
     _add_override("agent-x", "interactive", "mcp:*", enabled=False)
     _add_override("agent-x", "interactive", "mcp:jira", enabled=True)
     names = {t["name"] for t in get_tools_for_agent("agent-x", context="interactive")}
-    assert "mcp_jira__create_issue" in names
-    assert "mcp_slack__post_msg" not in names
+    assert _mcp_tool_name("jira", "create_issue") in names
+    assert _mcp_tool_name("slack", "post_msg") not in names
 
 
 # --- compute_effective_toolset (preview) ----------------------------------

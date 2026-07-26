@@ -354,6 +354,20 @@ def close_live(bot_config: dict, *, position: dict, reason: str) -> dict:
     if size <= 0:
         return {"state": "noop", "message": "trade has no size"}
 
+    # HL-CLOSE-1 caller side. The bot lane reaches the venue through
+    # scanner._execute_direct, NOT hyperliquid.close_position directly, and that
+    # is deliberate: _execute_direct is where the rejection contract is enforced.
+    # HyperLiquid reports a rejected reduce-only IOC as a per-status error inside
+    # a success-shaped payload, so close_position stamps payload["error"] and
+    # _execute_direct raises on it BEFORE any fill is recorded; a no-fill (but
+    # unrejected) response is marked pending_close_reconcile and a partial leaves
+    # the residual open and protected. Only "confirmed" reaches _close_trade_db
+    # below. If this ever gets inlined onto close_position, it must check
+    # result["error"] and route the rest through
+    # execution_results.parse_close_receipt — a close that did not fill must
+    # never be booked as closed (that books close_price, the 3%-through-mid
+    # limit that never traded, and retires the stop on a still-open position).
+    # tests/test_finish_shims.py holds all three outcomes down end to end.
     try:
         result = _execute_direct(
             "close", trade_id, sid, coin, direction, size, ref_price, close_reason=reason

@@ -16,9 +16,16 @@ Each control DISPATCHES on whether the position is paper or live:
   ``place_take_profit``), then persists the result and frees/registers the risk slot.
 
 Safety rules (operator decisions):
-* Closing / reducing / flipping is NEVER gated. Opening a NEW live position
-  respects the risk gates (``can_open`` → kill-switch / daily-loss / margin); a
-  red gate refuses the open with a clear error.
+* Closing / reducing is NEVER gated. Opening a NEW live position respects the
+  risk gates (``can_open`` → kill-switch / daily-loss / margin); a red gate
+  refuses the open with a clear error. It ALSO runs the three order-level bounds
+  the automated path runs (ORDER-BOUND-1): the LIVE-CLAMP-1 loss-at-stop cap,
+  the account portfolio budget, and the operator's typed GO-LIVE notional
+  ceiling — a hand-opened order is not an exemption from them.
+* A FLIP is a close + an open, and only its OPEN leg is gated. Every gate and
+  bound that can refuse the reversal is PRE-FLIGHTED before the close leg fires
+  (``_assert_live_open_bounds``), because a refusal after the close would strand
+  the account FLAT — the one outcome a flip must never produce.
 * Manual live SL/TP are RESTING reduce-only orders on the exchange (true
   protection), tracked by order id in ``signal_data``.
 * WS-light: paper paths do one DB txn + a cached mid (no candle loads). Live
@@ -678,9 +685,61 @@ def open_manual_position(
     return _refresh(session_id)
 
 
+def _assert_live_open_bounds(
+    strategy_id, asset, direction, *, size, ref_price, stop_price, book,
+    testnet, exclude_trade_ids=None, context: str = "",
+) -> None:
+    """ORDER-BOUND-1: the three money bounds every REAL open must satisfy.
+
+    The LIVE-CLAMP-1 loss-at-stop cap, the operator's typed GO-LIVE notional
+    ceiling and the account portfolio budget — the same trio
+    ``scanner._execute_direct`` runs at its order choke point, off the same
+    real-equity resolver. Raises HTTPException(409) on the first refusal;
+    returns None when the order is admitted. Real capital only: sim and testnet
+    carry no risk (identical scoping to _execute_direct's backstop).
+
+    Extracted so ``flip_position`` can PRE-FLIGHT these bounds BEFORE its close
+    leg. Running them only inside ``_live_open`` meant a flip closed the
+    position and THEN 409'd, stranding the account FLAT — the exact invariant
+    flip_position's own comment says it preserves (gates block opens, never
+    closes).
+
+    ``exclude_trade_ids`` drops rows the caller is retiring in the same
+    operation (the flip's outgoing position, which ``_live_close_trade`` may
+    leave OPEN pending close-reconcile) so the pre-flight and the backstop
+    inside ``_live_open`` evaluate the same "book + this order" figure instead
+    of counting the old position against its own replacement."""
+    from forven.sim.clock import is_sim_active as _is_sim_active
+
+    if testnet or _is_sim_active():
+        return
+
+    from forven.scanner import _get_real_account_equity
+
+    real_equity = _get_real_account_equity()
+    ok, why = risk_mod.check_live_loss_at_stop(
+        size=float(size), price=float(ref_price),
+        stop_loss=float(stop_price), equity=real_equity,
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail=f"{context}Blocked by risk clamp: {why}")
+    add_notional = float(size) * float(ref_price)
+    add_risk = abs(float(ref_price) - float(stop_price)) * float(size)
+    ok, why = risk_mod.check_live_strategy_ceiling(strategy_id, add_notional)
+    if not ok:
+        raise HTTPException(status_code=409, detail=f"{context}Blocked by go-live ceiling: {why}")
+    ok, why = risk_mod.check_live_portfolio_budget(
+        asset, direction, add_risk_usd=add_risk, add_notional_usd=add_notional,
+        equity=real_equity, book=book, exclude_trade_ids=exclude_trade_ids,
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail=f"{context}Blocked by portfolio budget: {why}")
+
+
 def _live_open(
     session_id, strategy_id, asset, direction, *, size, risk_pct, leverage,
     stop_loss_price, take_profit_price, idempotency_key=None,
+    exclude_trade_ids=None,
 ) -> None:
     """Open a real Hyperliquid position (gated), persist it, and register the slot."""
     risk_fraction = None
@@ -742,6 +801,28 @@ def _live_open(
     _halt_ok, _halt_reason = risk_mod.is_trading_allowed()
     if not _halt_ok:
         raise HTTPException(status_code=409, detail=f"Trading halted — {_halt_reason}")
+
+    # ORDER-BOUND-1: this function places its own hyperliquid.market_order and so
+    # never passes through scanner._execute_direct — which means LIVE-CLAMP-1, the
+    # account portfolio budget and the operator's typed GO-LIVE ceiling ALL used to
+    # be skipped for a hand-opened live position. Worse, an explicit `size` leaves
+    # risk_fraction None, so can_open above substituted per_strategy_max and never
+    # saw the submitted size at all: a manual open was the one unbounded real order
+    # in the system. Run the same three bounds the automated path runs, off the same
+    # real-equity resolver, before any exchange call. flip_position PRE-FLIGHTS the
+    # same helper before its close leg, so this call is the backstop for it, not the
+    # first look. The sim/testnet skip is repeated here purely so the exempt paths
+    # do not pay for a mark fetch the bounds would discard.
+    from forven.sim.clock import is_sim_active as _is_sim_active
+
+    if not testnet and not _is_sim_active():
+        _assert_live_open_bounds(
+            strategy_id, asset, direction,
+            size=float(resolved_size),
+            ref_price=_fresh_manual_mark(_resolve_session(session_id)),
+            stop_price=float(_parsed_stop), book=book, testnet=testnet,
+            exclude_trade_ids=exclude_trade_ids,
+        )
 
     try:
         leverage_result = set_leverage(
@@ -1177,12 +1258,27 @@ def flip_position(session_id: str) -> dict:
                 detail="Flip blocked: could not derive a protective stop for the reversed "
                        "position; not closing (a live position must carry a stop).",
             )
+        # ORDER-BOUND-1 (same invariant as the stop derivation above): _live_open now
+        # also enforces the loss-at-stop clamp, the go-live ceiling and the portfolio
+        # budget. Those run AFTER the close on this path, so a refusal there would
+        # strand the account FLAT — reachable when the reversed side's profile stop is
+        # wider, when the ceiling is below the existing notional, or when the outgoing
+        # row is still OPEN pending close-reconcile. Pre-flight them on the REVERSED
+        # order here, excluding the position we are about to close so it is not
+        # counted against its own replacement.
+        _assert_live_open_bounds(
+            strategy_id, asset, opposite,
+            size=size, ref_price=rev_mark, stop_price=rev_stop,
+            book=open_book, testnet=_live_testnet(),
+            exclude_trade_ids={old_id}, context="Flip blocked — ",
+        )
         _live_close_trade(trade, close_reason="manual_flip_close")
         _live_open(
             session_id, strategy_id, asset, opposite,
             size=size, risk_pct=None, leverage=leverage,
             stop_loss_price=rev_stop,
             take_profit_price=_coerce_optional_float(rev_levels.get("take_profit")),
+            exclude_trade_ids={old_id},
         )
         return _refresh(session_id)
 

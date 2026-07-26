@@ -610,14 +610,78 @@ class BinancePriceFeed:
 # ─── Binance derivatives data (funding + open interest) ──────────────────────
 # Backtest AND paper read the SAME funding/OI columns (via backtest._enrich_with_
 # market_data). Sourcing them from Binance — like the candles — keeps the two
-# engines on one venue. Binance funds every 8h; we express the rate PER HOUR
-# (rate / 8) so it merges onto the candle grid and accrues exactly like the
+# engines on one venue. Binance stamps the PER-SETTLEMENT rate; we express it
+# PER HOUR so it merges onto the candle grid and accrues exactly like the
 # (hourly) HyperLiquid series did — one funding convention across both engines.
+#
+# HARDEN-DATA-OPS (funding-interval-hardcoded-8h): the divisor used to be a
+# hardcoded 8 for EVERY symbol. Most USDⓈ-M perps settle every 8h, but not all —
+# 4h pairs are routine and Binance drops to 1h under extreme skew, so a fixed /8
+# mis-charged funding by 2x (8x at 1h) in the backtest, the kernel's in-walk
+# accrual and the paper book alike. Same class as the 2026-07-07 basket incident
+# (a single whole-file divisor inflated funding ~8x and corrupted the
+# cross-sectional ranking). Every series is now converted PER PRINT off the gap
+# to the next settlement — see funding_interval_hours_per_print, the one
+# implementation basket_lab._per_hour_funding_series also uses.
 _FUTURES_BINANCE_EXCHANGE = None
-_BINANCE_FUNDING_INTERVAL_HOURS = 8.0
+DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+MIN_FUNDING_INTERVAL_HOURS = 1.0
+MAX_FUNDING_INTERVAL_HOURS = 24.0
+# Back-compat alias: the old name is the *fallback* divisor now, not the rule.
+_BINANCE_FUNDING_INTERVAL_HOURS = DEFAULT_FUNDING_INTERVAL_HOURS
 _FUNDING_SERIES_CACHE: dict[str, tuple[float, list[tuple[int, float]]]] = {}
 _OI_SERIES_CACHE: dict[str, tuple[float, list[tuple[int, float]]]] = {}
-_SERIES_CACHE_TTL = 300.0  # funding events are 8h apart; 5-min cache is plenty
+_SERIES_CACHE_TTL = 300.0  # funding events are 4-8h apart; 5-min cache is plenty
+
+
+def funding_interval_hours_per_print(timestamps_ms) -> list[float]:
+    """Settlement interval (hours) for each funding print, in input order.
+
+    A print stamped at ``t`` is the rate for the interval ENDING at the next
+    print, so its own interval is the gap to the FOLLOWING print, clamped to
+    [1h, 24h]. The final print has no successor and takes the series median
+    (``DEFAULT_FUNDING_INTERVAL_HOURS`` when that median is itself unusable).
+
+    Per-print (not whole-file-median) because a file can carry mixed cadences —
+    the exact failure a single divisor cannot survive (2026-07-07: a keepalive
+    backfill flipped the measured cadence mid-day). Input MUST be sorted
+    ascending; returns [] for empty input.
+    """
+    stamps = [int(ts) for ts in timestamps_ms]
+    if not stamps:
+        return []
+    gaps: list[float | None] = []
+    for idx in range(len(stamps) - 1):
+        hours = (stamps[idx + 1] - stamps[idx]) / 3_600_000.0
+        gaps.append(hours if hours > 0 else None)
+    gaps.append(None)  # last print: no successor to measure against
+
+    measured = sorted(value for value in gaps if value is not None)
+    if measured:
+        mid = len(measured) // 2
+        median = measured[mid] if len(measured) % 2 else (measured[mid - 1] + measured[mid]) / 2.0
+    else:
+        median = DEFAULT_FUNDING_INTERVAL_HOURS
+    if not (MIN_FUNDING_INTERVAL_HOURS <= median <= MAX_FUNDING_INTERVAL_HOURS):
+        median = DEFAULT_FUNDING_INTERVAL_HOURS
+    return [
+        min(max(median if value is None else value, MIN_FUNDING_INTERVAL_HOURS), MAX_FUNDING_INTERVAL_HOURS)
+        for value in gaps
+    ]
+
+
+def _to_per_hour_funding(raw: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """Sort + dedupe raw ``(ts_ms, per-settlement rate)`` pairs and divide each by
+    ITS OWN settlement interval. Dedupe is keep-last: a paginated overlap would
+    otherwise present a 0h gap and poison the measured cadence."""
+    if not raw:
+        return []
+    by_ts: dict[int, float] = {}
+    for ts, rate in raw:
+        by_ts[int(ts)] = float(rate)
+    stamps = sorted(by_ts)
+    hours = funding_interval_hours_per_print(stamps)
+    return [(ts, by_ts[ts] / interval) for ts, interval in zip(stamps, hours)]
 
 
 def _binance_futures_exchange():
@@ -634,7 +698,7 @@ def _binance_futures_exchange():
 
 def _fetch_binance_funding_series_raw(symbol: str, start_ms: int, end_ms: int) -> list[tuple[int, float]]:
     exchange = _binance_futures_exchange()
-    out: list[tuple[int, float]] = []
+    raw: list[tuple[int, float]] = []
     since = int(start_ms)
     per_call = 1000
     for _ in range(60):  # bound pagination (60*1000 events ≫ any window)
@@ -645,21 +709,23 @@ def _fetch_binance_funding_series_raw(symbol: str, start_ms: int, end_ms: int) -
             ts = int(row.get("timestamp") or 0)
             rate = row.get("fundingRate")
             if ts and rate is not None and ts <= end_ms:
-                out.append((ts, float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS))
+                raw.append((ts, float(rate)))
         last_ts = int(batch[-1].get("timestamp") or 0)
         if len(batch) < per_call or last_ts >= end_ms or last_ts <= since:
             break
         since = last_ts + 1
-    out.sort(key=lambda pair: pair[0])
-    return out
+    # Collect the PER-SETTLEMENT rates first, then convert per print: the divisor
+    # is this symbol's own observed cadence, not a hardcoded 8 (see the section
+    # comment above / funding_interval_hours_per_print).
+    return _to_per_hour_funding(raw)
 
 
 def _read_binance_funding_parquet_series(symbol: str, start_ms: int, end_ms: int) -> list[tuple[int, float]]:
     """On-disk fallback for the live perp funding fetch: read the collected
-    funding history parquet (raw per-8h rates, written by
+    funding history parquet (raw per-settlement rates, written by
     ``data_manager.FundingCollector``) and normalize to PER-HOUR — the SAME
-    ``/ _BINANCE_FUNDING_INTERVAL_HOURS`` conversion the live path applies — so a
-    network-less / geo-blocked / rate-limited run isn't silently funding-blind.
+    per-print conversion the live path applies — so a network-less /
+    geo-blocked / rate-limited run isn't silently funding-blind.
     ``symbol`` is the ccxt pair ("BTC/USDT"); the parquet lives under the perp-
     pair dir via ``symbol_to_fs``. Returns [] on any error (caller then proceeds
     with no funding, matching prior behavior)."""
@@ -684,12 +750,15 @@ def _read_binance_funding_parquet_series(symbol: str, start_ms: int, end_ms: int
             .astype("int64")
             // 1_000_000
         )
-        out = [
-            (int(ts), float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS)
+        # Convert on the WHOLE file before windowing: a print's interval is the
+        # gap to the NEXT print, so trimming to [start, end] first would strand
+        # the window's last print on the median fallback.
+        raw = [
+            (int(ts), float(rate))
             for ts, rate in zip(ts_ms, df["funding_rate"])
-            if pd.notna(rate) and start_ms <= int(ts) <= end_ms
+            if pd.notna(rate)
         ]
-        out.sort(key=lambda pair: pair[0])
+        out = [pair for pair in _to_per_hour_funding(raw) if start_ms <= pair[0] <= end_ms]
         if out:
             log.info(
                 "Served %d on-disk funding records for %s (live perp API unavailable)",
@@ -761,14 +830,42 @@ def fetch_binance_oi_series(coin: str, start_ms: int | None = None, end_ms: int 
     return [(ts, oi) for ts, oi in series if start_ms <= ts <= end_ms]
 
 
+def funding_interval_hours_from_ticker(info: object) -> float:
+    """Settlement interval (hours) advertised by a ccxt fundingRate ticker.
+
+    HARDEN-DATA-OPS: the single-shot latest-rate call has no series to measure a
+    cadence from, so it reads the venue's own ``interval`` field ("4h"/"8h",
+    unified by ccxt and echoed in ``info.fundingIntervalHours``) and only falls
+    back to ``DEFAULT_FUNDING_INTERVAL_HOURS`` when the venue says nothing.
+    """
+    if not isinstance(info, dict):
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    raw = info.get("interval")
+    if raw is None:
+        nested = info.get("info")
+        if isinstance(nested, dict):
+            raw = nested.get("fundingIntervalHours") or nested.get("interval")
+    if raw is None:
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    text = str(raw).strip().lower().removesuffix("h")
+    try:
+        hours = float(text)
+    except ValueError:
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    if not (MIN_FUNDING_INTERVAL_HOURS <= hours <= MAX_FUNDING_INTERVAL_HOURS):
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    return hours
+
+
 def fetch_binance_funding_rate(coin: str) -> float | None:
-    """Latest Binance funding rate as a PER-HOUR rate (rate/8). Source-aware
-    drop-in for ``fetch_hyperliquid_funding_rate``."""
+    """Latest Binance funding rate as a PER-HOUR rate. Source-aware drop-in for
+    ``fetch_hyperliquid_funding_rate``. The divisor is the pair's advertised
+    settlement interval, not a hardcoded 8 (4h pairs were charged 2x)."""
     try:
         exchange = _binance_futures_exchange()
         info = exchange.fetch_funding_rate(_binance_symbol(coin))
         rate = info.get("fundingRate") if isinstance(info, dict) else None
-        return None if rate is None else float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS
+        return None if rate is None else float(rate) / funding_interval_hours_from_ticker(info)
     except Exception:
         return None
 

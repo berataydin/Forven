@@ -286,6 +286,12 @@ def apply_smart_decision(approval_id: int, mode: str) -> dict[str, Any]:
     applied = False
     if mode == "smart" and classifier["recommendation"] == "auto_approve":
         try:
+            # KEEP THIS IMPORT FUNCTION-LOCAL. forven.control_plane.approvals
+            # imports THIS module at top level (it owns create_approval, which
+            # dispatches into apply_smart_decision), so hoisting this to the
+            # module header closes a genuine import cycle and breaks the
+            # package. The dependency is one-directional at import time and
+            # bidirectional only at call time; that is deliberate.
             from forven.control_plane.approvals import post_approve_approval
             from forven.control_plane.models import ApprovalDecisionBody
 

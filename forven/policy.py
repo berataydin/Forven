@@ -287,6 +287,10 @@ DEFAULT_PIPELINE_CONFIG = {
         "min_robustness_score": 0.0,
         "mc_max_dd_p95": 0.50,
         "wfa_fold_pass_rate_min": 0.20,
+        # Minimum judgeable WFA folds behind a ->paper promotion. Mirrors
+        # _PAPER_GATE_FLOORS["wfa_min_folds"]; clamps gauntlet.wfa_min_folds from
+        # below so relaxing that knob to 1 cannot promote off one lucky OOS window.
+        "wfa_min_folds": 2,
         "param_jitter_pass_rate_min": 0.30,
         "live_min_closed_trades": 3,
         "live_max_drawdown_pct": 0.25,
@@ -512,15 +516,25 @@ def _normalize_pipeline_config(config: dict | None) -> dict:
     if not isinstance(paper_trading, dict):
         paper_trading = {}
         merged["paper_trading"] = paper_trading
+    explicit_paper_cfg = raw.get("paper_trading") if isinstance(raw.get("paper_trading"), dict) else {}
+    # ARCH-01 (2026-07-25): same explicit-wins rule as the paper_gate block above --
+    # the deploy_gate back-map ran UNCONDITIONALLY, so the three paper->live knobs it
+    # owns (min_paper_days / min_closed_trades / min_total_return_pct) were effectively
+    # READ-ONLY from Settings: the save round-trips the republished (stale) alias,
+    # _normalize overwrote the operator's new value from it, and load_pipeline_config
+    # then SELF-HEALED KV with the reverted value as though the operator chose it.
+    # These are real-capital thresholds; an operator raising min_paper_days must stick.
     if legacy_deploy_gate:
-        if "min_paper_days" in legacy_deploy_gate:
+        if "min_paper_days" in legacy_deploy_gate and "min_paper_days" not in explicit_paper_cfg:
             paper_trading["min_paper_days"] = legacy_deploy_gate.get("min_paper_days")
-        if "min_paper_trades" in legacy_deploy_gate:
+        if "min_paper_trades" in legacy_deploy_gate and "min_closed_trades" not in explicit_paper_cfg:
             paper_trading["min_closed_trades"] = legacy_deploy_gate.get("min_paper_trades")
-        if "min_total_return_pct" in legacy_deploy_gate:
+        if (
+            "min_total_return_pct" in legacy_deploy_gate
+            and "min_total_return_pct" not in explicit_paper_cfg
+        ):
             paper_trading["min_total_return_pct"] = legacy_deploy_gate.get("min_total_return_pct")
 
-    explicit_paper_cfg = raw.get("paper_trading") if isinstance(raw.get("paper_trading"), dict) else {}
     if (
         legacy_retirement
         and "max_drawdown_pct" in legacy_retirement
@@ -533,7 +547,15 @@ def _normalize_pipeline_config(config: dict | None) -> dict:
     if not isinstance(live_graduated, dict):
         live_graduated = {}
         merged["live_graduated"] = live_graduated
-    if legacy_decay and "degradation_threshold" in legacy_decay:
+    # ARCH-01: explicit-wins here too. decay.degradation_threshold is the republished
+    # alias of live_graduated.decay_kill_switch_pct — the LIVE decay kill switch — so
+    # the same unconditional back-map made that real-money knob unsettable from the UI.
+    explicit_live_cfg = raw.get("live_graduated") if isinstance(raw.get("live_graduated"), dict) else {}
+    if (
+        legacy_decay
+        and "degradation_threshold" in legacy_decay
+        and "decay_kill_switch_pct" not in explicit_live_cfg
+    ):
         live_graduated["decay_kill_switch_pct"] = legacy_decay.get("degradation_threshold")
 
     # Named-preset AUTHORITY: a deliberately-chosen stance (relaxed/strict) must win
@@ -558,7 +580,14 @@ def _normalize_pipeline_config(config: dict | None) -> dict:
         default_value = float(DEFAULT_PIPELINE_CONFIG.get(section, {}).get(field, 0.0))
         section_payload[field] = _coerce_ratio_threshold(section_payload.get(field), default_value)
 
-    # Publish backward-compatible aliases so existing callers keep working.
+    # Publish backward-compatible aliases so existing callers keep working. These are
+    # DERIVED VIEWS of the modern sections, never a source of truth — the back-mapping
+    # above is now explicit-wins so a republished (stale) alias round-tripped by the
+    # Settings save can no longer revert an operator edit (ARCH-01). Do NOT delete the
+    # aliases: they still have live consumers outside this module —
+    # strategies/fitness.py (paper_gate/deploy_gate.min_fitness, retirement.max_fitness),
+    # evolution.py (retirement), and monitoring.py / bot.py / brain.py
+    # (decay.degradation_threshold + decay.window_hours).
     merged["paper_gate"] = {
         "min_sharpe": float(merged["quick_screen"].get("min_sharpe", 1.0)),
         "max_drawdown_pct": float(merged["quick_screen"].get("max_drawdown_pct", 0.25)),
@@ -799,6 +828,111 @@ def score_strategy(metrics: dict) -> float:
         fitness = max(0.0, fitness - float(validation_penalty))
 
     return round(fitness, 1)
+
+
+# ---------------------------------------------------------------------------
+# Best symbol/timeframe selection from stored backtest results
+# ---------------------------------------------------------------------------
+# Lifted out of forven.db (2026-07-25 layering pass). This is a SELECTION
+# POLICY, not storage: it ranks a strategy's stored backtest contexts by
+# ``score_strategy`` and breaks ties on sharpe, then total return. Living in
+# db.py forced the storage layer to reach UP into this module for the scorer —
+# the exact inversion the layering ratchet in tests/test_finish_db_layering.py
+# now guards. The SQL is a plain read through ``get_db``; policy reading
+# storage is the correct direction.
+#
+# ``forven.db.resolve_best_symbol_timeframe`` / ``resolve_best_symbol`` remain
+# as deprecated shims that forward here, so existing importers keep working.
+
+def _result_metric_float(metrics: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(metrics.get(key, default))
+    except Exception:
+        return float(default)
+
+
+def _is_better_context_candidate(
+    candidate_fitness: float,
+    candidate_metrics: dict,
+    best_fitness: float,
+    best_metrics: dict,
+) -> bool:
+    if candidate_fitness > best_fitness:
+        return True
+    if candidate_fitness < best_fitness:
+        return False
+    candidate_sharpe = _result_metric_float(candidate_metrics, "sharpe", 0.0)
+    best_sharpe = _result_metric_float(best_metrics, "sharpe", 0.0)
+    if candidate_sharpe > best_sharpe:
+        return True
+    if candidate_sharpe < best_sharpe:
+        return False
+    candidate_return = _result_metric_float(candidate_metrics, "total_return_pct", 0.0)
+    best_return = _result_metric_float(best_metrics, "total_return_pct", 0.0)
+    return candidate_return > best_return
+
+
+def resolve_best_symbol_timeframe(strategy_id: str) -> tuple[str | None, str | None, float, dict]:
+    """Pick the best (symbol, timeframe) context for *strategy_id* from backtest results."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT br.symbol, br.timeframe, br.metrics_json, br.created_at
+            FROM backtest_results br
+            LEFT JOIN backtest_result_trash bt ON bt.result_id = br.result_id
+            WHERE br.strategy_id = ?
+              AND bt.result_id IS NULL
+              AND br.deleted_at IS NULL
+              AND TRIM(UPPER(br.symbol)) NOT IN ('', 'GENERIC')
+              AND TRIM(COALESCE(br.timeframe, '')) <> ''
+            ORDER BY br.created_at DESC
+            """,
+            (strategy_id,),
+        ).fetchall()
+
+    if not rows:
+        return None, None, 0.0, {}
+
+    # Keep the newest result for each symbol/timeframe context.
+    latest_by_context: dict[str, tuple[str, str, dict]] = {}
+    for r in rows:
+        symbol = str(r["symbol"] or "").strip().upper()
+        timeframe = str(r["timeframe"] or "").strip().lower()
+        if not symbol or symbol == "GENERIC" or not timeframe:
+            continue
+        key = f"{symbol}:{timeframe}"
+        if key in latest_by_context:
+            continue
+        try:
+            metrics = json.loads(r["metrics_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metrics = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        latest_by_context[key] = (symbol, timeframe, metrics)
+
+    best_symbol: str | None = None
+    best_timeframe: str | None = None
+    best_fitness = 0.0
+    best_metrics: dict = {}
+    for symbol, timeframe, metrics in latest_by_context.values():
+        fitness = float(score_strategy(metrics))
+        if best_symbol is None or _is_better_context_candidate(fitness, metrics, best_fitness, best_metrics):
+            best_symbol = symbol
+            best_timeframe = timeframe
+            best_fitness = fitness
+            best_metrics = metrics
+
+    if best_symbol is None or best_timeframe is None:
+        return None, None, 0.0, {}
+    return best_symbol, best_timeframe, best_fitness, best_metrics
+
+
+def resolve_best_symbol(strategy_id: str) -> tuple[str | None, float, dict]:
+    """Compatibility wrapper returning only symbol selection information."""
+    symbol, _timeframe, fitness, metrics = resolve_best_symbol_timeframe(strategy_id)
+    return symbol, fitness, metrics
+
 
 def _normalize_pipeline_stage(value: str | None) -> str:
     return normalize_stage(value)
@@ -2249,12 +2383,23 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             payload["error"] = str(legitimacy.get("reason") or "validation payload is not legitimate")
         payloads[normalized_type] = payload
 
+    # The cached blobs (metrics["verdict_tests"], strategies.verdict["tests"]) may only
+    # ENRICH a payload that a real, current backtest_results row already produced —
+    # never CREATE one for a missing robustness type.
+    #
+    # verdict-stub-backfills-robustness-artifacts (2026-07-25): the create branch let a
+    # stub/pending cached payload stand in for a test that never ran (or whose artifact
+    # was deleted/compacted), so it read as passing EVIDENCE and silenced the
+    # missing-evidence rejection — a false green on the gate that starts real spending.
+    # Absence of the row is now absence of evidence: the gate blocks with the
+    # counter-exempt missing_evidence code and the sweep re-queues the run.
+    # Enrichment is still field-level and skips status/passed, so a real persisted FAIL
+    # can never be overwritten by a cached pass (unchanged, deliberate).
     for test_name, payload in fallback_payloads.items():
         if test_name in stale_engine_types:
             continue  # type is claimed by a stale-engine artifact — no backfill
         existing = payloads.get(test_name)
         if not isinstance(existing, dict) or not isinstance(payload, dict):
-            payloads.setdefault(test_name, payload)
             continue
         merged = dict(existing)
         for field_name, field_value in payload.items():
@@ -2894,6 +3039,10 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # the job runs — never a merit failure. Measured divergence rejections keep
     # the counting source_divergence_reject code.
     "source_reconciliation_pending",
+    # The deflated-Sharpe gate is ENABLED but the DSR could not be computed (the
+    # trades artifact was compacted, or no backtest row exists). Absence of the
+    # measurement, not a bad measurement — re-running the backtest resolves it.
+    "dsr_unavailable",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -3823,6 +3972,103 @@ def _log_advisory_robustness_paper(strategy_id: str, verdict_payloads: dict, rob
         pass
 
 
+# Robustness types the paper->LIVE battery below actually JUDGES. param_jitter is
+# absent on purpose: the battery has no jitter criterion, so demanding its payload
+# would block on evidence nothing reads.
+_LIVE_STRICT_EVIDENCE_TYPES = ("walk_forward", "monte_carlo", "cost_stress", "regime_split")
+
+
+def _live_evidence_unusable(payload: object) -> bool:
+    """True when a robustness payload is ABSENT for the live battery.
+
+    Absence (missing / deleted / compacted / stale-engine-claimed artifact) or a
+    non-required skip both mean "nothing was measured" — never "it passed".
+
+    Deliberately NOT a quality judgement: a payload that exists but carries an
+    ``error`` from the legitimacy validator still flows into the numeric checks
+    below exactly as before. Widening this to errors would change the meaning of
+    every already-persisted borderline artifact in one step; the regression being
+    closed here is absence, and absence alone.
+    """
+    if not isinstance(payload, dict):
+        return True
+    if payload.get("non_required_failure"):
+        return True
+    return False
+
+
+def _gauntlet_participation_known(strategy_id: str, row, metrics: dict) -> bool:
+    """True when this strategy DEMONSTRABLY went through the robustness gauntlet.
+
+    Deliberately independent of the verdict PAYLOADS: the whole point is to
+    survive payload loss. ``_extract_gauntlet_verdict_payloads`` drops a type when
+    its artifact is deleted/compacted, stamped by a stale engine, or claimed by a
+    non-result row — and since the cached-stub CREATE branch was removed
+    (verdict-stub-backfills-robustness-artifacts) nothing backfills it. If the
+    live battery inferred participation from those same payloads, losing the
+    walk_forward row would silence BOTH the WFA checks and the cost-stress
+    fail-closed backstop and the strategy would graduate to REAL CAPITAL on an
+    empty battery. So participation is read from evidence that outlives the
+    payload: any robustness artifact row (INCLUDING soft-deleted ones), a gauntlet
+    workflow, or a cached verdict blob naming a gauntlet test.
+
+    Fails CLOSED (returns True) when the lookup itself errors: "we cannot tell"
+    must demand evidence, not waive it. False is reserved for strategies with no
+    trace of the gauntlet anywhere — direct/test promotions, which the empty-
+    payloads reject above already handles.
+    """
+    try:
+        with get_db() as conn:
+            # NOTE: no deleted_at filter — a soft-deleted/compacted artifact still
+            # proves the test RAN, which is exactly the case that must fail closed.
+            artifact = conn.execute(
+                """
+                SELECT 1 FROM backtest_results
+                WHERE strategy_id = ?
+                  AND LOWER(TRIM(COALESCE(result_type, ''))) IN (
+                      'walk_forward', 'monte_carlo', 'param_jitter', 'cost_stress', 'regime_split'
+                  )
+                LIMIT 1
+                """,
+                (strategy_id,),
+            ).fetchone()
+            if artifact:
+                return True
+            try:
+                workflow = conn.execute(
+                    "SELECT 1 FROM gauntlet_workflows WHERE strategy_id = ? LIMIT 1",
+                    (strategy_id,),
+                ).fetchone()
+            except Exception:
+                workflow = None  # gauntlet schema not initialised in this DB
+            if workflow:
+                return True
+    except Exception as exc:
+        log.warning(
+            "Gauntlet-participation lookup failed for %s — demanding evidence (fail closed): %s",
+            strategy_id, exc,
+        )
+        return True
+
+    # A cached verdict blob naming a gauntlet test proves the suite RAN even after
+    # every artifact row is gone — the canonical "artifacts vanished" case.
+    blobs: list[object] = []
+    if isinstance(metrics, dict):
+        blobs.append(metrics.get("verdict_tests"))
+    try:
+        if row is not None and row["verdict"]:
+            blobs.append((_parse_json_blob(row["verdict"], {}) or {}).get("tests"))
+    except Exception:  # noqa: BLE001 — a row without the column is simply no evidence
+        pass
+    for blob in blobs:
+        if not isinstance(blob, dict):
+            continue
+        for test_name in blob:
+            if _canonicalize_gauntlet_verdict_test(test_name) in _GAUNTLET_VALIDATION_TYPES:
+                return True
+    return False
+
+
 def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict) -> str | None:
     """Strict robustness battery for the LIVE (capital) gate.
 
@@ -3831,6 +4077,16 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
     Sharpe, OOS trade count, Monte-Carlo percentile, cost-stress survival, and
     regime consistency. Returns a rejection reason, or None if all clear.
     Read-only and fail-closed (may run inside the gate's write txn).
+
+    FAIL-CLOSED CONTRACT (2026-07-25): every numeric check below is presence-
+    conditional (``if isinstance(<payload>, dict)``), so a MISSING payload used to
+    silently skip its criterion — absence read as a pass on the one gate that starts
+    real spending. The EVIDENCE-COMPLETENESS block at the end closes that: a strategy
+    that demonstrably ran the gauntlet must still HAVE the payloads this battery
+    judges. It runs last on purpose, so a measured failure always reports its own
+    criterion and "evidence missing" is only ever the residue. Only a strategy with
+    no trace of the gauntlet at all (a direct/test promotion) keeps the carve-out,
+    and that case is already rejected by the empty-payloads guard above.
     """
     gate = config.get("gauntlet", {})
     rob = config.get("robustness_thresholds", {})
@@ -3839,7 +4095,50 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
     except Exception as exc:
         return f"Live gate: robustness evidence unavailable: {exc}"
     if not isinstance(verdict_payloads, dict) or not verdict_payloads:
-        return "Live gate: robustness evidence unavailable (no usable gauntlet artifacts)"
+        # Distinguish "never ran the gauntlet" from "ran it under a previous engine".
+        # Both fail closed — the decision is identical — but the operator's next
+        # action is not, and a strategy holding 33 artifacts told "no usable
+        # gauntlet artifacts" sends them hunting for missing data that is right
+        # there. The engine bump to 6 (per-print funding intervals changed cost
+        # magnitudes for every non-8h perp) invalidated every pre-bump verdict at
+        # once, so this is the COMMON case immediately after a re-baseline, not
+        # the rare one.
+        counts = {}
+        engine_version = "?"
+        try:
+            counts = _load_gauntlet_artifact_counts(strategy_id) or {}
+            # Local import: policy.py deliberately does not bind this at module
+            # level (see the other call sites) — it is part of the import cycle
+            # this codebase keeps at function scope.
+            from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
+            engine_version = str(BACKTEST_ENGINE_VERSION)
+        except Exception:  # noqa: BLE001 — diagnostics only; the rejection stands either way
+            pass
+        # Positive counts only: _load_gauntlet_artifact_counts returns the full
+        # key set with zeros for absent types, so a bare truthiness check on the
+        # dict reports "stale evidence" for a strategy that has none at all.
+        present = {k: v for k, v in counts.items() if isinstance(v, int) and v > 0}
+        if present:
+            summary = ", ".join(f"{k}x{v}" for k, v in sorted(present.items()))
+            return GateRejection(
+                f"Live gate: robustness evidence is STALE, not missing ({summary}) — the "
+                f"artifacts predate backtest engine v{engine_version} and were scored "
+                "under a different cost model. Re-run the gauntlet; failing closed before "
+                "real capital until then.",
+                # stale_engine_artifacts, NOT a new code. It is the existing taxonomy
+                # entry for exactly this condition and it is already in
+                # engine.RETRYABLE_BLOCK_REASON_CODES. Minting a fresh code here would
+                # have drained every affected strategy to failed_gate — which
+                # AUTO-ARCHIVES — so a clearer log message would have destroyed the
+                # paper cohort the message was written to explain.
+                reason_code="stale_engine_artifacts",
+            )
+        return GateRejection(
+            "Live gate: robustness evidence unavailable (no gauntlet artifacts at all) — "
+            "failing closed before real capital",
+            reason_code="missing_evidence",
+        )
 
     wfa = verdict_payloads.get("walk_forward")
     if isinstance(wfa, dict):
@@ -3875,21 +4174,6 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
         or bool(cost.get("non_required_failure"))
         or (cost.get("stressed_sharpe") is None and cost.get("degradation_pct") is None)
     )
-    # FAIL CLOSED on a missing/errored cost_stress — but ONLY when the strategy actually
-    # ran the gauntlet (walk_forward present, since it is a required test). cost_stress is
-    # non-required at the gauntlet->paper gate (Default preset "achievable paper, strict
-    # live"), so an ERRORED probe (gauntlet._non_required_skip) leaves no usable survival
-    # result here; without this guard the cost-survival checks below silently no-op and a
-    # strategy whose edge does NOT survive 2x fees/slippage could graduate to REAL MONEY.
-    # Gating on wfa avoids over-blocking direct/test promotions that carry no gauntlet
-    # validations at all (cost would also be absent there, but for a benign reason). This
-    # runs only when live_strict_robustness_enabled, so failing closed is safe: the
-    # strategy stays in paper, no capital at risk, until a clean cost-stress result exists.
-    if isinstance(wfa, dict) and cost_unusable:
-        return (
-            "Live gate: cost-stress survival could not be verified (no usable cost_stress "
-            "result) — failing closed before real capital"
-        )
     # Gate on SURVIVAL (positive stressed Sharpe) AND bounded degradation, not just an
     # absolute floor.
     if isinstance(cost, dict) and not cost_unusable:
@@ -3909,6 +4193,44 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
         if prof is not None and float(prof) < rmin:
             return f"Live gate: only {float(prof):.0%} of regimes profitable (minimum {rmin:.0%})"
 
+    # --- EVIDENCE COMPLETENESS (fail closed) ----------------------------------------
+    # Nothing above rejected. That is only meaningful if the evidence was actually
+    # THERE: every check above is `if isinstance(<payload>, dict)`, so a strategy whose
+    # walk_forward / cost_stress artifact was deleted, compacted or claimed by a
+    # stale-engine row passes this battery vacuously — and _evaluate_paper_gate is the
+    # ONLY gate on paper->live_graduated, so nothing downstream re-checks it.
+    #
+    # walk_forward is demanded unconditionally (it is THE OOS gate; policy even
+    # force-restores it into required_tests when a config drops it) and so is
+    # cost_stress: it is non-required at the ->paper gate under the "achievable paper,
+    # strict live" stance precisely because surviving 2x fees/slippage is checked HERE,
+    # before real money. Any other battery type the operator declared required is
+    # demanded too; a type nobody requires stays presence-conditional.
+    #
+    # `cost_unusable` (present but carrying no survival numbers) counts as absent, which
+    # is what the pre-2026-07-25 backstop did — except that backstop keyed on
+    # `isinstance(wfa, dict)`, inferring gauntlet participation from a payload that can
+    # VANISH. Losing the walk_forward row therefore disarmed BOTH the WFA checks and the
+    # last cost check before capital. Participation now comes from
+    # _gauntlet_participation_known, which survives payload loss.
+    demanded = {"walk_forward", "cost_stress"}
+    for test_name in (gate.get("required_tests") or []):
+        canonical = _canonicalize_gauntlet_verdict_test(test_name)
+        if canonical in _LIVE_STRICT_EVIDENCE_TYPES:
+            demanded.add(canonical)
+    absent = sorted(
+        name
+        for name in demanded
+        if (cost_unusable if name == "cost_stress" else _live_evidence_unusable(verdict_payloads.get(name)))
+    )
+    if absent and _gauntlet_participation_known(strategy_id, row, metrics):
+        return GateRejection(
+            "Live gate: robustness evidence could not be verified for "
+            f"{', '.join(absent)} (artifact missing, empty or superseded) — failing "
+            "closed before real capital; re-run the gauntlet suite",
+            reason_code="missing_evidence",
+        )
+
     return None
 
 
@@ -3926,6 +4248,13 @@ _PAPER_GATE_FLOORS = {
     "wfa_fold_pass_rate_min": 0.20,
     "param_jitter_pass_rate_min": 0.30,
     "min_trades": 3,
+    # wfa-min-folds-has-no-safety-floor (2026-07-25): wfa_min_folds was the only
+    # gauntlet threshold with NO floor and no clamp, so gauntlet.wfa_min_folds=1
+    # let a SINGLE lucky OOS window carry a paper promotion — the fold pass-RATE
+    # floor above cannot help when there is only one fold to average (1/1 = 100%).
+    # Two folds is the minimum at which "consistent out of sample" means anything.
+    # Editable like every other rail (set safety_floors.wfa_min_folds=0 to remove).
+    "wfa_min_folds": 2,
 }
 
 
@@ -4094,7 +4423,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
         "max_degradation": float(gate.get("wfa_max_degradation", 0.35)),
         "min_oos_trades": int(gate.get("wfa_min_oos_trades", 20)),
         "min_oos_sharpe": float(gate.get("wfa_min_oos_sharpe", 0.3)),
-        "min_folds": int(gate.get("wfa_min_folds", 2)),
+        # F2 floor (wfa-min-folds-has-no-safety-floor): the only gauntlet threshold
+        # that used to reach the gate UNCLAMPED. See _PAPER_GATE_FLOORS.
+        "min_folds": max(int(gate.get("wfa_min_folds", 2)), int(floors["wfa_min_folds"])),
     }
 
     wfa_payload = verdict_payloads.get("walk_forward")
@@ -4202,32 +4533,51 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     # Deflated Sharpe Ratio — optimizer selection-bias guard. OPT-IN: the DSR is
     # computed and surfaced for observation regardless, but only REJECTS here when
     # robustness_thresholds.deflated_sharpe_gate_enabled is on, so it can be
-        # calibrated before it blocks strategies. Once enabled it is authoritative,
-        # so an unavailable computation blocks rather than silently disabling the gate.
+    # calibrated before it blocks strategies. Once enabled it is authoritative,
+    # so an unavailable computation blocks rather than silently disabling the gate.
     if bool(rob_thresholds.get("deflated_sharpe_gate_enabled", False)):
         try:
             from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
 
-            dsr_info = compute_strategy_dsr(strategy_id)
+            dsr_info = compute_strategy_dsr(strategy_id, with_reason=True)
         except Exception as exc:
             return False, f"DSR gate unavailable: {exc}"
         dsr_val = dsr_info.get("dsr") if isinstance(dsr_info, dict) else None
-        if dsr_val is not None:
-            min_dsr = float(rob_thresholds.get("min_deflated_sharpe", 0.90))
-            if float(dsr_val) < min_dsr:
-                swarm_n = int(dsr_info.get("swarm_cluster_attempts") or 0)
-                if swarm_n > 0:
-                    trials_note = (
-                        f"~{dsr_info.get('n_trials')} effective trials "
-                        f"({dsr_info.get('n_trials_base')} optimizer x "
-                        f"{swarm_n + 1} swarm attempts in this idea-cluster)"
-                    )
-                else:
-                    trials_note = f"{dsr_info.get('n_trials')} trials"
-                return False, (
-                    f"DSR REJECT: Deflated Sharpe {float(dsr_val):.2f} below {min_dsr:.2f} "
-                    f"target (likely a selection artifact across {trials_note})"
+        if dsr_val is None:
+            # dsr-gate-fails-open (2026-07-25): this branch used to fall THROUGH — an
+            # ENABLED gate silently passed whenever the DSR could not be computed,
+            # i.e. exactly for the strategies whose evidence is thinnest (compacted
+            # trades artifact, missing backtest row). That is a false green on the
+            # capital-bearing ->paper gate, and it contradicted the opt-in contract
+            # documented above. Block instead. The code is evidence-ABSENCE (the
+            # artifact re-runs and the DSR becomes computable), so it is
+            # counter-exempt and must never drive the 5-strike auto-archive.
+            _dsr_why = str((dsr_info or {}).get("reason") or "unknown") if isinstance(dsr_info, dict) else "unavailable"
+            return False, GateRejection(
+                "DSR BLOCK: deflated-Sharpe could not be computed "
+                f"({_dsr_why}) and the DSR gate is enabled — re-run the backtest so "
+                "per-trade returns are persisted, then re-evaluate",
+                reason_code="dsr_unavailable",
+            )
+        min_dsr = float(rob_thresholds.get("min_deflated_sharpe", 0.90))
+        if float(dsr_val) < min_dsr:
+            swarm_n = int(dsr_info.get("swarm_cluster_attempts") or 0)
+            # "3 runs x N combos" — the deflation counts EVERY optimization run,
+            # not just the newest (dsr-trials-only-latest-optimization).
+            runs_n = int(dsr_info.get("n_optimization_runs") or 0)
+            runs_note = f"{runs_n} optimization runs totalling " if runs_n > 1 else ""
+            if swarm_n > 0:
+                trials_note = (
+                    f"~{dsr_info.get('n_trials')} effective trials "
+                    f"({runs_note}{dsr_info.get('n_trials_base')} optimizer x "
+                    f"{swarm_n + 1} swarm attempts in this idea-cluster)"
                 )
+            else:
+                trials_note = f"{runs_note}{dsr_info.get('n_trials')} trials"
+            return False, (
+                f"DSR REJECT: Deflated Sharpe {float(dsr_val):.2f} below {min_dsr:.2f} "
+                f"target (likely a selection artifact across {trials_note})"
+            )
 
     # S00552: Profit Factor enforcement at gauntlet (in addition to quick_screen).
     # M-15 (2026-06-09 audit): configurable via gauntlet.min_oos_profit_factor

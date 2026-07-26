@@ -41,7 +41,24 @@ def get_settings():
 
 @router.put("/api/settings/{section}")
 def put_settings_section(section: str, payload: dict):
+    # API-02: the body stays an open dict on purpose — each section has its own
+    # key set and full editability of every gate threshold is a deliberate
+    # project stance. The schema lives with the handlers instead:
+    # api_core._validate_settings_section_payload rejects unknown keys and
+    # out-of-range real-money limits with a 422 BEFORE anything is persisted.
     return core.put_settings_section(section, payload)
+
+
+@router.get("/api/settings/manifest-defaults")
+def get_settings_manifest_defaults():
+    # ARCH-05: the Settings page used to hand-copy ~214 engine defaults into
+    # frontend/src/lib/settings/manifest.ts, and they drifted — nine gate
+    # thresholds were captioning numbers the engine did not run, on the page an
+    # operator reviews before arming live capital. The flattening lives in
+    # forven/settings_manifest.py, not here: routers stay thin.
+    from forven import settings_manifest
+
+    return settings_manifest.manifest_defaults_payload()
 
 
 @router.post("/api/settings/test-discord")

@@ -195,8 +195,24 @@ def _runtime_health_summary() -> dict[str, object]:
 
 
 def health_check() -> dict[str, object]:
+    # OPS-4: FORVEN_ALLOW_MAINNET is the single switch between "every mainnet
+    # order is refused" and "orders spend real funds", and it used to be read
+    # exactly once, deep inside exchange.hyperliquid._assert_execution_allowed —
+    # a live-armed instance was indistinguishable from a testnet-only one from
+    # every status surface. mainnet_arming_snapshot() is env-only and never
+    # raises (it falls back to reading the var itself), so this cannot take the
+    # health endpoint down.
+    arming = core.mainnet_arming_snapshot()
     summary = _runtime_health_summary()
-    return {"status": summary["status"], "time": _now(), **summary}
+    return {
+        "status": summary["status"],
+        "time": _now(),
+        **summary,
+        # After the splat on purpose: a future key in _runtime_health_summary()
+        # must never be able to shadow the real-money arming flag.
+        "mainnet_armed": bool(arming.get("armed")),
+        "mainnet_arming": arming,
+    }
 
 
 def health_check_compat() -> dict[str, object]:

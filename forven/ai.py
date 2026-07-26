@@ -738,33 +738,29 @@ def _credentialed_chain(
     chain: list[tuple[str, str]],
     requested: tuple[str, str],
 ) -> list[tuple[str, str]]:
-    """Filter the fallback chain to providers with credentials and guarantee
-    that EVERY configured provider is reachable as a last resort.
+    """Filter the OPERATOR-CONFIGURED chain down to providers with credentials.
 
-    The configured fallback chain for a given primary may omit the one provider
-    the user actually has a key for (e.g. primary 'anthropic' -> [anthropic,
-    openai] never reaches a configured 'minimax'). So after filtering, we append
-    any credentialed provider from provider_priority that isn't already in the
-    chain. If nothing is credentialed, degrade to a single attempt on the
-    requested entry so the caller gets a clear "no credentials" error rather
-    than an unrelated provider's failure.
+    FILTER ONLY — this function never adds a provider the operator did not put in
+    the chain.
+
+    AI-03 (audit 2026-07-25): it used to append every credentialed provider from
+    ``provider_priority`` that wasn't already present, which quietly re-created
+    the exact cross-provider hop ``model_routing.get_fallback_chain`` had removed
+    ("we no longer inject cross-provider hops … which routed spend to providers
+    the operator never selected"). The effect: a transient 429 on the selected
+    vendor re-sent the prompt — which carries portfolio holdings, strategy source
+    and P&L — to a vendor the operator never chose, and the only trace was a
+    ``_record_fallback_event`` health entry. Cross-provider fallback is opt-in:
+    the operator adds explicit entries to ``fallback_chains``, and those ARE
+    honoured here because they arrive inside *chain*.
+
+    When nothing in the chain is credentialed we degrade to a single attempt on
+    the requested entry, so the caller gets a clear "no credentials" error naming
+    the provider it actually asked for rather than an unrelated vendor's failure.
     """
     filtered = [entry for entry in chain if _provider_has_credentials(entry[0])]
-    seen = {entry[0] for entry in filtered}
-    try:
-        priority = get_model_routing().get("provider_priority", []) or []
-    except Exception:
-        priority = []
-    for prov in priority:
-        if prov in seen:
-            continue
-        if _provider_has_credentials(prov):
-            filtered.append((prov, get_default_model_for_provider(prov)))
-            seen.add(prov)
     if filtered:
         return filtered
-    # No configured providers at all — keep one attempt so the error names the
-    # provider the caller asked for (today's worst-case behaviour, unchanged).
     return [requested] if requested[0] else (chain[:1] or [requested])
 
 

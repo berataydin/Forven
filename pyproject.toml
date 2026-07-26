@@ -14,6 +14,12 @@ license = { file = "LICENSE" }
 classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
 ]
+# Upper bounds: every dep whose behaviour reaches REAL MONEY or the backtest
+# math carries a next-major ceiling, so `pip install -e .` on a fresh checkout
+# can never silently swap in a breaking exchange client, web framework or
+# columnar engine. Ceilings are deliberately loose (next major only) so routine
+# patch/minor upgrades still flow; raise one on purpose after testing, never by
+# accident. Un-bounded entries below are non-critical / cosmetic deps.
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
@@ -24,12 +30,18 @@ dependencies = [
     "filelock>=3.13",
     "chromadb>=0.5",
     "ruff>=0.4",
-    "fastapi>=0.111.0",
-    "python-multipart>=0.0.9",
-    "uvicorn>=0.30.0",
+    # API surface + request/response validation. A FastAPI or pydantic major
+    # rewrites validation semantics, which is how a malformed order payload
+    # would start being accepted.
+    "fastapi>=0.111.0,<1",
+    # pydantic was an UNDECLARED direct dependency (imported by 26 forven
+    # modules) — so `forven.preflight` could not catch it missing. Declared now.
+    "pydantic>=2.7,<3",
+    "python-multipart>=0.0.9,<1",
+    "uvicorn>=0.30.0,<1",
     "websockets>=13.0,<17",
-    "slowapi>=0.1.9",
-    "pyarrow>=16.0.0",
+    "slowapi>=0.1.9,<1",
+    "pyarrow>=16.0.0,<25",
     # Upper bounds on the math-critical deps so a future major can't silently
     # break the numpy/pandas backtest engine on a fresh `pip install -e .`.
     "pandas>=2.0,<4",
@@ -37,12 +49,16 @@ dependencies = [
     "scipy>=1.11,<2",
     "requests>=2.31",
     "psutil>=5.9",
-    "ccxt>=4.5.0",
-    "hyperliquid-python-sdk>=0.22.0",
-    "eth-account>=0.13.0",
+    # Live-execution path: a ccxt / hyperliquid-sdk / eth-account major can
+    # change order params, response shapes or signing, i.e. change what the
+    # venue actually receives. Never let that arrive unannounced.
+    "ccxt>=4.5.0,<5",
+    "hyperliquid-python-sdk>=0.22.0,<1",
+    "eth-account>=0.13.0,<1",
     "scikit-learn>=1.5",
     "discord.py>=2.3",
-    "duckdb>=1.1.0",
+    # Backing store for the data lake — a major changes SQL/format behaviour.
+    "duckdb>=1.1.0,<2",
     "feedparser>=6.0",
     "trafilatura>=2.0",
     "beautifulsoup4>=4.12",
@@ -54,7 +70,8 @@ dependencies = [
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.3"]
-test = ["pytest>=8.0", "pytest-asyncio>=1.3,<2", "pytest-xdist>=3.6"]
+# TEST-3: xdist is required, not optional — CI runs the whole suite with `-n auto`.
+test = ["pytest>=8.0", "pytest-asyncio>=1.3,<2", "pytest-xdist>=3.6,<4"]
 
 [project.scripts]
 forven = "forven.cli:cli"
@@ -85,17 +102,59 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
+# ARCH-10 — why E303 (`too-many-blank-lines`) is NOT in `select` below, even
+# though it is exactly the rule this repo wants. Measured on ruff 0.15.18:
+#
+#   * E303 is preview-gated, and ruff has no per-rule preview opt-in. Selecting
+#     it without `preview = true` is a FAKE GATE: ruff prints
+#     "warning: Selection `E303` has no effect because preview is not enabled"
+#     and exits 0. Worse than absent — it reads as enforced.
+#   * Turning on `preview = true` switches `--output-format concise` from rule
+#     CODES to rule NAMES ("F401 ..." becomes "unused-import: ..."). Two tests
+#     shell out to ruff and grep its output for a code:
+#       - tests/test_harden_infra.py::
+#           test_test9_api_core_blocking_sleep_stays_a_single_known_instance
+#         greps for "ASYNC251", finds 0, and HARD FAILS its `== 1` pin.
+#       - tests/test_arch_api_core.py::test_api_core_has_no_unused_locals_left
+#         greps for "F841" and asserts none — under preview it matches nothing,
+#         so it stays green while checking NOTHING. A silently blinded gate on
+#         the app's hottest module is the worse of the two outcomes.
+#     Preview also costs 3 new ASYNC119 diagnostics needing their own baseline.
+#
+# So enabling it is a three-file atomic change (this file + both test files),
+# and the ARCH-10 group owns none of the two test files — the same
+# "must land in the SAME commit" constraint already documented at the
+# api_core.py ASYNC251 sleep. Until that lands, the rule is enforced by
+# tests/test_finish_formatting.py, which runs the REAL E303 in its own
+# `ruff --preview --select E303` subprocess (so no preview leaks into the
+# tree-wide `ruff check` CI gate) against a shrink-only per-file baseline.
+
 # Bug-catching rules gate CI:
 #   TID251 = banned-api (https://docs.astral.sh/ruff/rules/banned-api/)
 #   F      = pyflakes — undefined names (F821, real NameErrors), unused imports,
-#            redefinitions, malformed f-strings
+#            redefinitions, malformed f-strings, unused locals (F841)
 #   E9     = syntax / IO errors
-select = ["TID251", "F", "E9"]
-# F841 (unused local variable) deferred: ~24 pre-existing cases remain, several
-# in scanner.py where an unused computed value (risk_pct/leverage/canonical_meta)
-# may signal a real logic bug worth a careful audit rather than a blind delete.
-# Tracked as a follow-up; the high-value bug-catching rules above gate now.
-ignore = ["F841"]
+#   ASYNC  = flake8-async — blocking calls inside async defs. TEST-9: event-loop
+#            starvation is this project's most-repeated incident class (the
+#            single-worker backend stalling on a sync call inside the loop, see
+#            docs/memory backend-single-worker-ws-starvation). A linter that
+#            catches `time.sleep`/blocking IO in an async def is the cheapest
+#            possible guard against the next one.
+select = ["TID251", "F", "E9", "ASYNC"]
+# ASYNC109 (`timeout=` parameter on an async def) is the one ASYNC rule that is
+# NOT a blocking-call check — it is an API-shape convention preferring
+# `asyncio.timeout` at the call site. It fired on 5 signatures across 3 modules
+# that are public/monkeypatched, and carrying those as per-file entries meant
+# any new `async def foo(..., timeout=...)` anywhere in the tree turned CI red
+# for a non-bug. Ignored project-wide so the rest of the ASYNC set — the
+# blocking-call rules this selection exists for (ASYNC110 busy-wait, ASYNC2xx
+# blocking sleep/IO/subprocess) — still gates every one of those files.
+#
+# F841 is deliberately NOT here. It used to be a blanket ignore, which meant the
+# unused-local count could only grow. It is now a BASELINE: the rule is ON, and
+# the files that already trip it are listed one-by-one in per-file-ignores
+# below. New code is gated; the list can only shrink.
+ignore = ["ASYNC109"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "ta".msg = "The `ta` library is banned. It's unmaintained, was never a real dependency (see tests/test_no_ta_imports.py), and caused ~150 files of silent dead code. Use native pandas/numpy or the future forven/strategies/indicators.py helper instead."
@@ -108,6 +167,51 @@ ignore = ["F841"]
 # This test file documents the ban by name and references the `ta` module in
 # its prose + test logic; silencing the ruff rule for this one file.
 "tests/test_no_ta_imports.py" = ["TID251"]
+
+# --- TEST-9: ASYNC exemptions (deliberate, reviewed) ------------------------
+# ASYNC251 = blocking `time.sleep` in an async def. These two are the ONLY
+# sanctioned instances; everything else must use `await asyncio.sleep`.
+#   api_core.py — one-shot startup bootstrap sleep, before the app serves any
+#     request, so it starves nothing. This is a WHOLE-FILE ignore only because
+#     the audit group that added it does not own api_core.py; it leaves a gate
+#     hole in the app's hottest async module, so
+#     tests/test_harden_infra.py::test_test9_api_core_blocking_sleep_stays_a_single_known_instance
+#     pins the count in the meantime. Whoever next touches api_core.py should
+#     add a line-level `# noqa: ASYNC251` at the sleep and delete this entry.
+#   api_core.py is also on the F841 baseline below (4 unused locals, all
+#     `lifecycle_tag`-shaped) for the same ownership reason.
+"forven/api_core.py" = ["ASYNC251", "F841"]
+#   test_loop_starvation_fixes.py — deliberately blocks the loop to PROVE the
+#     stall watchdog observes it. Removing the block would delete the test.
+"tests/test_loop_starvation_fixes.py" = ["ASYNC251"]
+
+# --- TEST-9: F841 baseline --------------------------------------------------
+# Pre-existing unused locals, frozen file-by-file so the rule gates NEW code.
+# Several of these (scanner.py's risk_pct/leverage/canonical_meta, db.py's
+# net_pnl, backtest.py's active_trades/trades) may be real logic bugs — an
+# unused computed value in a sizing or PnL path is a smell, not lint noise — so
+# they want a careful audit, not a blind delete. Delete the entry, not just the
+# variable, when a file is cleaned.
+"forven/bot_factory/runner.py" = ["F841"]
+"forven/control_plane/status.py" = ["F841"]
+"forven/db.py" = ["F841"]
+"forven/evolution.py" = ["F841"]
+"forven/routers/lifecycle.py" = ["F841"]
+"forven/scanner.py" = ["F841"]
+"forven/strategies/backtest.py" = ["F841"]
+"forven/strategies/builtin/funding.py" = ["F841"]
+"forven/strategies/builtin/gap_fill.py" = ["F841"]
+"forven/strategies/builtin/momentum_burst_mean_reversion.py" = ["F841"]
+"forven/strategies/intake.py" = ["F841"]
+"tests/test_basket_live.py" = ["F841"]
+"tests/test_funding_kelly_single_application.py" = ["F841"]
+"tests/test_gauntlet_workflow_backfill.py" = ["F841"]
+"tests/test_hypothesis_promotion_loop.py" = ["F841"]
+"tests/test_hypothesis_revisit.py" = ["F841"]
+"tests/test_recall.py" = ["F841"]
+"tests/test_reconcile_sweep.py" = ["F841"]
+"tests/test_rule_engine.py" = ["F841"]
+"tests/test_scanner_indicators.py" = ["F841"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

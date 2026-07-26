@@ -1649,6 +1649,49 @@ async def _run_risk_cycle() -> dict:
     return snapshot
 
 
+def _hl_price_api_is_reachable() -> bool:
+    """True when a ``get_all_mids()`` call would actually reach the exchange.
+
+    STALE-REPUBLISH-1: with the HyperLiquid price breaker OPEN, ``get_all_mids``
+    does not fetch — it returns ``_cached_mids_snapshot()``, i.e. the daemon's OWN
+    ``daemon_state["last_prices"]``. Handing that back to the tick republished the
+    daemon's own cache to ``market:prices`` with a BRAND-NEW ``updated_at`` and a
+    fresh ``last_tick_ts``, which is worse than not polling at all:
+
+    * every downstream staleness check (the 120s mark-age gate, ``load_price_snapshot``)
+      read a minutes-or-hours-old mid as ~1s old, and
+    * ``hyperliquid._cached_mids_age_seconds`` reads that very ``last_tick_ts``, so
+      the loop kept RESETTING the age bound it is measured against — in a process
+      that never saw a live fetch (``_LAST_LIVE_MIDS_TS is None``, e.g. a fresh API
+      worker) ``_CACHED_MID_MAX_AGE_SECONDS`` could then never trip. The comment on
+      that function already calls the daemon stamp "defeatable (circular)"; this is
+      the loop that defeated it.
+
+    So the fallback poll skips while the breaker is open and lets the published
+    snapshot AGE honestly. Unknown/unreadable breaker state returns True — the
+    poll then behaves exactly as before rather than going dark on our own bug.
+    """
+    try:
+        from forven.sim.clock import is_sim_active
+
+        if is_sim_active():
+            # The sim clock serves its own deterministic mids; no breaker involved.
+            return True
+    except Exception:
+        pass
+    try:
+        from forven.exchange.hyperliquid import hl_price_breaker
+
+        # is_likely_available(), NOT can_execute(): the latter is a CONSUME
+        # operation that spends a HALF_OPEN probe slot (half_open_max_calls=2 on
+        # this breaker). Asking the question with it would burn the recovery
+        # budget the real get_all_mids() call needs, so the breaker could never
+        # close and the fallback poll would stay dark indefinitely.
+        return bool(hl_price_breaker.is_likely_available())
+    except Exception:
+        return True
+
+
 def _run_mark_watcher(prices: dict[str, float]) -> list[str]:
     """Thread-side mark-watcher pass. Lazy import: forven.mark_watcher pulls the
     scanner module (heavy) — pay that once on the first armed check, not at
@@ -2007,6 +2050,7 @@ async def async_market_loop(state: dict):
 
     last_fallback_poll = 0.0
     last_candle_refresh = 0.0
+    stale_poll_warned = False  # STALE-REPUBLISH-1: one warning per price-API outage
     try:
         while not shutdown.is_set():
             try:
@@ -2033,6 +2077,7 @@ async def async_market_loop(state: dict):
                     and now - last_fallback_poll >= PRICE_FALLBACK_POLL_INTERVAL
                 ):
                     try:
+                        mids = None
                         if resolve_market_data_source() == "binance":
                             mids = await _to_thread_with_timeout(
                                 "daemon.fetch_binance_prices.fallback",
@@ -2040,14 +2085,32 @@ async def async_market_loop(state: dict):
                                 fetch_binance_prices,
                                 _active_coins(),
                             )
-                        else:
+                        elif _hl_price_api_is_reachable():
                             mids = await _to_thread_with_timeout(
                                 "daemon.get_all_mids.fallback",
                                 FALLBACK_MIDS_TIMEOUT_SECONDS,
                                 get_all_mids,
                                 _get_testnet(),
                             )
-                        if isinstance(mids, dict):
+                        else:
+                            # STALE-REPUBLISH-1: breaker open — get_all_mids would hand
+                            # back OUR OWN cached mids, and publishing them would restamp
+                            # them fresh (see _hl_price_api_is_reachable). Skip: the
+                            # existing snapshot must be allowed to age so the downstream
+                            # staleness gates can finally see it. Logged once per outage
+                            # (the poll retries every 15s; a sustained outage must not
+                            # bury the log).
+                            if not stale_poll_warned:
+                                stale_poll_warned = True
+                                log.warning(
+                                    "Fallback price poll skipped: HyperLiquid price breaker is "
+                                    "open. NOT republishing cached mids — the market:prices "
+                                    "snapshot will age until a live fetch succeeds."
+                                )
+                        if isinstance(mids, dict) and mids:
+                            # _price_consumer drops an empty map anyway; checking here
+                            # keeps a doomed tick out of the queue and re-arms the warning.
+                            stale_poll_warned = False
                             await enqueue_price("poll", mids)
                     except Exception as e:
                         log.debug("Fallback price poll failed: %s", e)
@@ -2108,6 +2171,18 @@ def _daemon_startup_bookkeeping(install_signal_handlers: bool) -> dict | None:
 
     init_db()
     shutdown.clear()
+
+    # MAINNET-GUARD-2 caller side: the exchange guard PERMITS an unarmed mainnet
+    # reduce-only exit and logs it CRITICAL — real money moving on an instance that
+    # was never armed for it. Bridge that record to an operator notification here,
+    # where the DB is already initialised and no order is in flight. Fail-soft: a
+    # daemon must not refuse to start because alert wiring failed.
+    try:
+        from forven.notifications import install_exchange_alert_bridge
+
+        install_exchange_alert_bridge()
+    except Exception:
+        log.warning("Could not install the exchange alert bridge", exc_info=True)
 
     if install_signal_handlers:
         # H-R2: on POSIX, loop.add_signal_handler lets the event loop wake up

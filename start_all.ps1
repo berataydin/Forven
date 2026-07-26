@@ -9,9 +9,75 @@ $script:WatchdogOwnerAcquiredAt = $null
 Set-Location $script:RepoRoot
 
 
-function Write-Info { param([string]$m) Write-Host "[start_all] $m" }
-function Write-WarnMessage { param([string]$m) Write-Host "[start_all][warn] $m" }
-function Throw-StartAllError { param([string]$m) throw "[start_all][error] $m" }
+# OPS-6: start_all is the supervisor - it decides to restart, to back off, and
+# to permanently disable a service - but every one of those decisions used to
+# exist only in a console scrollback. An overnight crash-loop could not be
+# reconstructed afterwards. Mirror the console output into a durable log with
+# the same shape as watchdog.ps1's Write-Log.
+$script:StartAllLogRetainCount = 10
+$script:StartAllLogMaxBytes = 5MB
+$script:StartAllLogFile = Join-Path (Join-Path (Join-Path $script:RepoRoot ".tmp") "logs") "start_all.log"
+
+# OPS-3/OPS-10: `Start-Process -RedirectStandardOutput/-RedirectStandardError`
+# TRUNCATES its target when the child opens it, and Start-LoggedProcess used to
+# delete the previous file outright - so restarting a crashed service destroyed
+# the only record of WHY it died (the 2026-07-07 backend-crash triage ended in a
+# non-conclusion for exactly this reason). Rename aside, then prune: that
+# truncation was also the only thing bounding these logs.
+function Move-LogAside {
+    param([string]$Path, [int]$Keep = 10)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try {
+        if (Test-Path $Path) {
+            $item = Get-Item -Path $Path -ErrorAction Stop
+            if ($item.Length -gt 0) {
+                $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+                $rotated = "$Path.$stamp"
+                # Two rotations inside one second (a crash-loop) must not collide.
+                if (Test-Path $rotated) { $rotated = "$Path.$stamp-$PID" }
+                Move-Item -Path $Path -Destination $rotated -Force -ErrorAction Stop
+            } else {
+                Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+
+    try {
+        $dir = Split-Path -Parent $Path
+        $leaf = Split-Path -Leaf $Path
+        # -like (not -Filter): the Windows filter engine's legacy 8.3 matching
+        # makes "name.log.*" also match "name.log", which would prune the LIVE log.
+        $stale = @(Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "$leaf.*" -and $_.Name -ne $leaf } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip ([Math]::Max(0, $Keep)))
+        foreach ($old in $stale) {
+            Remove-Item -Path $old.FullName -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+function Write-StartAllLog {
+    param([string]$Line)
+    try {
+        $dir = Split-Path -Parent $script:StartAllLogFile
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Add-Content -Path $script:StartAllLogFile -Value "[$ts] $Line" -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+function Write-Info { param([string]$m) Write-Host "[start_all] $m"; Write-StartAllLog $m }
+function Write-WarnMessage { param([string]$m) Write-Host "[start_all][warn] $m"; Write-StartAllLog "[warn] $m" }
+function Throw-StartAllError { param([string]$m) Write-StartAllLog "[error] $m"; throw "[start_all][error] $m" }
+
+# OPS-10: cap start_all.log the same way the child logs are capped.
+try {
+    if ((Test-Path $script:StartAllLogFile) -and ((Get-Item -Path $script:StartAllLogFile -ErrorAction Stop).Length -gt $script:StartAllLogMaxBytes)) {
+        Move-LogAside -Path $script:StartAllLogFile -Keep 5
+    }
+} catch {}
 
 # Safe property lookup: under `Set-StrictMode -Version Latest`, reading a
 # non-existent property on a PSCustomObject throws. This returns $null instead
@@ -479,8 +545,11 @@ function Ensure-FrontendDeps {
 
 function Start-LoggedProcess {
     param([string]$FilePath,[string[]]$CommandArgs,[string]$WorkingDirectory,[string]$StdOutPath,[string]$StdErrPath)
-    Remove-Item $StdOutPath -Force -ErrorAction SilentlyContinue
-    Remove-Item $StdErrPath -Force -ErrorAction SilentlyContinue
+    # OPS-3: these two used to be `Remove-Item` - the crash evidence for the
+    # process we are about to REPLACE was deleted before the replacement even
+    # started. Keep it; keep the last N.
+    Move-LogAside -Path $StdOutPath -Keep $script:StartAllLogRetainCount
+    Move-LogAside -Path $StdErrPath -Keep $script:StartAllLogRetainCount
     Write-Info "Launching: $FilePath $($CommandArgs -join ' ')"
     $windowStyle = if ($script:ShowChildWindows -eq "1") { "Normal" } else { "Hidden" }
     return Start-Process -FilePath $FilePath -ArgumentList $CommandArgs -WorkingDirectory $WorkingDirectory `
@@ -723,6 +792,37 @@ function Get-RestartDelaySeconds {
     $normalizedFailures = [Math]::Max([int]$FailureCount, 0)
     $boundedFailures = [Math]::Min($normalizedFailures, 5)
     return [int][Math]::Min([Math]::Pow(2, $boundedFailures), 30)
+}
+
+# OPS-6: `permaDisabled` and the rapid-failure backoff both mean "the supervisor
+# has given up on this service". Those two states used to reach nobody - they
+# were console-only warnings in a window nobody was watching, so an overnight
+# crash-loop looked identical to a healthy night. Route them into the real
+# notification pipeline (app + Discord per policy). Best-effort: a notification
+# failure must never take the supervisor down with it.
+function Send-SupervisorNotification {
+    param([string]$Title, [string]$Summary, [string]$Severity = "critical", [string]$DedupeKey)
+
+    $pythonVar = Get-Variable -Name "python" -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $pythonVar -or [string]::IsNullOrWhiteSpace([string]$pythonVar.Value)) { return }
+    $pythonExe = [string]$pythonVar.Value
+
+    try {
+        # An explicit dedupe_key matters: emit_notification's DEFAULT key is built
+        # from the title, and these titles embed a varying failure COUNT, so every
+        # emission would look unique and the 900s system_degraded cooldown would
+        # never collapse a repeat.
+        $payload = @{
+            title = $Title; summary = $Summary; severity = $Severity; dedupe_key = $DedupeKey
+        } | ConvertTo-Json -Compress
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
+        # base64 argv, not inline interpolation: service names and exception text
+        # reach this function unescaped and would otherwise break the -c literal.
+        $code = "import base64, json, sys; from forven.notifications import emit_notification; p = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8')); emit_notification('system_degraded', severity=p['severity'], source='start_all', title=p['title'], summary=p['summary'], dedupe_key=(p.get('dedupe_key') or None))"
+        & $pythonExe -c $code $encoded *> $null
+    } catch {
+        Write-Host "[start_all][warn] Could not emit supervisor notification: $($_.Exception.Message)"
+    }
 }
 
 function Add-StartupSummary {
@@ -1303,8 +1403,16 @@ try {
             nextAllowedRestart = [DateTime]::MinValue
             permaDisabled      = $false
             disabledReason     = $null
+            lastBackoffNotice  = [DateTime]::MinValue
         }
     }
+    # Minimum spacing between two crash-loop notifications for the SAME service.
+    # Update-ServiceFailure runs on every 10s supervisor iteration while a
+    # service is down, and $rapidFailureWindow resets $failures every 2 minutes,
+    # so the counter re-crosses the threshold roughly every 2 minutes for as long
+    # as the outage lasts. Matches notification_policy's 900s system_degraded
+    # cooldown so the two agree instead of one masking the other.
+    $rapidFailureNoticeInterval = [TimeSpan]::FromSeconds(900)
 
     function Update-ServiceFailure {
         param([string]$Name, [int]$ExitCode)
@@ -1315,6 +1423,12 @@ try {
             $s.permaDisabled = $true
             $s.disabledReason = "config error (exit 78)"
             Write-WarnMessage "$Name exited with config-error code 78; not restarting this session. See $Name error log for details, fix the configuration, then re-run start_all."
+            # Once-only already: the $s.permaDisabled guard at the top of this
+            # function returns before we can reach here a second time.
+            Send-SupervisorNotification -Severity "critical" `
+                -DedupeKey "start_all:perma_disabled:$Name" `
+                -Title "start_all disabled $Name (config error)" `
+                -Summary "$Name exited with config-error code 78. The supervisor will NOT restart it this session; fix the configuration and re-run start_all."
             return
         }
 
@@ -1327,7 +1441,27 @@ try {
 
         if ($s.failures -ge $rapidFailureThreshold) {
             $s.nextAllowedRestart = $now.AddSeconds($rapidFailureBackoffSeconds)
-            Write-WarnMessage "$Name has failed $($s.failures) times in the last $($rapidFailureWindow.TotalMinutes) minutes; backing off for $rapidFailureBackoffSeconds seconds before the next restart attempt."
+            # `-eq`, not `-ge`: fire on the TRANSITION into the backed-off state.
+            # This function is called on EVERY 10s supervisor iteration while the
+            # service is down, so `-ge` emitted a CRITICAL notification every 10
+            # seconds - ~8 per 2-minute window, unbounded, each one spawning a
+            # cold python interpreter (importing forven.notifications, DB +
+            # config) SYNCHRONOUSLY inside the supervisor loop. The rate limit is
+            # belt-and-braces on top: the counter resets every $rapidFailureWindow
+            # and would otherwise re-cross the threshold every 2 minutes for the
+            # whole outage. A stable dedupe_key collapses whatever still gets
+            # through (the default key is derived from the title, which embeds the
+            # varying failure COUNT, so every emission looked unique).
+            if ($s.failures -eq $rapidFailureThreshold) {
+                Write-WarnMessage "$Name has failed $($s.failures) times in the last $($rapidFailureWindow.TotalMinutes) minutes; backing off for $rapidFailureBackoffSeconds seconds before the next restart attempt."
+                if (($now - $s.lastBackoffNotice) -ge $rapidFailureNoticeInterval) {
+                    $s.lastBackoffNotice = $now
+                    Send-SupervisorNotification -Severity "critical" `
+                        -DedupeKey "start_all:backoff:$Name" `
+                        -Title "start_all backing off $Name (crash loop)" `
+                        -Summary "$Name failed $($s.failures) times in $($rapidFailureWindow.TotalMinutes) minutes; no restart attempt for $rapidFailureBackoffSeconds seconds. The service is DOWN until then."
+                }
+            }
         }
     }
 
@@ -1512,6 +1646,9 @@ try {
     $script:IntentionalShutdown = ($exType -eq "PipelineStoppedException" -or $exType -eq "StopUpstreamCommandsException")
     if (-not $script:IntentionalShutdown) {
         Write-Host "[start_all][error] $($_.Exception.Message)"
+        # OPS-6: the supervisor dying is the single most important thing to have
+        # on disk afterwards - Write-Host alone left no trace.
+        Write-StartAllLog "[error] $($_.Exception.Message)"
     }
 } finally {
     # Clean up the sentinel

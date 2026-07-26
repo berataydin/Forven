@@ -1,3 +1,5 @@
+import BACKEND_DEFAULTS_SNAPSHOT from './backendDefaults.generated.json';
+
 export type SettingsAreaId =
   | 'home'
   | 'data'
@@ -34,7 +36,31 @@ export interface SettingsEntry {
   // from a day-valued field (e.g. the Backtest window) so an operator entering 1095
   // days immediately sees it as ~3 years.
   valueHint?: 'years';
+  /**
+   * ARCH-05: the engine owns this value, not the manifest.
+   *
+   * The literal written below is only the OFFLINE fallback. At module load
+   * `applyBackendDefaults` overwrites it from the backend's own default dicts
+   * (see backendDefaults.generated.json), and a live instance can refresh it
+   * again via `refreshSettingsManifestDefaults()`. Change a default in
+   * forven/policy.py or forven/settings_apply.py and regenerate — never here.
+   */
   default: unknown;
+  /**
+   * Set `false` to keep the literal above and skip the backend overlay. Only
+   * legitimate where the field is a deliberate UNIT MIRROR of the backend rail
+   * (a %-shaped input over a fraction-shaped config value) — overlaying there
+   * would caption a fraction under a "%" label. Every other entry must take the
+   * backend value; tests/test_finish_manifest.py enforces that.
+   */
+  defaultFromBackend?: false;
+  /**
+   * The committed source literal, stashed by `applyBackendDefaults` before it
+   * overwrites `default`. This is what the page falls back to when the generated
+   * snapshot is absent, so it is the value drift tests must assert against —
+   * checking `default` after the overlay is a tautology.
+   */
+  offlineDefault?: unknown;
   type: 'number' | 'text' | 'toggle' | 'select' | 'secret' | 'csv';
   options?: Array<{ value: string; label: string }>;
   area: SettingsAreaId;
@@ -1124,7 +1150,12 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.quick_screen.min_sharpe',
     label: 'Quick-screen min Sharpe',
-    default: 0.5,
+    // ARCH-05: mirrors DEFAULT_PIPELINE_CONFIG (forven/policy.py). These values are
+    // shown as the "Default" for a knob the operator has never set, AND are what the
+    // field renders when the backend returns no value — a stale number here is the
+    // page telling an operator a gate is stricter than the engine actually runs.
+    // tests/test_arch_wiring.py fails on any divergence; fix BOTH ends together.
+    default: 0,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
@@ -1136,7 +1167,13 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.quick_screen.min_profit_factor',
     label: 'Quick-screen min profit factor',
-    default: 1.05,
+    // 1.0 matches the engine's Default preset ("keep only a not-a-clear-loser
+    // screen at the cheapest triage"; the Strict preset restores 1.1). This was
+    // the last of the ten drifted captions: it could not be corrected in
+    // isolation because tests/test_arch_wiring.py::_KNOWN_MANIFEST_DEFAULT_DRIFT
+    // asserted that this ONE entry still disagreed. Both landed together, and
+    // that exemption set is now empty.
+    default: 1.0,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
@@ -1148,27 +1185,27 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.quick_screen.min_trades',
     label: 'Quick-screen min trades',
-    default: 30,
+    default: 20,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
     backendSection: 'pipeline',
     backendPath: 'quick_screen.min_trades',
     description:
-      'Minimum in-sample trade count for the quick-screen overfitting guardrails (Gate5). Was a hardcoded 30 before; deferred entirely when testing mode is on.',
+      'Minimum in-sample trade count for the quick-screen overfitting guardrails (Gate5). Was a hardcoded 30 before it was wired; the Default preset now runs 20 (the Strict preset restores 30). Deferred entirely when testing mode is on.',
     usedBy: ['forven.brain'],
   },
   {
     id: 'pipeline.quick_screen.min_robustness_score',
     label: 'Quick-screen min robustness',
-    default: 50,
+    default: 0,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-quick-screen',
     backendSection: 'pipeline',
     backendPath: 'quick_screen.min_robustness_score',
     description:
-      'Robustness-score floor (0-100) for the quick-screen guardrails (Gate3). The composite score is mostly earned inside the gauntlet, so fresh strategies score near zero — lower this (or enable testing mode) if the pipeline starves at quick screen. Was a hardcoded 50 before.',
+      'Robustness-score floor (0-100) for the quick-screen guardrails (Gate3). The composite score is mostly earned inside the gauntlet, so fresh strategies score near zero — a non-zero floor here is a catch-22 that empties the funnel, which is why the Default preset runs 0 (the Strict preset restores 40). Was a hardcoded 50 before it was wired.',
     usedBy: ['forven.brain'],
   },
   {
@@ -1285,7 +1322,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.gauntlet.min_robustness_score',
     label: 'Gauntlet min robustness score',
-    default: 50,
+    default: 30,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1297,7 +1334,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.gauntlet.min_trades',
     label: 'Gauntlet min trade count',
-    default: 30,
+    default: 20,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1364,7 +1401,11 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     // blocking strategies that lack those artifacts. Those two remain non-required by
     // default; their safety floors (MC tail-drawdown, regime profitability) still fire
     // whenever the test actually ran.
-    default: ['walk_forward', 'param_jitter', 'cost_stress'],
+    // ARCH-05: cost_stress was listed here but is NOT in the backend's Default preset —
+    // it is a strict-LIVE concern deferred to the paper->live gate (the Strict preset
+    // re-adds it at the gauntlet). Listing it made the page claim a ->paper gate the
+    // engine does not run.
+    default: ['walk_forward', 'param_jitter'],
     type: 'csv',
     // Canonical test names from forven.policy._GAUNTLET_VALIDATION_TYPES —
     // providing options renders this as checkboxes instead of a free-text CSV.
@@ -1386,6 +1427,14 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.gauntlet.mc_max_dd_p95',
     label: 'Gauntlet Monte-Carlo p95 max drawdown',
     unit: '%',
+    // %-shaped mirror of a fraction-shaped rail: policy stores 0.40 and
+    // _RATIO_THRESHOLD_PATHS accepts either form on write, so 40 round-trips.
+    // The backend would serve 0.4 here because policy._UI_PERCENT_THRESHOLD_PATHS
+    // (which converts 0.30 -> 30 at the settings read boundary) does not list
+    // this path — so the FIELD already renders 0.4 under a "%" label. Overlaying
+    // would only make the caption match that bug. The real fix is three lines in
+    // policy._UI_PERCENT_THRESHOLD_PATHS; until then this caption stays %-shaped.
+    defaultFromBackend: false,
     default: 40,
     type: 'number',
     area: 'lab',
@@ -1412,7 +1461,11 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.robustness_thresholds.wfa_fold_pass_rate_min',
     label: 'Walk-forward fold pass-rate floor',
     unit: '%',
-    default: 40,
+    // Backend stores the fraction 0.33 (a ratio rail — see policy._RATIO_THRESHOLD_PATHS,
+    // which accepts either form); this field is the %-shaped mirror of it. Not
+    // overlaid from the backend for the same reason as gauntlet.mc_max_dd_p95 above.
+    defaultFromBackend: false,
+    default: 33,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1426,7 +1479,9 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.robustness_thresholds.param_jitter_pass_rate_min',
     label: 'Param-jitter pass-rate floor',
     unit: '%',
-    default: 60,
+    // Backend stores the fraction 0.50 (ratio rail, see the note above).
+    defaultFromBackend: false,
+    default: 50,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-robustness-gauntlet',
@@ -1663,7 +1718,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'pipeline.paper_trading.min_closed_trades',
     label: 'Paper min closed trades',
-    default: 50,
+    default: 10,
     type: 'number',
     area: 'lab',
     subsection: 'lab-pipeline-paper-live-gates',
@@ -1676,7 +1731,9 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     id: 'pipeline.paper_trading.min_total_return_pct',
     label: 'Paper min total return',
     unit: '%',
-    // TODO confirm default
+    // Confirmed against DEFAULT_PIPELINE_CONFIG['paper_trading']['min_total_return_pct']
+    // (0.0): "strict live" is carried by the profit-factor / Sharpe / drawdown floors,
+    // not by a raw return threshold. Pinned by tests/test_arch_wiring.py.
     default: 0,
     type: 'number',
     area: 'lab',
@@ -1815,6 +1872,19 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     backendSection: 'pipeline',
     backendPath: 'safety_floors.wfa_fold_pass_rate_min',
     description: 'Absolute walk-forward fold pass-rate floor (fraction 0-1) clamped onto the gauntlet->paper gate. 0.20 = 20% of folds OOS-positive.',
+    usedBy: ['forven.policy'],
+  },
+  {
+    id: 'pipeline.safety_floors.wfa_min_folds',
+    label: 'Floor: min walk-forward folds (->paper)',
+    default: 2,
+    type: 'number',
+    area: 'lab',
+    subsection: 'lab-pipeline-safety-floors',
+    backendSection: 'pipeline',
+    backendPath: 'safety_floors.wfa_min_folds',
+    description:
+      'Absolute minimum judgeable walk-forward folds behind a gauntlet->paper promotion. wfa_min_folds was the only gauntlet threshold with no floor, so setting the gauntlet knob to 1 let a SINGLE lucky OOS window carry a promotion — the fold pass-RATE floor cannot help when there is only one fold to average (1/1 = 100%). Two is the minimum at which "consistent out of sample" means anything. Set 0 to remove the rail.',
     usedBy: ['forven.policy'],
   },
   {
@@ -2676,11 +2746,12 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'bot-operations.pipeline_assignments_per_cycle',
     label: 'Pipeline assignments per cycle',
-    default: 5,
+    default: 3,
     type: 'number',
     area: 'system',
     subsection: 'system-resource-tuning',
     backendSection: 'bot-operations',
+    // ARCH-05: mirrors _DEFAULT_SETTINGS_PAYLOAD (forven/api_core.py), which is 3.
     backendPath: 'pipeline_assignments_per_cycle',
     description: 'Max strategies the pipeline assigns to workers per dispatch cycle.',
     usedBy: ['forven.strategy_lifecycle', 'forven.runtime_worker'],
@@ -3023,7 +3094,13 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'data-engine.source_reconciliation_enabled',
     label: 'Source reconciliation gate',
-    default: false,
+    // ARCH-05 (2026-07-25): was captioned `false` against a backend that
+    // defaults this promotion-BLOCKING gate to true (dataeng/settings.py). This
+    // entry and the next were two further drifts, both invisible to
+    // tests/test_arch_wiring.py because its resolver reads
+    // _DEFAULT_SETTINGS_PAYLOAD, which does not carry the data_engine_settings
+    // subtree. Now overlaid from the backend as well.
+    default: true,
     type: 'toggle',
     area: 'data',
     subsection: 'data-engine-core',
@@ -3050,7 +3127,10 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   {
     id: 'data-engine.source_reconciliation_block_when_missing',
     label: 'Block when divergence unknown',
-    default: false,
+    // See the note on source_reconciliation_enabled: the backend defaults this
+    // to true ("until the reconciliation job has computed a usable reading,
+    // capital entry stays parked"), the caption said false.
+    default: true,
     type: 'toggle',
     area: 'data',
     subsection: 'data-engine-core',
@@ -3154,3 +3234,59 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   // choose which categories to KEEP, and executes behind a typed confirmation. It
   // calls POST /api/system/factory-reset directly, so it has no flat-settings rows.
 ];
+
+// --------------------------------------------------------------------------
+// ARCH-05: defaults come from the backend, not from the literals above
+// --------------------------------------------------------------------------
+// Every `default:` above is an offline fallback. The authoritative value is the
+// engine's own — forven/policy.py DEFAULT_PIPELINE_CONFIG, settings_apply's
+// _DEFAULT_SETTINGS_PAYLOAD, and the consumer-side live-risk registries —
+// flattened to backendPath keys by forven/settings_manifest.py and snapshotted
+// into backendDefaults.generated.json.
+//
+// Why the snapshot rather than a fetch: `default` is read synchronously while a
+// section renders (both as the "Default: N" caption and as the value a field
+// falls back to), so a promise that resolves after mount would leave the page
+// showing numbers it had already committed to. The snapshot is applied before
+// any component imports the manifest, works in SSR/unit tests/with the backend
+// down, and is pinned fresh by tests/test_finish_manifest.py.
+// `refreshSettingsManifestDefaults()` ($lib/api/settings) re-applies the LIVE
+// map on top for an instance whose snapshot was committed stale.
+
+/** Overlay `backendPath` -> value onto the manifest. Returns entries updated. */
+export function applyBackendDefaults(
+  values: Record<string, unknown>,
+  entries: SettingsEntry[] = SETTINGS_MANIFEST,
+): number {
+  let applied = 0;
+  for (const entry of entries) {
+    if (entry.defaultFromBackend === false) continue;
+    if (!entry.backendPath) continue;
+    if (!Object.prototype.hasOwnProperty.call(values, entry.backendPath)) continue;
+    const next = values[entry.backendPath];
+    // A backend that cannot answer must not blank a caption: the literal is a
+    // better answer than `undefined`.
+    if (next === undefined) continue;
+    // Preserve the committed source literal BEFORE the first overwrite. Without
+    // it there is nothing left to check the literal against: a test asserting
+    // `entry.default === values[path]` after this runs is true by construction
+    // and cannot fail on drift. `offlineDefault` is what the page shows when the
+    // snapshot is missing, so it is the value that actually needs pinning.
+    // Guarded so refreshSettingsManifestDefaults() re-applying the LIVE map does
+    // not overwrite the literal with the generated snapshot's value.
+    if (!Object.prototype.hasOwnProperty.call(entry, 'offlineDefault')) {
+      entry.offlineDefault = entry.default;
+    }
+    entry.default = next;
+    applied += 1;
+  }
+  return applied;
+}
+
+/** `backendPath` -> default, as shipped by the backend at generation time. */
+export const BACKEND_DEFAULTS: Record<string, unknown> = (
+  BACKEND_DEFAULTS_SNAPSHOT as { defaults?: Record<string, unknown> }
+).defaults ?? {};
+
+/** How many entries the snapshot overlaid. Exported so a test can pin coverage. */
+export const BACKEND_DEFAULTS_APPLIED: number = applyBackendDefaults(BACKEND_DEFAULTS);

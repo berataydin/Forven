@@ -6,6 +6,14 @@
 		type FactoryResetCategory,
 	} from '$lib/api/forven';
 
+	// API-10: must equal `FACTORY_RESET_CONFIRM_PHRASE` in $lib/api/forven, which is
+	// in turn the `Literal["FACTORY RESET"]` that FactoryResetBody accepts
+	// (forven/routers/ops.py). Declared locally rather than imported so this
+	// component stays mountable under a `vi.mock('$lib/api/forven')` factory;
+	// hardenApiUi.test.ts drives the REAL client through this dialog and asserts the
+	// posted body, so any drift between the three fails there rather than at runtime.
+	const FACTORY_RESET_PHRASE = 'FACTORY RESET';
+
 	// Accepted for parity with the other section components (the settings shell passes
 	// it); the Danger Zone is a custom destructive-action panel and does not read the
 	// flat settings blob.
@@ -39,7 +47,13 @@
 
 	$: keepIds = categories.filter((c) => keep[c.id]).map((c) => c.id);
 	$: wipeLabels = categories.filter((c) => !keep[c.id]).map((c) => c.label);
-	$: confirmArmed = confirmText.trim().toUpperCase() === 'RESET';
+	// API-10: the phrase is now BOTH the local arming check and the `confirm_phrase`
+	// the backend requires (a pydantic Literal). It used to be the word 'RESET',
+	// checked client-side only and never sent — so the wipe was one un-typed POST
+	// away for anything that could reach the API. Compared case-sensitively: the
+	// backend Literal is exact, so accepting 'factory reset' here would arm the
+	// button for a request the server then 422s.
+	$: confirmArmed = confirmText.trim() === FACTORY_RESET_PHRASE;
 
 	function toggleKeep(id: string, checked: boolean): void {
 		keep = { ...keep, [id]: checked };
@@ -152,7 +166,7 @@
 				cannot be undone.
 			</p>
 			<label class="block text-xs text-[#666]">
-				Type <span class="text-red-400">RESET</span> to confirm:
+				Type <span class="text-red-400">{FACTORY_RESET_PHRASE}</span> to confirm:
 				<input
 					type="text"
 					bind:value={confirmText}

@@ -278,9 +278,16 @@ class TestKrakenTradesHistory:
         after = len(data_mod.load_parquet(SYMBOL, TF))
         assert after >= 50  # backfilled bars persisted, not dropped
 
-    def test_all_available_heals_gappy_series(self, lake, monkeypatch):
-        # A stored trade-built series with no-trade holes is forward-filled to a
-        # continuous series when "all available" re-runs (even with no new data).
+    def test_all_available_does_not_fabricate_over_stored_gaps(self, lake, monkeypatch):
+        # REVERSED by HARDEN-DATA-OPS (forward-filled-bars-unmarked). This used
+        # to assert that re-running "all available" forward-filled the WHOLE
+        # merged series, healing an already-stored gappy dataset. That also
+        # invented flat bars across every real exchange outage already in
+        # storage, unmarked — permanently hiding the outage from the gap gate,
+        # and reading as continuous data that no backtest could distinguish from
+        # real prints. The fill now applies to the NEWLY-FETCHED window only
+        # (and stamps what it fabricated); repairing stored history is the
+        # gap-backfill path's job, which re-fetches rather than invents.
         base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
         H = 3_600_000
         gappy = pd.DataFrame(
@@ -300,7 +307,8 @@ class TestKrakenTradesHistory:
         monkeypatch.setattr(data_mod, "_cached_markets", lambda ex: {})
         data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", all_available=True)
         df = data_mod.load_parquet(SYMBOL, TF)
-        assert len(df) == 6  # hours 0..5 now continuous
+        assert len(df) == 2  # stored hole left visible, not papered over
+        assert data_mod.synthetic_bar_ranges(SYMBOL, TF) == []  # nothing fabricated
 
 
 class TestTradesOhlcvBuild:
