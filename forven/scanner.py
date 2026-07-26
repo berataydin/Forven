@@ -612,6 +612,28 @@ def _get_account_equity() -> float:
     return real if real is not None else _ACCOUNT_FALLBACK
 
 
+def _live_sizing_slice(account_equity: float | None = None) -> tuple[float | None, dict]:
+    """The sizing base for a REAL order: this strategy's equal share of the account.
+
+    SLICE-1. Wraps ``risk.live_equity_slice`` so both live paths (the kernel open
+    and the legacy per-bar open) resolve the base the same way. Pass
+    ``account_equity`` to slice a NARROWER base — the direction-book sub-account
+    balance — rather than the master wallet.
+
+    Returns (slice_usd, meta); slice_usd is None when it cannot be resolved and
+    the caller must refuse the open. Never falls back to full equity: doing so
+    would silently restore the very behaviour this replaces.
+    """
+    from forven.exchange.risk import live_equity_slice
+
+    base = account_equity if account_equity is not None else _get_real_account_equity()
+    try:
+        return live_equity_slice(base)
+    except Exception as exc:  # noqa: BLE001 — fail closed; never guess a slice
+        log.warning("SLICE-1: slice resolution failed (%s) — refusing to size", exc)
+        return None, {"reason": f"slice resolution failed: {exc}"}
+
+
 _PAPER_SANDBOX_INITIAL_CAPITAL = 10_000.0
 
 
@@ -4751,10 +4773,13 @@ def manage_positions(
             # open) — never size a real-money order off the _ACCOUNT_FALLBACK
             # constant. A funded book read below may refine this to the routed
             # sub-account's balance.
-            sizing_equity = _get_real_account_equity()
+            # SLICE-1: the strategy's equal share of the account, not the whole
+            # balance — see risk.py's SLICE-1 note for why full-equity sizing made
+            # every live open unfillable. Same fail-closed contract as before.
+            sizing_equity, _slice_meta = _live_sizing_slice()
             if sizing_equity is None or sizing_equity <= 0:
                 msg = (
-                    "real account equity unavailable (daemon/exchange not synced) — "
+                    f"live capital slice unavailable ({_slice_meta.get('reason') or 'unknown'}) — "
                     f"skipping live {strat['asset']} to avoid sizing off a fabricated fallback"
                 )
                 log.warning("[%s] BLOCKED %s — %s", strat_id, strat["asset"], msg)
@@ -4782,7 +4807,13 @@ def manage_positions(
                     # possibly near-empty) master wallet.
                     _book_eq = _book_account_equity(_book_addr)
                     if _book_eq and _book_eq > 0:
-                        sizing_equity = _book_eq
+                        # SLICE-1: the book balance is a NARROWER base, but it is
+                        # still shared by the whole cohort (direction routing is
+                        # per-signal, so any live strategy can land in either
+                        # book). Slice it by the same N — conservative rather than
+                        # clever; a per-book cohort count would need to know which
+                        # way each strategy will signal next.
+                        sizing_equity, _ = _live_sizing_slice(_book_eq)
                     else:
                         msg = (
                             f"could not read {open_book}-book sub-account balance — "
@@ -5019,6 +5050,22 @@ def manage_positions(
                 ),
                 6,
             )
+            # SLICE-1: same optional tighter cap as the kernel path — clamp to the
+            # go-live ceiling rather than refusing, and re-derive the fraction from
+            # what was actually placed so the recorded risk basis stays honest.
+            _ceiling_clamp_legacy = None
+            if execution_type == "live":
+                from forven.exchange.risk import apply_go_live_ceiling as _apply_ceiling_legacy
+
+                size, _ceiling_clamp_legacy = _apply_ceiling_legacy(strat_id, size, float(price))
+                if _ceiling_clamp_legacy and float(sizing_equity) > 0 and _leverage > 0:
+                    _size_fraction = max(
+                        0.0, min(1.0, (size * float(price)) / (float(sizing_equity) * float(_leverage)))
+                    )
+                    log.info(
+                        "[%s] SLICE-1: %s clamped to the $%.0f go-live ceiling (legacy path)",
+                        strat_id, strat["asset"], _ceiling_clamp_legacy["ceiling_usd"],
+                    )
             # Effective per-trade risk recorded for the position/risk widgets:
             # risk_per_trade for the risk-based modes, else the deployed fraction.
             if _controls.get("sizing_mode") in ("fraction", "atr"):
@@ -5038,6 +5085,8 @@ def manage_positions(
                 "stop_distance": round(float(_stop_dist_pct) * float(price), 8),
                 "risk_budget_usd": round(float(sizing_equity) * float(alloc_risk), 4),
             }
+            if _ceiling_clamp_legacy:
+                sizing_meta["go_live_ceiling_clamp"] = _ceiling_clamp_legacy
             if _controls.get("sizing_mode") == "fixed" and _controls.get("fixed_size"):
                 # FIXED-DOLLAR-1: state the dollar target explicitly so "fixed" on
                 # the position card can't be read as a fixed fraction (the fraction
@@ -6757,6 +6806,23 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
     # short with an operator-facing warning; a dedicated sub-account sizes off ITS
     # balance (fail closed if unreadable, never mis-size off the master wallet); and
     # the M7 cross-book self-trade guard defers an entry that could cross.
+    # SLICE-1 provenance for the trade row. `sizing_equity` arriving here is
+    # ALREADY this strategy's slice (the caller sliced the master wallet); if a
+    # direction book narrows the base below, that call replaces this.
+    _live_slice_meta: dict | None = None
+    try:
+        from forven.exchange.risk import live_cohort_ids as _cohort
+
+        _c = _cohort()
+        if _c is not None:
+            _live_slice_meta = {
+                "cohort_size": max(len(_c), 1),
+                "slice_usd": round(float(sizing_equity), 4),
+                "base": "master",
+            }
+    except Exception:  # noqa: BLE001 — provenance only; never block an order on it
+        _live_slice_meta = None
+
     books_on = False
     try:
         books_on = books.books_enabled()
@@ -6772,7 +6838,19 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         if _book_addr:
             _book_eq = _book_account_equity(_book_addr)
             if _book_eq and _book_eq > 0:
-                sizing_equity = _book_eq
+                # SLICE-1: slice the BOOK balance by the same cohort N — see the
+                # matching site on the legacy path for why the count is not
+                # per-book.
+                sizing_equity, _book_slice_meta = _live_sizing_slice(_book_eq)
+                if sizing_equity is None or sizing_equity <= 0:
+                    _why = (
+                        f"live capital slice unavailable for the {open_book} book "
+                        f"({_book_slice_meta.get('reason') or 'unknown'})"
+                    )
+                    log.warning("[%s] BLOCKED %s live — %s", strat_id, asset, _why)
+                    _notify_live_open_blocked(strat_id, asset, _why, "slice_unavailable")
+                    return f"BLOCKED {asset} — {_why}"
+                _live_slice_meta = {**_book_slice_meta, "base": f"{open_book}_book"}
             else:
                 log.warning(
                     "[%s] BLOCKED %s live — could not read %s-book sub-account balance; "
@@ -6828,6 +6906,26 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
             strat_id, portfolio_multiplier, size_fraction,
         )
     units = round(_sizing.position_units(equity=float(sizing_equity), size_fraction=size_fraction, leverage=leverage, entry_price=ref_price), 6)
+    # SLICE-1: the slice is the default allocation; an operator-typed go-live
+    # ceiling is an optional TIGHTER cap and the smaller wins. Clamped, not
+    # refused — a ceiling that refuses disables the strategy instead of limiting
+    # it, which is exactly how S05665 sat idle for three days.
+    from forven.exchange.risk import apply_go_live_ceiling as _apply_ceiling
+
+    units, _ceiling_clamp = _apply_ceiling(strat_id, units, ref_price)
+    if _ceiling_clamp:
+        # Re-derive the fraction from the units ACTUALLY placed. kernel_size_fraction
+        # is the equity-fraction basis the trade's PnL is computed from, so leaving
+        # the pre-clamp value there would overstate a clamped position's returns.
+        _eq = float(sizing_equity) or 0.0
+        _lev = float(leverage) or 1.0
+        if _eq > 0 and _lev > 0 and ref_price > 0:
+            size_fraction = max(0.0, min(1.0, (units * float(ref_price)) / (_eq * _lev)))
+        log.info(
+            "[%s] SLICE-1: %s clamped to the $%.0f go-live ceiling (%.6f -> %.6f units)",
+            strat_id, asset, _ceiling_clamp["ceiling_usd"],
+            _ceiling_clamp.get("requested_units", 0.0), units,
+        )
     if units <= 0:
         return None
     stop_price = pos.get("stop_price")
@@ -6946,6 +7044,13 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
     }
     if _live_clamp_meta:
         signal_data["live_risk_clamp"] = _live_clamp_meta
+    # SLICE-1: record the base this order was sized against. `kernel_equity_at_entry`
+    # is now the SLICE, not the account, and it is the PnL basis — without this a
+    # reader cannot tell a $166 slice of a $999 account from a $166 account.
+    if _live_slice_meta:
+        signal_data["live_capital_slice"] = _live_slice_meta
+    if _ceiling_clamp:
+        signal_data["go_live_ceiling_clamp"] = _ceiling_clamp
     # Pass book only when direction books are active so the books-off path keeps the
     # exact prior signature (book stays NULL = master wallet).
     _open_extra = {"book": open_book} if open_book is not None else {}
@@ -7203,8 +7308,14 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # (never size real money off the _ACCOUNT_FALLBACK constant), but close/refresh
     # actions still run so a live position can always be managed/exited.
     live_equity_unavailable = False
+    live_slice_meta: dict | None = None
     if is_live:
-        sizing_equity = _get_real_account_equity()
+        # SLICE-1: size against this strategy's EQUAL SHARE of the account, not the
+        # whole balance. Sizing against full equity is how six strategies each
+        # asked for the entire account and got refused forever (see risk.py's
+        # SLICE-1 note). Fails closed exactly like the equity read below it —
+        # a slice we cannot compute is not a slice we may guess at.
+        sizing_equity, live_slice_meta = _live_sizing_slice()
         live_equity_unavailable = sizing_equity is None or sizing_equity <= 0
     else:
         sizing_equity = _get_paper_strategy_equity(strat_id)

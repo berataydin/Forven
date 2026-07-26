@@ -6,6 +6,7 @@ Per-trade: 2% max risk per trade.
 """
 
 import json
+import math
 import logging
 import sqlite3
 import threading
@@ -1185,6 +1186,150 @@ def set_live_notional_ceiling(
 
 _TERMINAL_STRATEGY_STAGES = {"archived", "rejected", "backtest_failed"}
 
+# --------------------------------------------------------------------------- #
+# SLICE-1 — equal capital slices for the live cohort.
+#
+# Live sizing used to compute every order against the FULL account:
+#     units = equity * leverage * size_fraction / price
+# with `size_fraction = risk_per_trade / (stop_dist_pct * leverage)`. Leverage
+# cancels (so a stop-out loses ~risk_per_trade of the base, leverage-invariant --
+# that part was always right), but the BASE was the whole balance, and no
+# strategy knew that five others were sizing against the same dollars.
+#
+# The consequence was not theoretical. S06153 runs 3% risk with a ~2.95% stop, so
+# `999 * 0.03 / 0.0295` = $1,016 -- an order larger than the entire account, on a
+# $999 balance. It was refused 48 times by the hard notional cap, signalled again
+# five minutes later, and never traded for 13 days. S05665 the same, against its
+# go-live ceiling, 24 times. The caps were doing their job; the sizing was asking
+# a question no cap can answer, because "how much may I use?" is a question about
+# the OTHER strategies, and sizing could not see them.
+#
+# So the account is divided first: each live strategy gets `equity / N`, and sizes
+# within its own slice. Two properties fall out of that, both worth stating
+# because they are why this is simpler than bounding the same thing with caps:
+#
+#   * Worst-case portfolio risk is `risk_per_trade` of the ACCOUNT, no matter how
+#     many strategies run. N strategies each risking r of equity/N sum to r of
+#     equity. Adding a strategy divides the risk instead of adding to it.
+#   * `size_fraction` is already clamped to [0, 1], so a position can never exceed
+#     `slice * leverage` -- the "$100 slice at 2x is at most a $200 position"
+#     rule needs no new code.
+#
+# Deliberately NOT applied to paper or backtest sizing (operator decision): those
+# keep sizing off full equity, so existing paper track records stay comparable.
+# The promotion gates key on ratio metrics (Sharpe, profit factor, win rate) which
+# are scale-invariant, and the metric that DOES scale -- drawdown -- makes paper
+# look riskier than live will be, i.e. the gate errs conservative.
+# --------------------------------------------------------------------------- #
+
+#: Stages whose strategies can hold real-money positions, and therefore hold a slice.
+LIVE_COHORT_STAGES = ("live_graduated", "deployed")
+
+
+def live_cohort_ids() -> list[str] | None:
+    """Strategy ids currently eligible to open real-money positions.
+
+    Returns None when the cohort cannot be read. Callers MUST fail closed on
+    None rather than assuming a count: guessing low is the dangerous direction,
+    because N=1 hands a single strategy the entire account.
+    """
+    try:
+        placeholders = ",".join("?" * len(LIVE_COHORT_STAGES))
+        with get_db() as conn:
+            rows = conn.execute(
+                f"SELECT id FROM strategies "
+                f"WHERE LOWER(COALESCE(stage, status, '')) IN ({placeholders})",
+                list(LIVE_COHORT_STAGES),
+            ).fetchall()
+        return [str(r["id"]) for r in rows]
+    except Exception as exc:  # noqa: BLE001 — caller fails closed on None
+        log.warning("SLICE-1: could not enumerate the live cohort: %s", exc)
+        return None
+
+
+def live_equity_slice(account_equity: float | None) -> tuple[float | None, dict]:
+    """This strategy's equal share of the live account: ``equity / N``.
+
+    Returns ``(slice_usd, meta)``. ``slice_usd`` is None when the slice cannot be
+    resolved — an unreadable cohort or a non-positive equity — and the caller must
+    refuse the open, exactly as it already does when account equity is unavailable.
+
+    N is floored at 1: a strategy placing a live order is by definition in the
+    cohort, so a zero count means the read disagrees with reality, and dividing by
+    zero is not the way to find out.
+    """
+    meta: dict = {"cohort_size": None, "account_equity_usd": None, "slice_usd": None}
+    eq = None
+    try:
+        eq = float(account_equity) if account_equity is not None else None
+    except (TypeError, ValueError):
+        eq = None
+    if eq is None or eq <= 0:
+        return None, {**meta, "reason": "account equity unavailable"}
+
+    cohort = live_cohort_ids()
+    if cohort is None:
+        return None, {**meta, "account_equity_usd": round(eq, 2), "reason": "live cohort unreadable"}
+
+    n = max(len(cohort), 1)
+    slice_usd = eq / float(n)
+    return slice_usd, {
+        "cohort_size": n,
+        "account_equity_usd": round(eq, 2),
+        "slice_usd": round(slice_usd, 4),
+    }
+
+
+def apply_go_live_ceiling(
+    strategy_id: str, units: float, entry_price: float
+) -> tuple[float, dict | None]:
+    """Clamp an order DOWN to the strategy's go-live notional ceiling, if any.
+
+    SLICE-1 companion. The slice is the default allocation; an operator-typed
+    ceiling is an OPTIONAL tighter cap on top, and the smaller of the two wins.
+
+    It CLAMPS rather than refuses, and that is the whole point of the change: a
+    ceiling that refuses is a strategy-disabler, not a limiter. S05665 sized $475
+    against a $100 ceiling and was refused 24 times over three days rather than
+    trading at $100 — the operator's stated intent ("go live cautiously") was
+    unreachable through the very knob meant to express it.
+
+    Returns (units, clamp_meta|None). Only ever reduces: no ceiling, an
+    unreadable one, or an order already inside it are all exact no-ops, and the
+    result is floored so the resulting notional can never round back above the cap.
+    """
+    try:
+        px = float(entry_price)
+        u = float(units)
+        if u <= 0 or px <= 0:
+            return units, None
+        entry = (get_live_notional_ceilings() or {}).get(str(strategy_id).strip())
+        cap = float((entry or {}).get("ceiling_usd") or 0.0)
+        if cap <= 0:
+            return units, None
+        notional = u * px
+        if notional <= cap:
+            return units, None
+        # Floor at 6dp so the clamped notional is <= cap, never a hair above it.
+        capped = math.floor((cap / px) * 1e6) / 1e6
+        if capped <= 0:
+            return 0.0, {
+                "ceiling_usd": round(cap, 2),
+                "requested_notional_usd": round(notional, 2),
+                "clamped_notional_usd": 0.0,
+                "reason": "go-live ceiling is below one unit at this price",
+            }
+        return capped, {
+            "ceiling_usd": round(cap, 2),
+            "requested_notional_usd": round(notional, 2),
+            "clamped_notional_usd": round(capped * px, 2),
+            "requested_units": round(u, 6),
+            "clamped_units": capped,
+        }
+    except Exception as exc:  # noqa: BLE001 — never block an order on the clamp itself
+        log.warning("SLICE-1: go-live ceiling clamp failed for %s (%s) — leaving size unchanged", strategy_id, exc)
+        return units, None
+
 
 def _ceiling_stage_map(strategy_ids: list[str]) -> dict[str, str]:
     """Current stage per strategy id (lowercase); missing ids are absent."""
@@ -1422,6 +1567,30 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         ceilings_missing = [sid for sid in live_ids if sid not in ceilings]
     except Exception as exc:
         log.debug("Could not enumerate live strategies for ceiling audit: %s", exc)
+        live_ids = []
+
+    # SLICE-1: per-strategy sizing, as the operator sees it. "No ceiling" is no
+    # longer a gap to warn about — it is the DEFAULT and recommended state
+    # (the account is divided equally), so the UI needs the slice figure to show
+    # what system sizing actually produces, not just the absence of an override.
+    slice_usd, slice_meta = live_equity_slice(eq if eq else None)
+    strategy_sizing: list[dict] = []
+    for sid in sorted(set(live_ids) | {s for s in ceilings if not str(s).startswith("bot:")}):
+        manual = ceilings.get(sid) or {}
+        manual_usd = _coerce_non_negative_float(manual.get("ceiling_usd")) or None
+        candidates = [c for c in (slice_usd, manual_usd) if c and c > 0]
+        strategy_sizing.append({
+            "strategy_id": sid,
+            "mode": "manual" if manual_usd else "system",
+            "manual_usd": round(manual_usd, 2) if manual_usd else None,
+            "slice_usd": round(slice_usd, 2) if slice_usd else None,
+            "effective_usd": round(min(candidates), 2) if candidates else None,
+            "binding": (
+                None if not candidates
+                else ("manual" if manual_usd and manual_usd == min(candidates) else "slice")
+            ),
+            "stage": ceiling_stages.get(sid),
+        })
     return {
         "enabled": bool(settings.get("live_portfolio_budget_enabled", True)),
         "equity_usd": round(eq, 2) if eq else None,
@@ -1429,6 +1598,15 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         "limits_pct": limits_pct,
         "strategy_ceilings": annotated_ceilings,
         "ceilings_missing": ceilings_missing,
+        # SLICE-1 sizing view. `strategy_sizing` is the operator-facing answer to
+        # "how big will this strategy trade?", per strategy, with the reason.
+        "capital_slice": {
+            "cohort_size": slice_meta.get("cohort_size"),
+            "slice_usd": round(slice_usd, 2) if slice_usd else None,
+            "account_equity_usd": slice_meta.get("account_equity_usd"),
+            "unavailable_reason": slice_meta.get("reason"),
+        },
+        "strategy_sizing": strategy_sizing,
         "total_open_risk_usd": exposure["total_risk_usd"],
         "total_open_risk_limit_usd": round(max_risk_usd, 2) if max_risk_usd else None,
         "total_open_risk_used_frac": (
