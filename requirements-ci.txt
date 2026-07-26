@@ -30,9 +30,11 @@ pydantic>=2.7,<3
 PyJWT>=2.8
 pytest>=8.0
 pytest-asyncio>=1.3,<2
-# TEST-3: CI runs the FULL suite (~5.8k tests) with `-n auto`. Without xdist
+# TEST-3: CI runs the FULL suite (~6.2k tests) with `-n auto`. Without xdist
 # that step is a ~90-minute serial run and the job times out.
-pytest-xdist>=3.5,<4
+# Floor from #104, upper bound from the dependency-pinning pass: a new major of
+# a test runner should not land silently on a repo that gates real-money code.
+pytest-xdist>=3.6,<4
 python-multipart>=0.0.9,<1
 PyYAML>=6.0
 requests>=2.31

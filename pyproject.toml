@@ -71,7 +71,7 @@ dependencies = [
 [project.optional-dependencies]
 discord = ["discord.py>=2.3"]
 # TEST-3: xdist is required, not optional — CI runs the whole suite with `-n auto`.
-test = ["pytest>=8.0", "pytest-asyncio>=1.3,<2", "pytest-xdist>=3.5,<4"]
+test = ["pytest>=8.0", "pytest-asyncio>=1.3,<2", "pytest-xdist>=3.6,<4"]
 
 [project.scripts]
 forven = "forven.cli:cli"

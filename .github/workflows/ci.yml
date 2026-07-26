@@ -64,6 +64,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
+          # Install the package itself (deps already pinned above, hence --no-deps).
+          # Without this `forven` is importable only because pytest runs from the
+          # repo root -- a SUBPROCESS does not inherit that, so the sandbox
+          # (forven/sandbox) fails with "No module named 'forven'" and every test
+          # that executes strategy code through it dies. Only visible once the
+          # whole suite gates; the previous 44-file allowlist ran none of them.
+          python -m pip install -e . --no-deps
 
       - name: Run Ruff
         run: ruff check forven tests
@@ -204,7 +211,12 @@ jobs:
           for f in "${SERIAL_LANE[@]}"; do
             IGNORE+=(--ignore "$f")
           done
-          python -m pytest -q -n auto "${DESELECT[@]}" "${IGNORE[@]}"
+          # --dist loadfile (from #104) keeps each FILE on one worker: several
+          # suites share module-level state — the HyperLiquid SDK fixtures rebuild
+          # forven.exchange.hyperliquid — so splitting a file across workers is not
+          # safe yet. That is orthogonal to the serial lane above, which is about
+          # CPU contention rather than shared state, and both are needed.
+          python -m pytest -q -n auto --dist loadfile "${DESELECT[@]}" "${IGNORE[@]}"
 
       - name: Run subprocess-heavy suites (serial lane)
         run: |
