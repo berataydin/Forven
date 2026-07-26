@@ -447,13 +447,49 @@ def _trade_roster_key(row: dict, roster_ids: set[str]) -> str | None:
     return None
 
 
+def mirror_equity_slice(equity: float) -> tuple[float, dict]:
+    """SLICE-1 (Propr): one roster member's equal share of the CHALLENGE account.
+
+    The mirror had the same defect the Hyperliquid live path did — every roster
+    member sized against the FULL challenge balance, with no member aware that
+    five others were sizing against the same dollars. On the live $5,000 phase
+    with a 6-strategy roster that is not a theoretical over-allocation, it is a
+    challenge-ending one:
+
+        per-trade risk  = 5000 * 1%      = $50
+        six stop-outs   = $300           = 2x the $150 daily-loss limit,
+                                           and the ENTIRE $300 drawdown allowance
+
+    i.e. one bad session inside the rules of the game ends the attempt. Dividing
+    first makes six simultaneous stop-outs $50 total — 33% of the daily limit —
+    and keeps worst-case exposure at MAX_RISK_PCT of the challenge no matter how
+    large the roster grows.
+
+    Returns (slice_usd, meta). Falls back to the FULL equity only when the roster
+    cannot be read, which is the conservative direction here in the sense that it
+    preserves today's behaviour rather than silently halving positions on a
+    transient KV error — the daily-budget check downstream still bounds it.
+    """
+    meta: dict = {"roster_size": None, "challenge_equity_usd": round(float(equity or 0.0), 2)}
+    try:
+        n = max(len(mirror_roster() or {}), 1)
+    except Exception:  # noqa: BLE001 — never block a mirror open on the roster read
+        return float(equity), {**meta, "reason": "roster unreadable — sized off full equity"}
+    return float(equity) / n, {**meta, "roster_size": n,
+                               "slice_usd": round(float(equity) / n, 2)}
+
+
 def _size_mirror_order(
     asset: str, mid: float, stop_price: float, risk_pct: float | None,
     leverage: float | None, equity: float,
 ) -> tuple[float, str | None]:
-    """Independent Propr sizing: risk fraction of CHALLENGE equity at the stop
-    distance, notional-capped inside the venue's leverage room. Returns
-    (size, skip_reason)."""
+    """Independent Propr sizing: risk fraction of this member's SLICE of challenge
+    equity at the stop distance, notional-capped inside the venue's leverage room.
+    Returns (size, skip_reason).
+
+    ``equity`` is the member's slice (see mirror_equity_slice), not the account —
+    the notional headroom below is therefore also per-slice, so N members cannot
+    collectively exceed the challenge balance."""
     risk = float(risk_pct) if risk_pct else DEFAULT_RISK_PCT
     risk = min(max(risk, 0.0), MAX_RISK_PCT) or DEFAULT_RISK_PCT
     stop_dist = abs(mid - stop_price)
@@ -532,8 +568,13 @@ def _mirror_open(
         entry.update({"status": "skipped", "reason": "price already beyond the stop at mirror time"})
         return
 
+    # SLICE-1: size against this member's share of the challenge, not the whole
+    # balance. Six members each sizing off full equity put 2x the account at risk
+    # and could exhaust the drawdown allowance in one session.
+    slice_usd, slice_meta = mirror_equity_slice(equity)
+    entry["capital_slice"] = slice_meta
     size, skip_reason = _size_mirror_order(
-        asset, mid, stop_price, row.get("risk_pct"), row.get("leverage"), equity
+        asset, mid, stop_price, row.get("risk_pct"), row.get("leverage"), slice_usd
     )
     if skip_reason or size <= 0:
         entry.update({"status": "skipped", "reason": skip_reason or "size resolved to zero"})

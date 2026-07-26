@@ -67,6 +67,20 @@ export interface ProprMirror {
 	candidates: ProprMirrorCandidate[];
 	state: Record<string, ProprMirrorTradeState>;
 	halt?: ProprMirrorHalt;
+	/** Orphaned venue positions the mirror found but does not own. */
+	unmanaged?: Record<string, unknown>;
+	/**
+	 * SLICE-1: the challenge account is divided equally across the roster and each
+	 * member sizes within its own share. Before this, every member sized off the
+	 * FULL balance — six of them could put 2x the account at risk and exhaust the
+	 * drawdown allowance in a single session.
+	 */
+	capital_slice?: {
+		roster_size?: number | null;
+		challenge_equity_usd?: number | null;
+		slice_usd?: number | null;
+		reason?: string | null;
+	} | null;
 }
 
 export interface ProprOverview {

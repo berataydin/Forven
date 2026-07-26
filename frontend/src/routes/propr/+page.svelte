@@ -263,6 +263,8 @@
 	);
 	$: accountIsPaper = status?.account_type === 'paper';
 	$: halt = mirror?.halt ?? null;
+	// SLICE-1: how the challenge account is divided across the roster.
+	$: capitalSlice = mirror?.capital_slice ?? null;
 
 	// Gauge helpers for the challenge-rules panel: fill % of the venue limit,
 	// clamped, with color stepping at 50% and at the 80% halt line.
@@ -498,6 +500,23 @@
 						></div>
 						<div class="absolute inset-y-0 w-px bg-white" style="left:80%" title="Mirror halt line (80% of the venue cap)"></div>
 					</div>
+				{#if capitalSlice?.slice_usd}
+					<div class="border border-[#1a1a1a] bg-[#080808] px-3 py-2 text-[11px]">
+						<div class="flex items-center justify-between">
+							<span class="text-[#888]">Position sizing</span>
+							<span class="text-[#aaa]">
+								account split {capitalSlice.roster_size} ways ·
+								<span class="text-white">{fmtUsd(capitalSlice.slice_usd)}</span> each
+							</span>
+						</div>
+						<div class="mt-1 text-[10px] text-[#555]">
+							Each roster strategy risks its configured % of ITS OWN share, so the whole roster
+							stopping out on the same day costs one strategy's risk — not {capitalSlice.roster_size}×
+							it. Before this the mirror sized every member off the full balance, which could
+							exhaust the drawdown allowance in a single session.
+						</div>
+					</div>
+				{/if}
 					<div class="text-[10px] text-[#555]">
 						Guarded by: open-halt at 80% · loss-at-stop of open positions counts against the
 						remaining budget, so simultaneous stop-outs can't stack past the cap.

@@ -121,13 +121,28 @@ def propr_get_mirror():
     _require_enabled()
     from forven import propr_mirror
 
+    halt = propr_mirror.get_halt_state()
+    # SLICE-1: the challenge account is divided equally across the roster, so the
+    # panel can answer "how big will each member trade?" instead of leaving it to
+    # be inferred. Derived from the halt state's equity (the same figure the daily
+    # rules are measured against) so the two can never disagree on screen.
+    capital_slice = None
+    try:
+        equity = float((halt or {}).get("equity") or 0.0)
+        if equity > 0:
+            _slice, meta = propr_mirror.mirror_equity_slice(equity)
+            capital_slice = meta
+    except Exception:  # noqa: BLE001 — a display figure must never break the panel
+        capital_slice = None
+
     return {
         "enabled": propr_mirror.mirror_enabled(),
         "strategies": propr_mirror.mirror_roster(),
         "candidates": propr_mirror.roster_candidates(),
         "state": propr_mirror.get_state(),
-        "halt": propr_mirror.get_halt_state(),
+        "halt": halt,
         "unmanaged": propr_mirror.get_unmanaged_state(),
+        "capital_slice": capital_slice,
     }
 
 
