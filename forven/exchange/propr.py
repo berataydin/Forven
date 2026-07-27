@@ -527,10 +527,27 @@ def _poll_order_fill(account_id: str, order_id: str) -> dict | None:
 
 def _create_orders(account_id: str, orders: list[dict]) -> list[dict]:
     body: dict = {"orders": orders}
-    payload = _request(
-        "POST", f"/accounts/{account_id}/orders",
-        breaker=propr_trade_breaker, body=body,
-    )
+    try:
+        payload = _request(
+            "POST", f"/accounts/{account_id}/orders",
+            breaker=propr_trade_breaker, body=body,
+        )
+    except ProprApiError:
+        # Propr answers a rejected order with a bare {"message": "Bad Request
+        # Exception"} and no validation detail, so the reason is unrecoverable
+        # from the response alone. Two mirror attempts (E0252 2026-07-24, E0270
+        # 2026-07-26) died here with nothing to go on but that string.
+        #
+        # Log exactly what we SENT. It is the only half of the exchange we
+        # control, and it turns "rejected, cause unknown" into a body you can
+        # diff against the venue's schema in one pass. Order parameters only —
+        # no credentials are in this payload (auth rides in the headers).
+        log.error(
+            "Propr REJECTED this order body (%d order(s)) — compare against the "
+            "venue schema; the response carries no validation detail:\n%s",
+            len(orders), json.dumps(body, indent=2, default=str)[:2000],
+        )
+        raise
     return _rows(payload)
 
 
