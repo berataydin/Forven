@@ -130,15 +130,18 @@ def armed_propr(monkeypatch):
 
     sent: list[dict] = []
 
-    def fake_create(account_id, orders):
-        sent.append({"account_id": account_id, "orders": orders})
+    def fake_create(account_id, orders, group_id=None):
+        sent.append({"account_id": account_id, "orders": orders, "group_id": group_id})
         created = []
         for i, order in enumerate(orders):
+            # Entries are marketable IOC limits (the venue has no usable market
+            # type for us — see the adapter docstring), so "limit" is what fills.
+            is_entry = order["type"] == "limit"
             created.append({
                 "orderId": f"oid-{i}",
                 "intentId": order["intentId"],
-                "status": "filled" if order["type"] == "market" else "open",
-                "averageFillPrice": "50010" if order["type"] == "market" else None,
+                "status": "filled" if is_entry else "open",
+                "averageFillPrice": "50010" if is_entry else None,
                 "cumulativeQuantity": order["quantity"],
             })
         return created
@@ -157,16 +160,23 @@ def test_market_order_builds_grouped_bracket(armed_propr):
     )
     assert not result.get("error")
     orders = sent[0]["orders"]
-    assert [o["type"] for o in orders] == ["market", "stop_market", "take_profit_market"]
+    assert [o["type"] for o in orders] == ["limit", "stop_market", "take_profit_market"]
     entry, stop, tp = orders
     assert entry["reduceOnly"] is False
     assert stop["reduceOnly"] is True and tp["reduceOnly"] is True
-    # Protective legs sit on the exit side of a long.
+    # Entry is a marketable IOC limit: priced through the book, bounded slippage.
+    assert entry["timeInForce"] == "IOC" and float(entry["price"]) > 50_000.0
+    assert stop["timeInForce"] == "GTC" and tp["timeInForce"] == "GTC"
+    # Protective legs sit on the exit side of a long...
     assert entry["side"] == "buy" and stop["side"] == "sell" and tp["side"] == "sell"
-    assert entry["positionSide"] == stop["positionSide"] == tp["positionSide"] == "long"
-    # Batched orders share one ULID order group.
-    groups = {o["orderGroupId"] for o in orders}
-    assert len(groups) == 1 and len(groups.pop()) == 26
+    # ...and positionSide tracks the ORDER side, not the position being closed.
+    # The docs show "long" on these legs; the venue answers 13096. Measured
+    # 2026-07-27 against the live paper account.
+    assert entry["positionSide"] == "long"
+    assert stop["positionSide"] == "short" and tp["positionSide"] == "short"
+    # The group ULID rides on the ENVELOPE (13059), never on the orders.
+    assert len(sent[0]["group_id"]) == 26
+    assert all("orderGroupId" not in o for o in orders)
     # Return contract the scanner's _extract_order_meta reads.
     assert result["entry_order_id"] == "oid-0"
     assert result["stop_order_id"] == "oid-1"
@@ -196,11 +206,36 @@ def test_close_position_is_reduce_only(armed_propr):
     assert not result.get("error")
     (order,) = sent[0]["orders"]
     assert order["reduceOnly"] is True
-    assert order["type"] == "market"
-    # Selling to close reduces the LONG side.
-    assert order["side"] == "sell" and order["positionSide"] == "long"
+    assert order["type"] == "limit" and order["timeInForce"] == "IOC"
+    # Selling to close a long carries positionSide "short" — alignment with the
+    # ORDER side is what the venue enforces (13096); reduceOnly is what makes it
+    # a close. Getting this inverted rejected every exit we ever attempted.
+    assert order["side"] == "sell" and order["positionSide"] == "short"
+    assert float(order["price"]) < 50_000.0, "a sell must be priced BELOW the mid to cross"
     assert result["exit_price"] == pytest.approx(50_010.0)
     assert result["order_id"] == "oid-0"
+
+
+def test_close_falls_back_to_a_market_order_when_the_mid_is_unavailable(armed_propr, monkeypatch):
+    """No mid must never block an exit.
+
+    The marketable-IOC-limit construction needs a mid to price against. If the
+    mid feed is down, pricing degrades to None — and a `limit` with no price is
+    rejected by the venue, which would turn a missing quote into a position we
+    cannot close. Bounded slippage is the preference; getting out is the
+    requirement, so the plain venue `market` type takes over.
+    """
+    propr, sent = armed_propr
+    monkeypatch.setattr(propr, "get_all_mids", lambda testnet=True: {})
+
+    result = propr.close_position("BTC", 0.002, "sell")
+
+    assert not result.get("error"), "a missing mid must not block an exit"
+    (order,) = sent[0]["orders"]
+    assert order["type"] == "market"
+    assert "price" not in order, "a market order must not carry a null price"
+    assert order["reduceOnly"] is True
+    assert order["side"] == "sell" and order["positionSide"] == "short"
 
 
 def test_market_order_rejects_vault_routing(armed_propr):

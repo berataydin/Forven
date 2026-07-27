@@ -25,14 +25,29 @@ Venue quirks (from github.com/XBorgLabs/propr-docs):
 * Client order ids are ULIDs (``intentId``); batches need an ``orderGroupId``
   ULID; conditional (stop/TP) orders need an existing ``positionId`` OR must
   ride in the entry's order group.
-  MEASURED 2026-07-27, and it contradicts how this module read that: POST
-  /accounts/{id}/orders takes ONE bare order object, not ``{"orders": [...]}``.
-  The wrapper is rejected at schema validation ("Bad Request Exception") while a
-  bare object reaches order creation (``order_create_failed`` 13051). Orders are
-  therefore submitted one at a time; ``orderGroupId`` is still stamped on every
-  leg so the venue can associate them. Whether that satisfies the "ride in the
-  entry's order group" rule for conditionals is UNVERIFIED — no order has yet
-  been accepted, and 13051 remains undiagnosed.
+  ``orderGroupId`` is TOP-LEVEL on the envelope, not a per-order field.
+* EVERY order needs all 11 required fields — ``accountId``, ``intentId``,
+  ``exchange``, ``type``, ``side``, ``positionSide``, ``productType``, ``asset``,
+  ``base``, ``quote``, ``quantity``. This module sent 6 of them until 2026-07-27,
+  so every order was rejected at schema validation with a bare "Bad Request
+  Exception" naming no field — which is why the mirror never placed an order
+  from PROPR-1 until then.
+* Entries are LIMIT orders priced through the book with ``timeInForce: "IOC"`` —
+  exactly how the Hyperliquid adapter does it. The venue does have a ``market``
+  type, but a marketable IOC limit bounds worst-case slippage explicitly
+  (``_MARKETABLE_SLIPPAGE``) instead of accepting whatever the book gives, which
+  matters on a challenge account where a bad fill is measured against the rules.
+  Conditionals are ``stop_market`` / ``take_profit_market`` (with ``triggerPrice``
+  and ``timeInForce: "GTC"``) — plain ``stop`` / ``take_profit`` are rejected.
+* ``positionSide`` must ALIGN with ``side``: buy->long, sell->short (error 13096
+  ``order_side_must_align_with_position_side_...``). It is NOT the side of the
+  position being closed — a reduce-only SELL closing a LONG still carries
+  ``positionSide: "short"``. ``reduceOnly`` is what makes it a close.
+  THE PUBLISHED DOCS ARE WRONG ON THIS POINT: their "attach SL/TP" and "close a
+  position" examples both show ``side: "sell"`` with ``positionSide: "long"``,
+  which the venue rejects with 13096. Measured against the live API 2026-07-27
+  (all three ``positionSide: "long"`` variants rejected, ``"short"`` accepted) —
+  trust this comment over the docs, and re-measure before "fixing" it back.
 * ``reduceOnly: true`` is MANDATORY on closes — omitting it opens a reverse
   position instead of closing.
 * No market-data endpoints: mids come from Hyperliquid MAINNET (read-only —
@@ -533,62 +548,104 @@ def _poll_order_fill(account_id: str, order_id: str) -> dict | None:
     return None
 
 
-def _create_orders(account_id: str, orders: list[dict]) -> list[dict]:
-    """POST each order as a BARE object; the endpoint takes one order, not a batch.
+#: How far through the book a "market" entry is priced. The venue does have a
+#: ``market`` type, but a marketable IOC limit caps worst-case slippage at a
+#: number we choose instead of whatever the book happens to hold — the same
+#: construction the Hyperliquid adapter uses. On a challenge account the fill
+#: price feeds the drawdown rules, so an unbounded fill is a rule risk.
+_MARKETABLE_SLIPPAGE = 0.03
 
-    PROPR-ORDER-SHAPE (2026-07-27). This sent ``{"orders": [...]}`` from PROPR-1
-    onward and every order the mirror ever placed was rejected. Probing the live
-    API separates the two failures cleanly:
 
-        {"orders": [...]}   -> 400 "Bad Request Exception"   (schema rejected)
-        bare order object   -> 400 order_create_failed 13051 (schema ACCEPTED,
-                                                              creation refused)
+def _marketable_price(asset: str, is_buy: bool, mid: float) -> str:
+    """A limit price far enough through the book that an IOC fills like a market."""
+    factor = (1.0 + _MARKETABLE_SLIPPAGE) if is_buy else (1.0 - _MARKETABLE_SLIPPAGE)
+    return _fmt_decimal(_round_price(float(mid) * factor, asset))
 
-    The bare object reaches order creation; the wrapper never does. The venue's
-    tests stub ``_request``, so the wrong shape was asserted against our own
-    assumption rather than the API — the TEST-5 gap the audit named, arriving
-    exactly as predicted.
 
-    Submitting singly means a bracket is no longer atomic: the entry can succeed
-    and a protective leg fail. That is why the FIRST order is treated as the
-    entry and re-raises, while a later failure returns what was created — the
-    caller reports the gap through ``protective_leg_failed`` (and the mirror
-    re-arms or closes on it), which is strictly better than losing a filled entry
-    because its stop was refused.
+def _build_order(
+    account_id: str, asset: str, *, side: str, quantity: str, intent_id: str,
+    order_type: str = "limit", price: str | None = None,
+    trigger_price: str | None = None, reduce_only: bool = False,
+    time_in_force: str | None = "IOC", position_id: str | None = None,
+) -> dict:
+    """One Propr order with EVERY required field the API demands.
 
-    NOTE: 13051 is still unresolved, so this does not yet make the mirror work.
-    It moves the failure from "we send a shape the API will not parse" to "the
-    API parses it and declines", which is the honest state and the one worth
-    asking the venue about.
+    PROPR-ORDER-SCHEMA (2026-07-27). Orders were being sent with 6 of the 11
+    required fields — ``accountId``, ``exchange``, ``productType``, ``base`` and
+    ``quote`` were all missing — so every one was rejected at schema validation
+    with a bare "Bad Request Exception" that named no field. That is why the
+    mirror has never placed an order since PROPR-1.
+
+    ``positionSide`` ALWAYS follows ``side`` (buy->long, sell->short). The venue
+    enforces it (error 13096
+    ``order_side_must_align_with_position_side_buy_long_or_sell_short``) and it
+    is NOT the side of the position being closed — a reduce-only SELL that
+    closes a LONG still carries ``positionSide: "short"``. ``close_position``
+    had this inverted, which would have rejected every exit.
     """
-    created: list[dict] = []
-    for index, order in enumerate(orders):
-        try:
-            payload = _request(
-                "POST", f"/accounts/{account_id}/orders",
-                breaker=propr_trade_breaker, body=order,
-            )
-        except ProprApiError:
-            # Propr answers a rejection with {"message": ..., "code": N} and no
-            # field-level detail, so log exactly what we SENT — the only half of
-            # the exchange we control, and what turns "rejected, cause unknown"
-            # into a body you can diff against the venue's schema. Order
-            # parameters only; auth rides in the headers.
-            log.error(
-                "Propr REJECTED this order (%d/%d):\n%s",
-                index + 1, len(orders), json.dumps(order, indent=2, default=str)[:1200],
-            )
-            if index == 0:
-                raise  # entry failed — nothing was opened, surface it
-            log.error(
-                "Propr accepted the entry but REJECTED leg %d/%d (%s) — the position "
-                "is open without it; caller must re-arm or close:\n%s",
-                index + 1, len(orders), order.get("type"),
-                json.dumps(order, indent=2, default=str)[:800],
-            )
-            break
-        created.extend(_rows(payload))
-    return created
+    order = {
+        "accountId": account_id,
+        "intentId": intent_id,
+        "exchange": "hyperliquid",
+        "type": order_type,
+        "side": side,
+        "positionSide": "long" if side == "buy" else "short",
+        "productType": "perp",
+        "asset": asset,
+        "base": asset,
+        "quote": "USDC",
+        "quantity": quantity,
+        "reduceOnly": bool(reduce_only),
+    }
+    if price is not None:
+        order["price"] = price
+    if trigger_price is not None:
+        order["triggerPrice"] = trigger_price
+    if time_in_force:
+        order["timeInForce"] = time_in_force
+    # A conditional that is NOT riding in an entry's order group must name the
+    # position it protects (13056 CONDITIONAL_ORDER_REQUIRES_POSITION_OR_GROUP).
+    if position_id:
+        order["positionId"] = position_id
+    return order
+
+
+def _create_orders(account_id: str, orders: list[dict],
+                   group_id: str | None = None) -> list[dict]:
+    """POST the batch. ``orderGroupId`` is TOP-LEVEL, not per-order.
+
+    PROPR-ORDER-SHAPE (2026-07-27). Two things were wrong here and the venue's
+    generic "Bad Request Exception" named neither:
+
+      * orders were missing 5 of 11 required fields (see ``_build_order``), and
+      * ``orderGroupId`` was stamped on each order instead of the envelope.
+
+    An earlier pass at this inferred from error strings that the endpoint took a
+    single bare order — a bare object DOES get further (it reaches order
+    creation and fails 13051) which read like progress. It was not: the docs at
+    github.com/XBorgLabs/propr-docs specify the batch envelope, and a complete
+    order inside it is ACCEPTED. Verified live: first fill on this account,
+    0.001 BTC @ 65250. Reading the spec would have been faster than four rounds
+    of probing the API.
+    """
+    body: dict = {"orders": orders}
+    if group_id:
+        body["orderGroupId"] = group_id
+    try:
+        payload = _request(
+            "POST", f"/accounts/{account_id}/orders",
+            breaker=propr_trade_breaker, body=body,
+        )
+    except ProprApiError:
+        # The venue returns {"message": ..., "code": N} with no field-level
+        # detail, so log exactly what we SENT — the only half of the exchange we
+        # control. Order parameters only; auth rides in the headers.
+        log.error(
+            "Propr REJECTED this order body (%d order(s)):\n%s",
+            len(orders), json.dumps(body, indent=2, default=str)[:1500],
+        )
+        raise
+    return _rows(payload)
 
 
 def _match_created(created: list[dict], intent_ids: dict[str, str],
@@ -638,7 +695,7 @@ def market_order(
 
     asset_n = normalize_asset(asset)
     is_buy = str(side).upper() in ("B", "BUY", "LONG")
-    position_side = "long" if is_buy else "short"
+    # positionSide is derived inside _build_order (it must ALWAYS follow side).
 
     size = _quantize_size(asset_n, size)
     if size <= 0:
@@ -672,54 +729,44 @@ def market_order(
     key_root = idempotency_key or new_ulid()
     intent_ids = {"entry": deterministic_ulid(f"{key_root}:entry")}
     quantity = _fmt_decimal(size)
+    entry_side = "buy" if is_buy else "sell"
 
-    entry = {
-        "intentId": intent_ids["entry"],
-        "asset": asset_n,
-        "type": "market",
-        "side": "buy" if is_buy else "sell",
-        "positionSide": position_side,
-        "quantity": quantity,
-        "reduceOnly": False,
-    }
+    entry = _build_order(
+        account_id, asset_n, side=entry_side, quantity=quantity,
+        intent_id=intent_ids["entry"],
+        # No market type on this venue — a marketable IOC limit IS the market order.
+        price=_marketable_price(asset_n, is_buy, mid), time_in_force="IOC",
+    )
     orders = [entry]
     order_labels = ["entry"]
 
     if stop_loss_price:
         intent_ids["stop"] = deterministic_ulid(f"{key_root}:stop")
-        orders.append({
-            "intentId": intent_ids["stop"],
-            "asset": asset_n,
-            "type": "stop_market",
-            "side": "sell" if is_buy else "buy",
-            "positionSide": position_side,
-            "quantity": quantity,
-            "triggerPrice": _fmt_decimal(_round_price(float(stop_loss_price), asset_n)),
-            "reduceOnly": True,
-        })
+        orders.append(_build_order(
+            account_id, asset_n,
+            side="sell" if is_buy else "buy", quantity=quantity,
+            intent_id=intent_ids["stop"], order_type="stop_market",
+            trigger_price=_fmt_decimal(_round_price(float(stop_loss_price), asset_n)),
+            reduce_only=True, time_in_force="GTC",
+        ))
         order_labels.append("stop")
 
     if take_profit_price:
         intent_ids["take_profit"] = deterministic_ulid(f"{key_root}:tp")
-        orders.append({
-            "intentId": intent_ids["take_profit"],
-            "asset": asset_n,
-            "type": "take_profit_market",
-            "side": "sell" if is_buy else "buy",
-            "positionSide": position_side,
-            "quantity": quantity,
-            "triggerPrice": _fmt_decimal(_round_price(float(take_profit_price), asset_n)),
-            "reduceOnly": True,
-        })
+        orders.append(_build_order(
+            account_id, asset_n,
+            side="sell" if is_buy else "buy", quantity=quantity,
+            intent_id=intent_ids["take_profit"], order_type="take_profit_market",
+            trigger_price=_fmt_decimal(_round_price(float(take_profit_price), asset_n)),
+            reduce_only=True, time_in_force="GTC",
+        ))
         order_labels.append("take_profit")
 
-    if len(orders) > 1:
-        group_id = deterministic_ulid(f"{key_root}:group")
-        for order in orders:
-            order["orderGroupId"] = group_id
+    # TOP-LEVEL, not per-order — and required whenever there is more than one.
+    group_id = deterministic_ulid(f"{key_root}:group") if len(orders) > 1 else None
 
     try:
-        created = _create_orders(account_id, orders)
+        created = _create_orders(account_id, orders, group_id)
     except ProprApiError as exc:
         return {"error": f"Propr order rejected: {exc}"}
 
@@ -812,17 +859,15 @@ def limit_order(
     account_id, _ = resolve_account()
     key_root = idempotency_key or new_ulid()
     tif_map = {"gtc": "GTC", "ioc": "IOC", "fok": "FOK", "alo": "GTX", "gtx": "GTX"}
-    order = {
-        "intentId": deterministic_ulid(f"{key_root}:entry"),
-        "asset": asset_n,
-        "type": "limit",
-        "side": "buy" if is_buy else "sell",
-        "positionSide": "long" if is_buy else "short",
-        "quantity": _fmt_decimal(size),
-        "price": _fmt_decimal(_round_price(float(price), asset_n)),
-        "timeInForce": tif_map.get(str(tif).strip().lower(), "GTC"),
-        "reduceOnly": False,
-    }
+    order = _build_order(
+        account_id, asset_n,
+        side="buy" if is_buy else "sell",
+        quantity=_fmt_decimal(size),
+        intent_id=deterministic_ulid(f"{key_root}:entry"),
+        order_type="limit",
+        price=_fmt_decimal(_round_price(float(price), asset_n)),
+        time_in_force=tif_map.get(str(tif).strip().lower(), "GTC"),
+    )
     try:
         created = _create_orders(account_id, [order])
     except ProprApiError as exc:
@@ -996,17 +1041,20 @@ def _place_conditional(
     if size <= 0:
         return {"error": f"protective size for {asset_n} rounds below the lot size"}
     account_id, _ = resolve_account()
-    order = {
-        "intentId": new_ulid(),
-        "asset": asset_n,
-        "type": order_type,
-        "side": "sell" if is_long else "buy",
-        "positionSide": "long" if is_long else "short",
-        "positionId": _position_id(position),
-        "quantity": _fmt_decimal(size),
-        "triggerPrice": _fmt_decimal(_round_price(float(trigger_price), asset_n)),
-        "reduceOnly": True,
-    }
+    # positionSide follows the ORDER side, not the position's — protecting a LONG
+    # means a SELL, which the venue requires to carry "short" (13096). Building it
+    # by hand here is what got that inverted; _build_order is the single source.
+    order = _build_order(
+        account_id, asset_n,
+        side="sell" if is_long else "buy",
+        quantity=_fmt_decimal(size),
+        intent_id=new_ulid(),
+        order_type=order_type,
+        trigger_price=_fmt_decimal(_round_price(float(trigger_price), asset_n)),
+        reduce_only=True,
+        time_in_force="GTC",
+        position_id=_position_id(position),
+    )
     try:
         created = _create_orders(account_id, [order])
     except ProprApiError as exc:
@@ -1054,8 +1102,14 @@ def close_position(
     _assert_propr_execution_allowed()
     asset_n = normalize_asset(asset)
     is_buy = str(side).strip().lower() in ("b", "buy")
-    # Closing with a BUY reduces a SHORT; closing with a SELL reduces a LONG.
-    position_side = "short" if is_buy else "long"
+    # Closing with a BUY reduces a SHORT; closing with a SELL reduces a LONG —
+    # but positionSide is NOT the side of the position being reduced. The venue
+    # requires it to align with the ORDER side (buy->long, sell->short) and
+    # rejects anything else with 13096
+    # order_side_must_align_with_position_side_buy_long_or_sell_short. This was
+    # inverted here, so every exit would have been refused; _build_order now
+    # derives it so the two cannot disagree. ``reduceOnly`` is what makes it a
+    # close rather than a reverse.
 
     raw_size = float(size)
     size = _quantize_size(asset_n, raw_size)
@@ -1068,19 +1122,21 @@ def close_position(
         else:
             return {"error": f"close size for {asset_n} is non-positive"}
 
-    # Reference mark only — a Propr close is a venue MARKET order with no
-    # client-side price cap, so an unavailable mid never blocks this exit.
+    # A marketable IOC limit bounds the exit's slippage, but it NEEDS a mid to
+    # price against. With no mid, fall back to the venue's plain market type
+    # rather than sending a limit with no price (which the venue rejects): an
+    # unavailable mid must never block an exit. Bounded fill is the preference;
+    # getting out is the requirement.
     mid = float(get_all_mids().get(asset_n, 0) or 0)
     account_id, _ = resolve_account()
-    order = {
-        "intentId": new_ulid(),
-        "asset": asset_n,
-        "type": "market",
-        "side": "buy" if is_buy else "sell",
-        "positionSide": position_side,
-        "quantity": _fmt_decimal(size),
-        "reduceOnly": True,
-    }
+    order = _build_order(
+        account_id, asset_n,
+        side="buy" if is_buy else "sell", quantity=_fmt_decimal(size),
+        intent_id=new_ulid(),
+        order_type="limit" if mid else "market",
+        price=_marketable_price(asset_n, is_buy, mid) if mid else None,
+        time_in_force="IOC", reduce_only=True,
+    )
     try:
         created = _create_orders(account_id, [order])
     except ProprApiError as exc:

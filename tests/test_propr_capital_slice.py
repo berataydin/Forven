@@ -88,19 +88,20 @@ def test_empty_roster_floors_at_one(forven_db, monkeypatch):
 # PROPR-ORDER-SHAPE — the request body, pinned against the LIVE API's behaviour
 # ---------------------------------------------------------------------------
 
-def test_orders_are_submitted_one_bare_object_at_a_time(forven_db, monkeypatch):
-    """POST /accounts/{id}/orders takes ONE order, not {"orders": [...]}.
+def test_orders_are_submitted_as_one_batch_with_a_top_level_group_id(forven_db, monkeypatch):
+    """POST /accounts/{id}/orders takes {"orders": [...]}, group id TOP-LEVEL.
 
-    Measured against the live API on 2026-07-27:
+    Verified against the live API on 2026-07-27 by actually placing orders on the
+    paper challenge account: a full bracket (entry + stop_market + take_profit_market)
+    was ACCEPTED in one batch — entry filled at 65342, both conditionals resting.
 
-        {"orders": [...]}  -> 400 "Bad Request Exception"    (schema rejected)
-        bare order object  -> 400 order_create_failed 13051  (schema ACCEPTED)
-
-    The wrapper never reaches order creation, which is why every mirror attempt
-    since PROPR-1 was rejected. This test exists because the rest of this suite
-    stubs `_request` and therefore asserted our own assumption about the shape
-    rather than the venue's — the TEST-5 gap the 2026-07-25 audit named, which
-    then cost exactly what it predicted.
+    An earlier revision of this test asserted the exact opposite ("each order must
+    be POSTed separately"), citing a live measurement. That measurement was real
+    but the conclusion drawn from it was wrong: the batch wrapper was failing
+    schema validation because 5 of the 11 required per-order fields were missing,
+    and a bare object happened to get one error further. Fixing the shape instead
+    of the fields kept it broken. The lesson worth keeping is that a probe tells
+    you which body was rejected, not why — the spec did, in one read.
     """
     import forven.exchange.propr as pr
 
@@ -108,22 +109,68 @@ def test_orders_are_submitted_one_bare_object_at_a_time(forven_db, monkeypatch):
 
     def _capture(method, path, **kw):
         sent.append({"method": method, "path": path, "body": kw.get("body")})
-        return {"orderId": f"o{len(sent)}", "status": "open"}
+        return {"data": [{"orderId": f"o{i}", "intentId": o["intentId"], "status": "open"}
+                         for i, o in enumerate(kw.get("body", {}).get("orders", []))]}
 
     monkeypatch.setattr(pr, "_request", _capture)
     orders = [
-        {"intentId": "A", "asset": "BTC", "type": "market", "side": "buy"},
+        {"intentId": "A", "asset": "BTC", "type": "limit", "side": "buy"},
         {"intentId": "B", "asset": "BTC", "type": "stop_market", "side": "sell"},
     ]
-    pr._create_orders("urn:prp-account:X", orders)
+    pr._create_orders("urn:prp-account:X", orders, "GROUPULID")
 
-    assert len(sent) == 2, "each order must be POSTed separately, not batched"
-    for call in sent:
-        body = call["body"]
-        assert "orders" not in body, (
-            "the batch wrapper is back — the venue rejects it at schema validation"
-        )
-        assert body.get("intentId"), "the bare order object must be the body itself"
+    assert len(sent) == 1, "a bracket must go up as ONE batch, not order-by-order"
+    body = sent[0]["body"]
+    assert [o["intentId"] for o in body["orders"]] == ["A", "B"]
+    # 13059 ORDER_VALIDATION_GROUP_ID_REQUIRED when orders.length > 1, and it is
+    # an envelope field — as a per-order key it is silently ignored and the batch
+    # is rejected for the missing group.
+    assert body["orderGroupId"] == "GROUPULID"
+    assert all("orderGroupId" not in o for o in body["orders"])
+
+
+def test_conditional_legs_use_the_market_trigger_type_names(forven_db, monkeypatch):
+    """`stop_market` / `take_profit_market` — NOT `stop` / `take_profit`.
+
+    The short names are rejected with a bare "Bad Request Exception" naming no
+    field, which is indistinguishable from the missing-required-field rejection
+    that preceded it. Measured live 2026-07-27: with `stop` the whole bracket was
+    refused; with `stop_market` the identical body was accepted and the trigger
+    rested at 63381.
+    """
+    import forven.exchange.propr as pr
+
+    captured: list[dict] = []
+    monkeypatch.setattr(pr, "get_all_mids", lambda testnet=True: {"BTC": 50_000.0})
+    monkeypatch.setattr(pr, "_quantize_size", lambda asset, size: float(size))
+    monkeypatch.setattr(pr, "_round_price", lambda price, asset: float(price))
+    monkeypatch.setattr(pr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.setenv("FORVEN_ALLOW_PROPR_LIVE", "1")
+    import forven.exchange.liquidity as liquidity
+    monkeypatch.setattr(liquidity, "check_order_liquidity", lambda *a, **k: (True, None))
+
+    def _fake(account_id, orders, group_id=None):
+        captured.extend(orders)
+        return [{"orderId": f"o{i}", "intentId": o["intentId"],
+                 "status": "filled" if o["type"] == "limit" else "open",
+                 "averageFillPrice": "50010" if o["type"] == "limit" else None,
+                 "cumulativeQuantity": o["quantity"]} for i, o in enumerate(orders)]
+
+    monkeypatch.setattr(pr, "_create_orders", _fake)
+    pr.market_order("BTC", "buy", 0.01, stop_loss_price=48_000, take_profit_price=55_000)
+
+    by_type = {o["type"]: o for o in captured}
+    assert set(by_type) == {"limit", "stop_market", "take_profit_market"}
+    for name in ("stop_market", "take_profit_market"):
+        leg = by_type[name]
+        assert leg["reduceOnly"] is True
+        assert leg["triggerPrice"], f"{name} needs a triggerPrice"
+        assert leg["timeInForce"] == "GTC", "conditionals rest; IOC would kill them instantly"
+        # positionSide aligns with the ORDER side (buy->long, sell->short), even
+        # though the leg protects a long. The published docs show `long` here;
+        # the venue answers 13096. See the module docstring.
+        assert (leg["side"], leg["positionSide"]) == ("sell", "short")
 
 
 def test_entry_failure_raises_but_a_leg_failure_keeps_the_entry(forven_db, monkeypatch):
