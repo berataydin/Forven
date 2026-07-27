@@ -20,6 +20,12 @@ Semantics:
   Entries are skipped (recorded, not retried) when they pre-date the strategy
   joining the roster, are older than the freshness window (a stale entry is a
   different trade than the strategy took), or price already crossed the stop.
+  RETRY-1 is the one exception to "failed is terminal": a terminally failed
+  open re-arms (attempts reset, cooldown-bounded) while its source trade is
+  still OPEN and the last scan still shows the strategy emitting the
+  same-direction entry signal — the strategy is still asking for that exact
+  trade, so lateness alone does not disqualify it, and the signal gate
+  REPLACES the freshness window for these.
 * CLOSE mirror — the source trade leaves OPEN => reduce-only close of the
   mirrored quantity + best-effort cancel of the resting bracket legs.
 * Idempotency — entry intentIds derive deterministically from the source
@@ -101,6 +107,14 @@ MAX_OPENS_PER_TICK = 3
 MAX_OPEN_ATTEMPTS = 3
 MAX_CLOSE_ATTEMPTS = 10
 _STATE_RETENTION_DAYS = 7
+
+# RETRY-1: how fresh the scanner's signal snapshot must be to prove the entry
+# signal is still active (fail closed on a stale snapshot), and how long a
+# re-armed entry that fails terminally AGAIN must wait before the next round —
+# so a venue that keeps rejecting sees one bounded round per cooldown, not one
+# order per tick for as long as a 4h signal stays lit.
+RETRY_SIGNAL_MAX_SCAN_AGE_MINUTES = 15
+RETRY_REARM_COOLDOWN_MINUTES = 10
 
 # PROPR-CLOSE-1: how much of a reduce-only close may go unfilled and still count
 # as complete. The adapter quantizes the close size DOWN to the venue's step, so
@@ -445,6 +459,47 @@ def _trade_roster_key(row: dict, roster_ids: set[str]) -> str | None:
         if value and value in roster_ids:
             return value
     return None
+
+
+def _entry_signal_snapshot(now: datetime) -> dict | None:
+    """The last scan's per-strategy signal snapshot, or None when it is missing
+    or too stale to prove anything (fail closed — a RETRY-1 re-arm needs a
+    CURRENT signal, not a memory of one)."""
+    try:
+        scanner_state = kv_get("scanner_state", {}) or {}
+    except Exception:
+        return None
+    if not isinstance(scanner_state, dict):
+        return None
+    signals = scanner_state.get("signals")
+    if not isinstance(signals, dict):
+        return None
+    last_scan = _parse_when(scanner_state.get("last_scan"))
+    if last_scan is None or (now - last_scan) > timedelta(
+        minutes=RETRY_SIGNAL_MAX_SCAN_AGE_MINUTES
+    ):
+        return None
+    return signals
+
+
+def _entry_signal_active(row: dict, signals: dict | None) -> bool:
+    """True when the snapshot shows this trade's strategy STILL emitting the
+    same-direction entry signal. Strategies that publish directional_signals
+    gate on the per-direction entry flag (the scalar entry_signal can be
+    false while the other direction fires)."""
+    if not isinstance(signals, dict):
+        return False
+    sid = str(row.get("strategy_id") or row.get("strategy") or "").strip()
+    sig = signals.get(sid)
+    if not isinstance(sig, dict):
+        return False
+    direction = str(row.get("direction") or "").strip().lower()
+    directional = sig.get("directional_signals")
+    if isinstance(directional, dict) and f"{direction}_entry" in directional:
+        return bool(directional.get(f"{direction}_entry"))
+    return bool(sig.get("entry_signal")) and (
+        str(sig.get("direction") or "").strip().lower() == direction
+    )
 
 
 def mirror_equity_slice(equity: float) -> tuple[float, dict]:
@@ -917,11 +972,49 @@ def mirror_tick() -> dict:
         _save_state(state)
         return {**summary, "error": f"trades query failed: {exc}"}
 
+    # RETRY-1: the signal snapshot is only needed when some entry is (or was)
+    # in the signal-gated retry path — don't read it on every quiet tick.
+    _retry_candidates = any(
+        isinstance(e, dict) and (e.get("status") == "failed" or e.get("retry_signal_gated"))
+        for e in state.values()
+    )
+    signal_snapshot = _entry_signal_snapshot(now) if _retry_candidates else None
+
     to_open = []
     for row in open_rows:
         trade_id = str(row["id"])
         existing = state.get(trade_id)
+        signal_gated = bool(existing and existing.get("retry_signal_gated"))
         if existing and existing.get("status") not in ("pending", "error"):
+            if existing.get("status") != "failed":
+                continue
+            # RETRY-1 re-arm: the open failed terminally, but the source trade
+            # is still OPEN and the strategy is still emitting this entry —
+            # it is still asking for this exact trade, so retry a full round.
+            rearmed_at = _parse_when(existing.get("retry_rearmed_at"))
+            if rearmed_at and (now - rearmed_at) < timedelta(
+                minutes=RETRY_REARM_COOLDOWN_MINUTES
+            ):
+                continue
+            if not _entry_signal_active(row, signal_snapshot):
+                continue
+            existing.update({
+                "status": "pending",
+                "attempts": 0,
+                "retry_signal_gated": True,
+                "retry_rearmed_at": now.isoformat(),
+                "reason": "re-armed after terminal failure: entry signal still active",
+            })
+            summary["rearmed"] = summary.get("rearmed", 0) + 1
+            signal_gated = True
+        elif signal_gated and not _entry_signal_active(row, signal_snapshot):
+            # Mid-round: the signal that justified the late retry is gone —
+            # entering NOW would be a trade the strategy is no longer asking
+            # for. Stop chasing.
+            existing.update({
+                "status": "failed",
+                "reason": "retry abandoned: entry signal no longer active",
+            })
             continue
         sid = _trade_roster_key(row, roster_ids)
         added_at = _parse_when(roster.get(sid or ""))
@@ -931,7 +1024,10 @@ def mirror_tick() -> dict:
                                "asset": row.get("asset"), "strategy": sid}
             summary["skipped"] += 1
             continue
-        if opened_at and (now - opened_at) > timedelta(minutes=OPEN_FRESHNESS_MINUTES):
+        # A signal-gated retry is exempt from the freshness window: the ACTIVE
+        # entry signal (checked above, every tick) is the stronger form of the
+        # same "is this still the trade the strategy took?" question.
+        if not signal_gated and opened_at and (now - opened_at) > timedelta(minutes=OPEN_FRESHNESS_MINUTES):
             state[trade_id] = {"status": "skipped", "reason": "entry older than the freshness window",
                                "asset": row.get("asset"), "strategy": sid}
             summary["skipped"] += 1

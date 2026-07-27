@@ -457,6 +457,129 @@ def test_mirror_closes_when_source_closes(mirror_env):
     assert pm.get_state()["T-m2"]["status"] == "closed"
 
 
+# ---------------------------------------------------------------------------
+# RETRY-1: signal-gated re-arm of terminally failed opens
+# ---------------------------------------------------------------------------
+
+def _set_scanner_signals(sid: str, *, entry: bool = True, direction: str = "long",
+                         scan_age_minutes: float = 0.0,
+                         directional: dict | None = None) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from forven.db import kv_set
+
+    sig: dict = {"entry_signal": entry, "direction": direction}
+    if directional is not None:
+        sig["directional_signals"] = directional
+    kv_set("scanner_state", {
+        "last_scan": (datetime.now(timezone.utc)
+                      - timedelta(minutes=scan_age_minutes)).isoformat(),
+        "signals": {sid: sig},
+    })
+
+
+def _seed_failed_open(pm, trade_id: str, **extra) -> None:
+    state = pm.get_state()
+    state[trade_id] = {"status": "failed", "attempts": 3, "strategy": "S-M1",
+                       "asset": "BTC", "direction": "long",
+                       "reason": "Propr order rejected: Bad Request Exception", **extra}
+    pm._save_state(state)
+
+
+def test_terminal_failure_rearms_while_entry_signal_active(mirror_env):
+    """RETRY-1: a terminally failed open retries while the strategy still emits
+    the same-direction entry signal — even past the freshness window, which the
+    signal gate replaces."""
+    from datetime import datetime, timedelta, timezone
+
+    pm, calls = mirror_env
+    stale_open = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _insert_trade("T-r1", "S-M1", opened_at=stale_open)
+    _seed_failed_open(pm, "T-r1")
+    _set_scanner_signals("S-M1", entry=True, direction="long")
+
+    summary = pm.mirror_tick()
+    assert summary["opened"] == 1
+    assert summary.get("rearmed") == 1
+    assert len(calls["orders"]) == 1
+    assert calls["orders"][0]["idempotency_key"] == "propr-mirror:T-r1"
+    entry = pm.get_state()["T-r1"]
+    assert entry["status"] == "open"
+    assert entry["retry_signal_gated"] is True
+
+
+def test_no_rearm_when_signal_inactive_mismatched_or_stale(mirror_env):
+    """No active same-direction signal on a FRESH scan => the failure stays
+    terminal, reason untouched."""
+    pm, calls = mirror_env
+    _insert_trade("T-r2", "S-M1")
+    for kwargs in (
+        {"entry": False, "direction": "long"},                          # signal off
+        {"entry": True, "direction": "short"},                          # wrong direction
+        {"entry": True, "direction": "long", "scan_age_minutes": 60.0},  # stale scan
+    ):
+        _seed_failed_open(pm, "T-r2")
+        _set_scanner_signals("S-M1", **kwargs)
+        summary = pm.mirror_tick()
+        assert summary["opened"] == 0, kwargs
+        assert not calls["orders"], kwargs
+        entry = pm.get_state()["T-r2"]
+        assert entry["status"] == "failed", kwargs
+        assert entry["reason"] == "Propr order rejected: Bad Request Exception", kwargs
+
+
+def test_rearm_respects_cooldown(mirror_env):
+    """A round that already re-armed and failed again waits out the cooldown
+    before the next round."""
+    from datetime import datetime, timedelta, timezone
+
+    pm, calls = mirror_env
+    _insert_trade("T-r3", "S-M1")
+    _set_scanner_signals("S-M1", entry=True, direction="long")
+
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    _seed_failed_open(pm, "T-r3", retry_rearmed_at=recent)
+    assert pm.mirror_tick()["opened"] == 0
+    assert not calls["orders"]
+
+    lapsed = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    _seed_failed_open(pm, "T-r3", retry_rearmed_at=lapsed)
+    assert pm.mirror_tick()["opened"] == 1
+    assert len(calls["orders"]) == 1
+
+
+def test_gated_retry_abandons_when_signal_drops_midround(mirror_env):
+    """A re-armed round in flight re-checks the gate every tick; the signal
+    dropping means the strategy no longer asks for this trade — stop chasing."""
+    pm, calls = mirror_env
+    _insert_trade("T-r4", "S-M1")
+    state = pm.get_state()
+    state["T-r4"] = {"status": "error", "attempts": 1, "strategy": "S-M1",
+                     "asset": "BTC", "direction": "long", "retry_signal_gated": True,
+                     "reason": "Propr order rejected: Bad Request Exception"}
+    pm._save_state(state)
+    _set_scanner_signals("S-M1", entry=False, direction="long")
+
+    summary = pm.mirror_tick()
+    assert summary["opened"] == 0
+    assert not calls["orders"]
+    entry = pm.get_state()["T-r4"]
+    assert entry["status"] == "failed"
+    assert "abandoned" in entry["reason"]
+
+
+def test_directional_signals_gate_the_rearm(mirror_env):
+    """Strategies that publish directional_signals gate on the per-direction
+    entry flag — the scalar entry_signal can be false while long_entry fires."""
+    pm, calls = mirror_env
+    _insert_trade("T-r5", "S-M1")
+    _seed_failed_open(pm, "T-r5")
+    _set_scanner_signals("S-M1", entry=False, direction="short",
+                         directional={"long_entry": True, "short_entry": False})
+    assert pm.mirror_tick()["opened"] == 1
+    assert len(calls["orders"]) == 1
+
+
 def test_challenge_rules_parse_the_real_payload_shape():
     from forven.propr_mirror import _challenge_rules
 
