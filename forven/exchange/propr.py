@@ -25,6 +25,14 @@ Venue quirks (from github.com/XBorgLabs/propr-docs):
 * Client order ids are ULIDs (``intentId``); batches need an ``orderGroupId``
   ULID; conditional (stop/TP) orders need an existing ``positionId`` OR must
   ride in the entry's order group.
+  MEASURED 2026-07-27, and it contradicts how this module read that: POST
+  /accounts/{id}/orders takes ONE bare order object, not ``{"orders": [...]}``.
+  The wrapper is rejected at schema validation ("Bad Request Exception") while a
+  bare object reaches order creation (``order_create_failed`` 13051). Orders are
+  therefore submitted one at a time; ``orderGroupId`` is still stamped on every
+  leg so the venue can associate them. Whether that satisfies the "ride in the
+  entry's order group" rule for conditionals is UNVERIFIED — no order has yet
+  been accepted, and 13051 remains undiagnosed.
 * ``reduceOnly: true`` is MANDATORY on closes — omitting it opens a reverse
   position instead of closing.
 * No market-data endpoints: mids come from Hyperliquid MAINNET (read-only —
@@ -526,29 +534,61 @@ def _poll_order_fill(account_id: str, order_id: str) -> dict | None:
 
 
 def _create_orders(account_id: str, orders: list[dict]) -> list[dict]:
-    body: dict = {"orders": orders}
-    try:
-        payload = _request(
-            "POST", f"/accounts/{account_id}/orders",
-            breaker=propr_trade_breaker, body=body,
-        )
-    except ProprApiError:
-        # Propr answers a rejected order with a bare {"message": "Bad Request
-        # Exception"} and no validation detail, so the reason is unrecoverable
-        # from the response alone. Two mirror attempts (E0252 2026-07-24, E0270
-        # 2026-07-26) died here with nothing to go on but that string.
-        #
-        # Log exactly what we SENT. It is the only half of the exchange we
-        # control, and it turns "rejected, cause unknown" into a body you can
-        # diff against the venue's schema in one pass. Order parameters only —
-        # no credentials are in this payload (auth rides in the headers).
-        log.error(
-            "Propr REJECTED this order body (%d order(s)) — compare against the "
-            "venue schema; the response carries no validation detail:\n%s",
-            len(orders), json.dumps(body, indent=2, default=str)[:2000],
-        )
-        raise
-    return _rows(payload)
+    """POST each order as a BARE object; the endpoint takes one order, not a batch.
+
+    PROPR-ORDER-SHAPE (2026-07-27). This sent ``{"orders": [...]}`` from PROPR-1
+    onward and every order the mirror ever placed was rejected. Probing the live
+    API separates the two failures cleanly:
+
+        {"orders": [...]}   -> 400 "Bad Request Exception"   (schema rejected)
+        bare order object   -> 400 order_create_failed 13051 (schema ACCEPTED,
+                                                              creation refused)
+
+    The bare object reaches order creation; the wrapper never does. The venue's
+    tests stub ``_request``, so the wrong shape was asserted against our own
+    assumption rather than the API — the TEST-5 gap the audit named, arriving
+    exactly as predicted.
+
+    Submitting singly means a bracket is no longer atomic: the entry can succeed
+    and a protective leg fail. That is why the FIRST order is treated as the
+    entry and re-raises, while a later failure returns what was created — the
+    caller reports the gap through ``protective_leg_failed`` (and the mirror
+    re-arms or closes on it), which is strictly better than losing a filled entry
+    because its stop was refused.
+
+    NOTE: 13051 is still unresolved, so this does not yet make the mirror work.
+    It moves the failure from "we send a shape the API will not parse" to "the
+    API parses it and declines", which is the honest state and the one worth
+    asking the venue about.
+    """
+    created: list[dict] = []
+    for index, order in enumerate(orders):
+        try:
+            payload = _request(
+                "POST", f"/accounts/{account_id}/orders",
+                breaker=propr_trade_breaker, body=order,
+            )
+        except ProprApiError:
+            # Propr answers a rejection with {"message": ..., "code": N} and no
+            # field-level detail, so log exactly what we SENT — the only half of
+            # the exchange we control, and what turns "rejected, cause unknown"
+            # into a body you can diff against the venue's schema. Order
+            # parameters only; auth rides in the headers.
+            log.error(
+                "Propr REJECTED this order (%d/%d):\n%s",
+                index + 1, len(orders), json.dumps(order, indent=2, default=str)[:1200],
+            )
+            if index == 0:
+                raise  # entry failed — nothing was opened, surface it
+            log.error(
+                "Propr accepted the entry but REJECTED leg %d/%d (%s) — the position "
+                "is open without it; caller must re-arm or close:\n%s",
+                index + 1, len(orders), order.get("type"),
+                json.dumps(order, indent=2, default=str)[:800],
+            )
+            break
+        created.extend(_rows(payload))
+    return created
 
 
 def _match_created(created: list[dict], intent_ids: dict[str, str],

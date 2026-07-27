@@ -82,3 +82,78 @@ def test_empty_roster_floors_at_one(forven_db, monkeypatch):
     monkeypatch.setattr(pm, "mirror_roster", lambda: {})
     got, meta = pm.mirror_equity_slice(5000.0)
     assert got == 5000.0 and meta["roster_size"] == 1
+
+
+# ---------------------------------------------------------------------------
+# PROPR-ORDER-SHAPE — the request body, pinned against the LIVE API's behaviour
+# ---------------------------------------------------------------------------
+
+def test_orders_are_submitted_one_bare_object_at_a_time(forven_db, monkeypatch):
+    """POST /accounts/{id}/orders takes ONE order, not {"orders": [...]}.
+
+    Measured against the live API on 2026-07-27:
+
+        {"orders": [...]}  -> 400 "Bad Request Exception"    (schema rejected)
+        bare order object  -> 400 order_create_failed 13051  (schema ACCEPTED)
+
+    The wrapper never reaches order creation, which is why every mirror attempt
+    since PROPR-1 was rejected. This test exists because the rest of this suite
+    stubs `_request` and therefore asserted our own assumption about the shape
+    rather than the venue's — the TEST-5 gap the 2026-07-25 audit named, which
+    then cost exactly what it predicted.
+    """
+    import forven.exchange.propr as pr
+
+    sent: list[dict] = []
+
+    def _capture(method, path, **kw):
+        sent.append({"method": method, "path": path, "body": kw.get("body")})
+        return {"orderId": f"o{len(sent)}", "status": "open"}
+
+    monkeypatch.setattr(pr, "_request", _capture)
+    orders = [
+        {"intentId": "A", "asset": "BTC", "type": "market", "side": "buy"},
+        {"intentId": "B", "asset": "BTC", "type": "stop_market", "side": "sell"},
+    ]
+    pr._create_orders("urn:prp-account:X", orders)
+
+    assert len(sent) == 2, "each order must be POSTed separately, not batched"
+    for call in sent:
+        body = call["body"]
+        assert "orders" not in body, (
+            "the batch wrapper is back — the venue rejects it at schema validation"
+        )
+        assert body.get("intentId"), "the bare order object must be the body itself"
+
+
+def test_entry_failure_raises_but_a_leg_failure_keeps_the_entry(forven_db, monkeypatch):
+    """Submitting singly means a bracket is no longer atomic.
+
+    A failed ENTRY must surface (nothing was opened). A failed protective LEG
+    must NOT discard the filled entry — the caller reports it through
+    `protective_leg_failed` and the mirror re-arms or closes. Losing a real
+    filled position because its stop was refused would be the worse trade.
+    """
+    import forven.exchange.propr as pr
+
+    calls = {"n": 0}
+
+    def _entry_ok_leg_fails(method, path, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"orderId": "entry-1", "status": "open"}
+        raise pr.ProprApiError(400, "order_create_failed", {"code": 13051})
+
+    monkeypatch.setattr(pr, "_request", _entry_ok_leg_fails)
+    created = pr._create_orders("acct", [
+        {"intentId": "A", "type": "market"},
+        {"intentId": "B", "type": "stop_market"},
+    ])
+    assert len(created) == 1, "the filled entry must be returned, not discarded"
+
+    def _entry_fails(method, path, **kw):
+        raise pr.ProprApiError(400, "order_create_failed", {"code": 13051})
+
+    monkeypatch.setattr(pr, "_request", _entry_fails)
+    with pytest.raises(pr.ProprApiError):
+        pr._create_orders("acct", [{"intentId": "A", "type": "market"}])
