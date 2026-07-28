@@ -39,7 +39,13 @@ export interface ProprMirrorTradeState {
 	exit_price?: number | null;
 	opened_at?: string;
 	closed_at?: string;
+	recorded_at?: string;
 	source_execution_type?: string;
+	risk_usd?: number;
+	attempts?: number;
+	/** RETRY-1: this entry re-armed after a terminal failure while its entry signal stayed live. */
+	retry_signal_gated?: boolean;
+	retry_rearmed_at?: string;
 }
 
 export interface ProprMirrorHalt {
@@ -59,6 +65,9 @@ export interface ProprMirrorHalt {
 	halted?: boolean;
 	reasons?: string[];
 	checked_at?: string;
+	/** PROPR-ANCHOR-1: how today's day-start equity was determined. */
+	anchor_source?: string;
+	daily_rule_fully_enforced?: boolean;
 }
 
 export interface ProprMirror {
@@ -80,6 +89,9 @@ export interface ProprMirror {
 		challenge_equity_usd?: number | null;
 		slice_usd?: number | null;
 		reason?: string | null;
+		/** MIRROR-RISK-1: the RESOLVED Settings-page risk, whole percent. */
+		risk_pct?: number | null;
+		risk_usd_per_trade?: number | null;
 	} | null;
 }
 

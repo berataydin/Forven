@@ -258,13 +258,83 @@
 			!strategyFilter.trim() ||
 			`${c.id} ${c.name}`.toLowerCase().includes(strategyFilter.trim().toLowerCase())
 	);
-	$: mirrorRows = Object.entries(mirror?.state ?? {}).sort(
-		(a, b) => (b[1].opened_at ?? '').localeCompare(a[1].opened_at ?? '')
+	// Skips/failures carry only recorded_at — without the fallback they sink to
+	// the bottom regardless of recency.
+	const stateWhen = (st: { opened_at?: string; closed_at?: string; recorded_at?: string }) =>
+		st.closed_at ?? st.opened_at ?? st.recorded_at ?? '';
+	$: mirrorRows = Object.entries(mirror?.state ?? {}).sort((a, b) =>
+		stateWhen(b[1]).localeCompare(stateWhen(a[1]))
 	);
 	$: accountIsPaper = status?.account_type === 'paper';
 	$: halt = mirror?.halt ?? null;
 	// SLICE-1: how the challenge account is divided across the roster.
 	$: capitalSlice = mirror?.capital_slice ?? null;
+
+	// Realized PnL of one CLOSED ledger entry (price move × qty, before fees).
+	const statePnl = (st: {
+		status?: string;
+		direction?: string;
+		quantity?: number;
+		entry_price?: number | null;
+		exit_price?: number | null;
+	}): number | null => {
+		if (st.status !== 'closed') return null;
+		const entry = Number(st.entry_price);
+		const exit = Number(st.exit_price);
+		const qty = Number(st.quantity);
+		if (!Number.isFinite(entry) || !Number.isFinite(exit) || !Number.isFinite(qty) || qty <= 0)
+			return null;
+		return (exit - entry) * qty * (st.direction === 'short' ? -1 : 1);
+	};
+
+	// Mirror activity summary over the ledger (the backend prunes terminal
+	// entries after 7 days, so these figures cover the recent window).
+	$: mirrorSummary = (() => {
+		const counts: Record<string, number> = {};
+		let realized = 0;
+		let hasRealized = false;
+		for (const [, st] of mirrorRows) {
+			counts[st.status] = (counts[st.status] ?? 0) + 1;
+			const pnl = statePnl(st);
+			if (pnl !== null) {
+				realized += pnl;
+				hasRealized = true;
+			}
+		}
+		return { counts, realized: hasRealized ? realized : null };
+	})();
+
+	// Challenge P&L tiles: since-start and today, plus open unrealized.
+	$: todayPnl =
+		halt?.equity !== undefined && halt?.day_start_equity !== undefined
+			? (halt.equity ?? 0) - (halt.day_start_equity ?? 0)
+			: null;
+	$: netPnlPct =
+		halt?.profit_progress_usd !== undefined && halt?.starting_balance
+			? ((halt.profit_progress_usd ?? 0) / halt.starting_balance) * 100
+			: null;
+	$: unrealizedTotal = (() => {
+		let total = 0;
+		let seen = false;
+		for (const row of positions) {
+			const v = pickNum(row as Row, 'unrealizedPnl', 'unrealized_pnl');
+			if (v !== null) {
+				total += v;
+				seen = true;
+			}
+		}
+		return seen ? total : null;
+	})();
+	// Days into the active attempt, from the attempts list the venue serves.
+	$: attemptDaysIn = (() => {
+		const active = attempts.find((a) => pickStr(a, 'status').toLowerCase() === 'active');
+		const started = pick(active ?? {}, 'createdAt', 'created_at', 'startedAt');
+		if (!started) return null;
+		const ms = Date.now() - new Date(String(started)).getTime();
+		return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms / 86_400_000) : null;
+	})();
+	const signedUsd = (v: number | null | undefined) =>
+		v === null || v === undefined ? '—' : `${v >= 0 ? '+' : ''}${fmtUsd(v)}`;
 
 	// Gauge helpers for the challenge-rules panel: fill % of the venue limit,
 	// clamped, with color stepping at 50% and at the 80% halt line.
@@ -426,20 +496,75 @@
 				<div class="border border-[#222] bg-[#0a0a0a] p-2">
 					<div class="text-[10px] uppercase tracking-wider text-[#666]">Account value</div>
 					<div class="text-base font-bold text-white">{fmtUsd(status?.account_value)}</div>
+					{#if halt?.starting_balance}
+						<div class="text-[10px] text-[#555]">started {fmtUsd(halt.starting_balance)}</div>
+					{/if}
+				</div>
+				<div class="border border-[#222] bg-[#0a0a0a] p-2">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">P&L since start</div>
+					<div
+						class={`text-base font-bold ${(halt?.profit_progress_usd ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+					>
+						{signedUsd(halt?.profit_progress_usd)}
+					</div>
+					{#if netPnlPct !== null}
+						<div class="text-[10px] text-[#555]">{netPnlPct >= 0 ? '+' : ''}{netPnlPct.toFixed(2)}%</div>
+					{/if}
+				</div>
+				<div class="border border-[#222] bg-[#0a0a0a] p-2">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">Today</div>
+					<div class={`text-base font-bold ${(todayPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+						{signedUsd(todayPnl)}
+					</div>
+					<div class="text-[10px] text-[#555]">resets each UTC day</div>
+				</div>
+				<div class="border border-[#222] bg-[#0a0a0a] p-2">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">Unrealized</div>
+					<div
+						class={`text-base font-bold ${unrealizedTotal === null ? 'text-[#aaa]' : unrealizedTotal >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+					>
+						{unrealizedTotal === null ? '—' : signedUsd(unrealizedTotal)}
+					</div>
+					<div class="text-[10px] text-[#555]">
+						{positions.length} open position{positions.length === 1 ? '' : 's'}
+					</div>
 				</div>
 				<div class="border border-[#222] bg-[#0a0a0a] p-2">
 					<div class="text-[10px] uppercase tracking-wider text-[#666]">Attempt status</div>
 					<div class="text-base font-bold text-[#aaa]">{status?.attempt_status ?? '—'}</div>
+					{#if attemptDaysIn !== null}
+						<div class="text-[10px] text-[#555]">day {attemptDaysIn + 1}</div>
+					{/if}
+				</div>
+				<div class="border border-[#222] bg-[#0a0a0a] p-2">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">To target</div>
+					{#if halt?.profit_target_usd}
+						<div class="text-base font-bold text-white">
+							{fmtUsd(Math.max(0, (halt.profit_target_usd ?? 0) - (halt.profit_progress_usd ?? 0)))}
+						</div>
+						<div class="text-[10px] text-[#555]">of {fmtUsd(halt.profit_target_usd)} target</div>
+					{:else}
+						<div class="text-base font-bold text-[#aaa]">—</div>
+					{/if}
+				</div>
+				<div class="border border-[#222] bg-[#0a0a0a] p-2">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">Sizing</div>
+					{#if capitalSlice?.risk_pct}
+						<div class="text-base font-bold text-white">
+							{capitalSlice.risk_pct}% <span class="text-[#666] text-xs">/ trade</span>
+						</div>
+						<div class="text-[10px] text-[#555]">
+							≈ {fmtUsd(capitalSlice.risk_usd_per_trade)} risk on a {fmtUsd(capitalSlice.slice_usd)} slice
+						</div>
+					{:else}
+						<div class="text-base font-bold text-[#aaa]">—</div>
+					{/if}
 				</div>
 				<div class="border border-[#222] bg-[#0a0a0a] p-2">
 					<div class="text-[10px] uppercase tracking-wider text-[#666]">Account</div>
 					<div class="text-[10px] font-mono text-[#888] pt-1.5 truncate" title={status?.account_id}>
 						{status?.account_id ?? '—'}
 					</div>
-				</div>
-				<div class="border border-[#222] bg-[#0a0a0a] p-2">
-					<div class="text-[10px] uppercase tracking-wider text-[#666]">Open positions</div>
-					<div class="text-base font-bold text-white">{positions.length}</div>
 				</div>
 			</div>
 			{#if attempts.length > 0}
@@ -481,6 +606,14 @@
 					</span>
 				</div>
 
+				{#if halt.daily_rule_fully_enforced === false}
+					<div class="border border-yellow-900 bg-yellow-500/5 px-3 py-2 text-[11px] text-yellow-500">
+						Today's opening balance was never observed (cold start), so the daily-loss gauge is
+						anchored on the first reading of the day and only PARTIALLY enforces the venue's rule
+						today. Tomorrow's anchor carries over normally.
+					</div>
+				{/if}
+
 				<!-- daily loss gauge -->
 				<div class="space-y-1">
 					<div class="flex items-baseline justify-between text-[11px]">
@@ -507,13 +640,17 @@
 							<span class="text-[#aaa]">
 								account split {capitalSlice.roster_size} ways ·
 								<span class="text-white">{fmtUsd(capitalSlice.slice_usd)}</span> each
+								{#if capitalSlice.risk_pct}
+									· risking <span class="text-white">{capitalSlice.risk_pct}%</span>
+									(≈ {fmtUsd(capitalSlice.risk_usd_per_trade)}) per trade
+								{/if}
 							</span>
 						</div>
 						<div class="mt-1 text-[10px] text-[#555]">
-							Each roster strategy risks its configured % of ITS OWN share, so the whole roster
-							stopping out on the same day costs one strategy's risk — not {capitalSlice.roster_size}×
-							it. Before this the mirror sized every member off the full balance, which could
-							exhaust the drawdown allowance in a single session.
+							Each roster strategy risks {capitalSlice.risk_pct ?? 2}% of ITS OWN share at the
+							trade's stop distance, so the whole roster stopping out on the same day risks
+							~{capitalSlice.risk_pct ?? 2}% of the account — not {capitalSlice.roster_size}× it.
+							The percentage is tunable in Settings → Trading → Propr challenge mirror.
 						</div>
 					</div>
 				{/if}
@@ -545,8 +682,9 @@
 					</div>
 					<div class="text-[10px] text-[#555]">
 						Guarded by: open-halt at 80% · every mirrored entry carries an exchange-side stop
-						bracket · sizing risks 1% of challenge equity per trade (hard cap 2%) · closes are
-						never halted, so risk can always come down.
+						bracket · sizing risks {capitalSlice?.risk_pct ?? 2}% of each strategy's slice per
+						trade (tunable in Settings → Trading → Propr challenge mirror) · closes are never
+						halted, so risk can always come down.
 					</div>
 				</div>
 
@@ -573,7 +711,7 @@
 
 				<div class="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-[#666] border-t border-[#151515] pt-2">
 					<span>✓ no unprotected entries (source trades without a stop are never mirrored)</span>
-					<span>✓ day-start equity anchored to our first reading — tighter than the venue's</span>
+					<span>✓ day-start equity carried from the previous day's last reading, so overnight losses count</span>
 					<span>✓ auto-disarm if the account stops reporting as paper</span>
 					<span>✓ unreadable rules fall back to the strictest tier (3% / 6%)</span>
 				</div>
@@ -590,9 +728,10 @@
 					<p class="text-[11px] text-[#666]">
 						Pick the strategies whose trades get copied onto the Propr account. Live and paper
 						trading are completely untouched — the mirror only observes their trades and places
-						its own independently-sized orders here (risk % of the challenge equity at each
-						trade's stop, entry + stop + take-profit as one bracket, reduce-only closes). Only
-						trades opened AFTER a strategy joins the roster are mirrored.
+						its own independently-sized orders here ({capitalSlice?.risk_pct ?? 2}% of the
+						strategy's equal slice at each trade's stop, entry + stop + take-profit as one
+						bracket, reduce-only closes). Only trades opened AFTER a strategy joins the roster
+						are mirrored; a failed open retries as long as the entry signal stays live.
 					</p>
 				</div>
 				<div class="flex items-center gap-2 shrink-0">
@@ -676,7 +815,26 @@
 				</div>
 
 				<div class="space-y-1">
-					<span class="text-[10px] uppercase tracking-wider text-[#666]">Mirrored trades</span>
+					<div class="flex items-center justify-between">
+						<span class="text-[10px] uppercase tracking-wider text-[#666]">
+							Mirrored trades <span class="normal-case text-[#555]">(last 7 days)</span>
+						</span>
+						{#if mirrorRows.length > 0}
+							<span class="text-[10px] text-[#666]">
+								{#each ['open', 'closed', 'pending', 'error', 'failed', 'skipped'] as s}
+									{#if mirrorSummary.counts[s]}
+										<span class="mr-2">{mirrorSummary.counts[s]} {s}</span>
+									{/if}
+								{/each}
+								{#if mirrorSummary.realized !== null}
+									· realized
+									<span class={mirrorSummary.realized >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+										{signedUsd(mirrorSummary.realized)}
+									</span>
+								{/if}
+							</span>
+						{/if}
+					</div>
 					{#if mirrorRows.length === 0}
 						<div class="text-[11px] text-[#555]">
 							Nothing mirrored yet — trades appear here within a minute of a roster strategy
@@ -685,28 +843,63 @@
 					{:else}
 						<div class="max-h-64 overflow-y-auto space-y-0.5">
 							{#each mirrorRows as [tradeId, st] (tradeId)}
-								<div class="border border-[#151515] bg-[#0a0a0a] px-2 py-1 text-[11px] flex items-center gap-2">
-									<span
-										class={`text-[9px] uppercase tracking-wider px-1 py-0.5 border shrink-0 ${
-											st.status === 'open'
-												? 'border-emerald-800 text-emerald-400'
-												: st.status === 'closed'
-													? 'border-[#333] text-[#888]'
-													: st.status === 'skipped'
-														? 'border-[#333] text-[#666]'
-														: 'border-red-900 text-red-400'
-										}`}
-									>
-										{st.status}
-									</span>
-									<span class="font-bold text-[#bbb] shrink-0">{st.asset}</span>
-									<span class={st.direction === 'short' ? 'text-red-400' : 'text-emerald-400'}>
-										{st.direction}
-									</span>
-									<span class="text-[#777] truncate flex-1" title={st.reason ?? ''}>
-										{st.strategy}{st.reason ? ` — ${st.reason}` : ''}
-									</span>
-									{#if st.quantity}<span class="text-[#666]">{fmtNum(st.quantity, 5)}</span>{/if}
+								{@const pnl = statePnl(st)}
+								<div class="border border-[#151515] bg-[#0a0a0a] px-2 py-1 text-[11px]">
+									<div class="flex items-center gap-2">
+										<span
+											class={`text-[9px] uppercase tracking-wider px-1 py-0.5 border shrink-0 ${
+												st.status === 'open'
+													? 'border-emerald-800 text-emerald-400'
+													: st.status === 'closed'
+														? 'border-[#333] text-[#888]'
+														: st.status === 'skipped'
+															? 'border-[#333] text-[#666]'
+															: st.status === 'pending'
+																? 'border-yellow-900 text-yellow-500'
+																: 'border-red-900 text-red-400'
+											}`}
+										>
+											{st.status}
+										</span>
+										<span class="font-bold text-[#bbb] shrink-0">{st.asset}</span>
+										<span class={st.direction === 'short' ? 'text-red-400' : 'text-emerald-400'}>
+											{st.direction}
+										</span>
+										{#if st.retry_signal_gated}
+											<span
+												class="text-[9px] uppercase tracking-wider px-1 py-0.5 border border-[#3a2a10] text-[#c9a227] shrink-0"
+												title="Re-armed after a terminal open failure because the strategy's entry signal was still live (RETRY-1)."
+											>
+												re-armed
+											</span>
+										{/if}
+										<span class="text-[#777] truncate flex-1" title={st.reason ?? ''}>
+											{st.strategy}
+											<span class="text-[#555]">({st.source_execution_type ?? '?'})</span>
+										</span>
+										{#if pnl !== null}
+											<span class={`shrink-0 ${pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+												{signedUsd(pnl)}
+											</span>
+										{/if}
+										<span class="text-[#555] text-[10px] shrink-0">{fmtWhen(stateWhen(st))}</span>
+									</div>
+									<div class="mt-0.5 flex items-center gap-3 text-[10px] text-[#555] pl-1">
+										{#if st.quantity}
+											<span>{fmtNum(st.quantity, 5)} {st.asset}</span>
+										{/if}
+										{#if st.entry_price}
+											<span>
+												in {fmtNum(st.entry_price)}{st.exit_price ? ` → out ${fmtNum(st.exit_price)}` : ''}
+											</span>
+										{/if}
+										{#if st.risk_usd}
+											<span>risk {fmtUsd(st.risk_usd)}</span>
+										{/if}
+										{#if st.reason}
+											<span class="truncate text-[#666]" title={st.reason}>{st.reason}</span>
+										{/if}
+									</div>
 								</div>
 							{/each}
 						</div>

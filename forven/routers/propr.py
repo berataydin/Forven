@@ -131,6 +131,12 @@ def propr_get_mirror():
         equity = float((halt or {}).get("equity") or 0.0)
         if equity > 0:
             _slice, meta = propr_mirror.mirror_equity_slice(equity)
+            # MIRROR-RISK-1: the RESOLVED risk setting, so the page shows the
+            # number the next order will actually use (not a hardcoded caption).
+            risk_frac = propr_mirror.mirror_risk_fraction()
+            meta["risk_pct"] = round(risk_frac * 100.0, 4)
+            if meta.get("slice_usd"):
+                meta["risk_usd_per_trade"] = round(float(meta["slice_usd"]) * risk_frac, 2)
             capital_slice = meta
     except Exception:  # noqa: BLE001 — a display figure must never break the panel
         capital_slice = None
