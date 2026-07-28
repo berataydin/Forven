@@ -634,6 +634,42 @@ def _live_sizing_slice(account_equity: float | None = None) -> tuple[float | Non
         return None, {"reason": f"slice resolution failed: {exc}"}
 
 
+def _book_sizing_equity(open_book: str) -> float | None:
+    """SLICE-BASE-1: the sizing base when direction books are on — the COMBINED
+    long+short pool, not the routed book alone.
+
+    A strategy deploys ONE direction at a time, so the capital working for the
+    cohort is the whole pool; dividing each book separately by the same N halved
+    every slice (the operator funds the books as one pot split across two
+    wallets for order ROUTING, not as two independent allocations). The routed
+    book still fronts the margin, so ITS read stays mandatory — None here means
+    fail closed, exactly as before. The counterpart book is additive only: an
+    unreadable counterpart degrades the base back to the routed book, which
+    under-sizes rather than over-sizes. If the whole cohort ever lands
+    same-side, the venue's margin check on the routed book is the backstop and
+    a refused order fails closed.
+    """
+    from forven.exchange import books
+
+    addr = books.book_address(open_book)
+    if not addr:
+        return None
+    eq = _book_account_equity(addr)
+    if not eq or eq <= 0:
+        return None
+    other = "short" if str(open_book).strip().lower() == "long" else "long"
+    try:
+        other_addr = books.book_address(other)
+        # A shared/misconfigured address must not double the base.
+        if other_addr and str(other_addr).lower() != str(addr).lower():
+            other_eq = _book_account_equity(other_addr)
+            if other_eq and other_eq > 0:
+                eq += other_eq
+    except Exception:  # noqa: BLE001 — additive only; the routed book is the floor
+        pass
+    return eq
+
+
 _PAPER_SANDBOX_INITIAL_CAPITAL = 10_000.0
 
 
@@ -4802,17 +4838,13 @@ def manage_positions(
             if open_book is not None:
                 _book_addr = books.book_address(open_book)
                 if _book_addr:
-                    # Dedicated sub-account: size off ITS balance. If that read
-                    # fails, FAIL CLOSED — never silently size off the (different,
-                    # possibly near-empty) master wallet.
-                    _book_eq = _book_account_equity(_book_addr)
+                    # The routed sub-account's read is mandatory (fail closed —
+                    # never silently size off the possibly near-empty master
+                    # wallet), but the sizing base is the COMBINED book pool:
+                    # see _book_sizing_equity (SLICE-BASE-1) for why per-book
+                    # division halved every slice.
+                    _book_eq = _book_sizing_equity(open_book)
                     if _book_eq and _book_eq > 0:
-                        # SLICE-1: the book balance is a NARROWER base, but it is
-                        # still shared by the whole cohort (direction routing is
-                        # per-signal, so any live strategy can land in either
-                        # book). Slice it by the same N — conservative rather than
-                        # clever; a per-book cohort count would need to know which
-                        # way each strategy will signal next.
                         sizing_equity, _ = _live_sizing_slice(_book_eq)
                     else:
                         msg = (
@@ -6836,11 +6868,10 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
             return f"SKIPPED {asset} short — long-only (no short book)"
         _book_addr = books.book_address(open_book)
         if _book_addr:
-            _book_eq = _book_account_equity(_book_addr)
+            # SLICE-BASE-1: mandatory routed-book read, COMBINED-pool sizing
+            # base — see _book_sizing_equity.
+            _book_eq = _book_sizing_equity(open_book)
             if _book_eq and _book_eq > 0:
-                # SLICE-1: slice the BOOK balance by the same cohort N — see the
-                # matching site on the legacy path for why the count is not
-                # per-book.
                 sizing_equity, _book_slice_meta = _live_sizing_slice(_book_eq)
                 if sizing_equity is None or sizing_equity <= 0:
                     _why = (
@@ -6850,7 +6881,7 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
                     log.warning("[%s] BLOCKED %s live — %s", strat_id, asset, _why)
                     _notify_live_open_blocked(strat_id, asset, _why, "slice_unavailable")
                     return f"BLOCKED {asset} — {_why}"
-                _live_slice_meta = {**_book_slice_meta, "base": f"{open_book}_book"}
+                _live_slice_meta = {**_book_slice_meta, "base": "combined_books"}
             else:
                 log.warning(
                     "[%s] BLOCKED %s live — could not read %s-book sub-account balance; "

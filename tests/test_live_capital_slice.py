@@ -80,6 +80,62 @@ def test_empty_cohort_floors_at_one(forven_db, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# SLICE-BASE-1: the sizing base when direction books are on
+# --------------------------------------------------------------------------- #
+
+def _patch_books(monkeypatch, addrs: dict, eqs: dict):
+    import forven.scanner as scanner
+    from forven.exchange import books
+
+    monkeypatch.setattr(books, "book_address", lambda b, settings=None: addrs.get(b))
+    monkeypatch.setattr(scanner, "_book_account_equity", lambda a: eqs.get(a))
+    return scanner
+
+
+def test_book_sizing_base_combines_both_books(forven_db, monkeypatch):
+    """Strategies deploy ONE direction at a time, so the base is the combined
+    long+short pool — per-book division halved every slice."""
+    scanner = _patch_books(
+        monkeypatch,
+        {"long": "0xlong", "short": "0xshort"},
+        {"0xlong": 508.7, "0xshort": 490.5},
+    )
+    assert scanner._book_sizing_equity("short") == pytest.approx(999.2)
+    assert scanner._book_sizing_equity("long") == pytest.approx(999.2)
+
+
+def test_book_sizing_base_degrades_to_routed_book_when_counterpart_unreadable(forven_db, monkeypatch):
+    """The counterpart is additive only — losing its read under-sizes, never
+    over-sizes, and never blocks the open."""
+    scanner = _patch_books(
+        monkeypatch,
+        {"long": "0xlong", "short": "0xshort"},
+        {"0xshort": 490.5},  # long book read fails
+    )
+    assert scanner._book_sizing_equity("short") == pytest.approx(490.5)
+
+
+def test_book_sizing_base_fails_closed_when_routed_book_unreadable(forven_db, monkeypatch):
+    """The routed book fronts the margin — its read stays mandatory."""
+    scanner = _patch_books(
+        monkeypatch,
+        {"long": "0xlong", "short": "0xshort"},
+        {"0xlong": 508.7},  # short book read fails
+    )
+    assert scanner._book_sizing_equity("short") is None
+
+
+def test_book_sizing_base_does_not_double_count_a_shared_address(forven_db, monkeypatch):
+    """A misconfig pointing both books at one wallet must not double the base."""
+    scanner = _patch_books(
+        monkeypatch,
+        {"long": "0xSAME", "short": "0xsame"},
+        {"0xSAME": 490.5, "0xsame": 490.5},
+    )
+    assert scanner._book_sizing_equity("long") == pytest.approx(490.5)
+
+
+# --------------------------------------------------------------------------- #
 # What the slice does to sizing — the actual defect
 # --------------------------------------------------------------------------- #
 
