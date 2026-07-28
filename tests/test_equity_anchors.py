@@ -36,9 +36,11 @@ def test_jump_guard_never_self_heals(forven_db):
     assert notes and "REJECTED" in str(notes[0].get("summary"))
 
 
-def test_jump_guard_still_accepts_losses_and_normal_moves(forven_db):
+def test_jump_guard_still_accepts_losses_and_normal_moves(forven_db, monkeypatch):
+    # EQ-DROP-1: a 50% loss flows through when open exposure can explain it.
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 200.0)
     state = {"last_equity": 600.0}
-    ok, _ = risk._validate_equity_sample(300.0, state)  # a real 50% loss flows through
+    ok, _ = risk._validate_equity_sample(300.0, state)  # $300 drop <= 2x$200 + $25
     assert ok
     ok, _ = risk._validate_equity_sample(1_200.0, state)  # 2x move is fine
     assert ok
@@ -100,10 +102,16 @@ def test_drain_rebaseline_reanchors_step_down_no_killswitch(forven_db):
     assert daily["start_equity"] == pytest.approx(359.0)
 
 
-def test_same_basis_drop_without_drain_flag_still_draws_down(forven_db):
+def test_same_basis_drop_without_drain_flag_still_draws_down(forven_db, monkeypatch):
     """Without the drain flag, the SAME lower reading is a genuine loss: it computes
     drawdown against the peak (and a large enough drop fires the kill-switch). This
-    is the contrast that proves the drain path doesn't blanket-suppress losses."""
+    is the contrast that proves the drain path doesn't blanket-suppress losses.
+
+    Open exposure covers the drop (EQ-DROP-1's bound is about IMPOSSIBLE losses,
+    not real ones) and the confirmation spacing is zeroed so three back-to-back
+    test ticks still count as independent (HALT-CONFIRM-2 has its own tests)."""
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 200.0)
+    monkeypatch.setattr(risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
     _seed_live_state(675.0, 675.0, source="books_only")
     result = risk.update_equity(359.0, "books_only")  # rebaseline defaults False
     # 47% drawdown on the 10% testnet cap -> kill-switch fires after the
@@ -324,3 +332,114 @@ def test_rebaseline_endpoint_uses_fresh_read_and_fails_closed(forven_db, monkeyp
     # unconfirmed → refused
     result = ops.post_equity_rebaseline(ConfirmBody(confirm=False))
     assert result["ok"] is False
+
+
+# ------------------- EQ-DROP-1 + HALT-CONFIRM-2 (the 2026-07-28 false halt)
+
+
+def _seed_daily(start: float) -> None:
+    kv_set("daily_risk", {
+        "date": get_today().isoformat(),
+        "start_equity": start,
+        "current_equity": start,
+    })
+
+
+def test_drop_guard_rejects_the_2026_07_28_phantom(forven_db, monkeypatch):
+    """Incident replay: a 429 storm served one book's perp margin without its
+    spot leg — $999.28 -> $516.82 — while total open live notional was ~$16.
+    The sample must be REJECTED with anchors frozen: no halt, no drawdown."""
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 16.3)
+    _seed_live_state(999.45, 999.28, source="books_only")
+    _seed_daily(999.28)
+    for _ in range(3):
+        result = risk.update_equity(516.82, "books_only")
+        assert result.get("rejected") is True
+        assert result.get("action") is None
+    state = kv_get("risk_state", {})
+    assert not state.get("daily_loss_halt")
+    assert not state.get("kill_switch_active")
+    assert state["last_equity"] == pytest.approx(999.28)
+
+
+def test_drop_guard_alerts_operator_after_persistent_rejects(forven_db, monkeypatch):
+    from forven.notifications import list_notifications, update_notification_preferences
+    update_notification_preferences({"discord_mode": "shadow"})
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    state = {"last_equity": 999.0, "equity_source": "books_only"}
+    for _ in range(risk._EQUITY_JUMP_ALERT_AFTER_REJECTS):
+        ok, reason = risk._validate_equity_sample(500.0, state, source="books_only")
+        assert not ok and "re-baseline" in reason
+    notes = list_notifications(event_type="equity_anomaly")
+    assert notes and "drop" in str(notes[0].get("title", "")).lower()
+
+
+def test_drop_guard_ignores_small_drops_and_covered_losses(forven_db, monkeypatch):
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    state = {"last_equity": 1000.0, "equity_source": "books_only"}
+    ok, _ = risk._validate_equity_sample(950.0, state, source="books_only")
+    assert ok, "a 5% drop is inside normal variance — never second-guessed"
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 400.0)
+    state = {"last_equity": 1000.0, "equity_source": "books_only"}
+    ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
+    assert ok, "a 60% drop covered by open exposure is a real loss — flows through"
+
+
+def test_drop_guard_stands_down_when_notional_unreadable(forven_db, monkeypatch):
+    """An unreadable trades table must not suppress a genuine halt — the guard
+    accepts the sample and the normal drawdown machinery judges it."""
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: None)
+    state = {"last_equity": 1000.0, "equity_source": "books_only"}
+    ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
+    assert ok
+
+
+def test_drop_guard_skips_basis_change_and_rebaseline_ticks(forven_db, monkeypatch):
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    state = {"last_equity": 1000.0, "equity_source": "books_aggregate"}
+    ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
+    assert ok, "a basis change is re-anchored by its own path, not judged as a drop"
+    state = {"last_equity": 1000.0, "equity_source": "books_only"}
+    ok, _ = risk._validate_equity_sample(400.0, state, source="books_only", rebaseline=True)
+    assert ok, "a confirmed drain re-baseline is an intentional step-down"
+
+
+def test_degraded_ticks_never_confirm_a_halt(forven_db, monkeypatch):
+    """HALT-CONFIRM-2: a tick built on substituted/failed wallet reads can breach
+    all it wants — it cannot advance the confirmation streak, so a venue outage
+    can never confirm its own phantom."""
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    kv_set("kill_switch_enabled", False)
+    _seed_live_state(675.0, 675.0, source="books_only")
+    _seed_daily(675.0)
+    for _ in range(6):
+        risk.update_equity(359.0, "books_only", degraded=True)
+    state = kv_get("risk_state", {})
+    assert not state.get("daily_loss_halt")
+    assert int(state.get("daily_halt_breach_streak") or 0) == 0
+
+
+def test_confirmations_require_spacing_between_ticks(forven_db, monkeypatch):
+    """Three breaching ticks in one burst are ONE observation (the 2026-07-28
+    halt confirmed 3-for-3 in 8 seconds): only spaced ticks advance the streak,
+    and the halt latches on the third INDEPENDENT one."""
+    from datetime import timedelta
+
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    kv_set("kill_switch_enabled", False)
+    _seed_live_state(675.0, 675.0, source="books_only")
+    _seed_daily(675.0)
+
+    base = risk.get_now()
+    current = {"t": base}
+    monkeypatch.setattr(risk, "get_now", lambda: current["t"])
+
+    risk.update_equity(359.0, "books_only")           # counts: 1/3
+    risk.update_equity(359.0, "books_only")           # same window: not counted
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 1
+    current["t"] = base + timedelta(seconds=25)
+    risk.update_equity(359.0, "books_only")           # counts: 2/3
+    current["t"] = base + timedelta(seconds=50)
+    result = risk.update_equity(359.0, "books_only")  # counts: 3/3 — latches
+    assert result.get("daily_halt") is True
+    assert kv_get("risk_state", {}).get("daily_loss_halt") is True

@@ -1391,6 +1391,10 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
             # DRAIN-1: signals update_equity to re-baseline the (lower) step-down
             # instead of computing a drawdown against the pre-drain HWM.
             "drain_accepted": drain_accepted,
+            # HALT-CONFIRM-2: a tick built on substituted/failed reads may still
+            # update equity, but it must never CONFIRM a halt latch — the
+            # 2026-07-28 false halt was confirmed 3-for-3 inside one 429 storm.
+            "degraded": bool(substituted or read_failed),
         }
     except Exception:
         # Hard failure: skip rather than fall back to a master-only value that
@@ -1542,6 +1546,7 @@ async def _run_risk_cycle() -> dict:
             equity,
             equity_source,
             rebaseline=drain_accepted,
+            degraded=bool(acct.get("degraded")),
         )
         if not isinstance(risk_check, dict):
             return snapshot

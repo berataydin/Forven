@@ -4120,7 +4120,10 @@ def _get_live_risk_state() -> dict:
         return dict(state) if isinstance(state, dict) else dict(default_state)
 
 
-def update_equity(account_equity: float, source: str = "exchange", *, rebaseline: bool = False) -> dict:
+def update_equity(
+    account_equity: float, source: str = "exchange", *,
+    rebaseline: bool = False, degraded: bool = False,
+) -> dict:
     """Update equity tracking. Call this every daemon tick.
 
     Updates the high-water mark, checks drawdown kill-switch,
@@ -4138,6 +4141,10 @@ def update_equity(account_equity: float, source: str = "exchange", *, rebaseline
             after a confirmed consecutive-clean-zero streak, so a genuine loss —
             which arrives as a lower-but-nonzero clean read — still flows through
             as drawdown.
+        degraded: HALT-CONFIRM-2. True when the sample was built on substituted
+            (cached) or failed per-wallet reads. A degraded tick still updates
+            equity/HWM, but it can never advance a halt/kill-switch confirmation
+            streak — a venue outage must not confirm its own phantom.
 
     Returns:
         {
@@ -4151,7 +4158,9 @@ def update_equity(account_equity: float, source: str = "exchange", *, rebaseline
         }
     """
     with _RISK_STATE_LOCK:
-        return _update_equity_locked(account_equity, source, rebaseline=rebaseline)
+        return _update_equity_locked(
+            account_equity, source, rebaseline=rebaseline, degraded=degraded
+        )
 
 
 def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
@@ -4241,6 +4250,38 @@ def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
 # confirmation). Open-time protection is not gated: M9 refuses new opens from
 # the first breaching read.
 _HALT_CONFIRM_TICKS = 3
+# HALT-CONFIRM-2: confirmations must also be INDEPENDENT. The 2026-07-28 false
+# daily halt was "confirmed" 3-for-3 in 8 seconds — three samples of the same
+# poisoned number inside one 429 storm. A breach tick only counts when it is at
+# least this far from the previously counted one AND from a non-degraded read.
+_HALT_CONFIRM_MIN_SPACING_SECONDS = 20.0
+
+
+def _count_breach_tick(state: dict, streak_key: str, last_at_key: str, degraded: bool) -> int | None:
+    """HALT-CONFIRM-2: advance a halt confirmation streak only for an
+    INDEPENDENT breach tick. Returns the new streak, or None when this tick
+    must not count: a DEGRADED read (substituted/failed wallet legs) can never
+    confirm its own phantom, and two ticks inside the spacing window are one
+    observation, not two. A non-counting tick leaves the streak intact — the
+    breach may be real, and later independent ticks finish the confirmation —
+    while the M9 open-path check blocks NEW opens from the first breaching
+    read regardless.
+    """
+    if degraded:
+        return None
+    now_dt = get_now()
+    prev_iso = state.get(last_at_key)
+    if prev_iso:
+        try:
+            prev_dt = datetime.fromisoformat(str(prev_iso))
+            if (now_dt - prev_dt).total_seconds() < _HALT_CONFIRM_MIN_SPACING_SECONDS:
+                return None
+        except (ValueError, TypeError):
+            pass  # unparseable stamp: count the tick rather than wedge the halt
+    state[last_at_key] = now_dt.isoformat()
+    streak = int(state.get(streak_key) or 0) + 1
+    state[streak_key] = streak
+    return streak
 
 _MAX_PLAUSIBLE_EQUITY = 1e12  # $1T — no real or testnet account reaches this
 _EQUITY_JUMP_REJECT_MULT = 100.0  # a single-tick 100x jump from the last good equity is suspect
@@ -4256,17 +4297,63 @@ _EQUITY_JUMP_ALERT_AFTER_REJECTS = 5
 # leaves a durable trail at the moment such an inflation enters the risk state.
 _EQUITY_NOTABLE_MOVE_MULT = 2.0
 
+# EQ-DROP-1: reject a single-tick equity DROP that open exposure cannot explain.
+# The allowance is deliberately generous — every open live position's FULL
+# notional (a total wipe), doubled, plus a flat buffer for fees/funding — so any
+# real trading loss passes and only physically-impossible drops are rejected
+# (the 2026-07-28 false halt: a $482 "loss" while total open notional was ~$16,
+# because a 429 storm served one book's perp margin without its spot leg).
+# Fail-closed like the jump guard: persistent rejects alert the operator, and a
+# genuine WITHDRAWAL is confirmed via the Re-baseline action, same as a deposit.
+# Drops under the min fraction are never second-guessed — they are inside normal
+# trading variance and the daily-loss rule exists to judge them.
+_EQUITY_DROP_EXPOSURE_MULT = 2.0
+_EQUITY_DROP_BUFFER_USD = 25.0
+_EQUITY_DROP_MIN_FRACTION = 0.10
 
-def _validate_equity_sample(account_equity: object, state: dict) -> tuple[bool, str]:
+
+def _open_live_notional_usd() -> float | None:
+    """Total |notional| of OPEN live trades, or None when unreadable.
+
+    EQ-DROP-1's plausibility bound. On None the drop guard stands down (an
+    unreadable trades table must not suppress a genuine halt)."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT entry_price, fill_entry_price, size FROM trades "
+                "WHERE status = 'OPEN' AND LOWER(COALESCE(execution_type, 'live')) = 'live'"
+            ).fetchall()
+        total = 0.0
+        for r in rows:
+            row = dict(r)
+            entry = _coerce_non_negative_float(row.get("fill_entry_price")) or _coerce_non_negative_float(row.get("entry_price"))
+            size = _coerce_non_negative_float(row.get("size"))
+            if entry and size:
+                total += entry * size
+        return total
+    except Exception as exc:  # noqa: BLE001 — guard degrades open, never blocks the tick
+        log.warning("EQ-DROP-1: open-live-notional read failed (%s) — drop guard stands down", exc)
+        return None
+
+
+def _validate_equity_sample(
+    account_equity: object, state: dict, *,
+    source: str | None = None, rebaseline: bool = False,
+) -> tuple[bool, str]:
     """Return ``(ok, reason)`` for an incoming equity sample.
 
     Rejects non-numeric / NaN / non-positive / above the absolute plausibility
-    ceiling, and a single-tick jump > ``_EQUITY_JUMP_REJECT_MULT`` x the last good
-    equity. The relative-jump check FAILS CLOSED (EQ-BASIS-3): it keeps rejecting
-    for as long as the suspect value persists, and once the streak passes
-    ``_EQUITY_JUMP_ALERT_AFTER_REJECTS`` it alerts the operator to confirm a
-    genuine large deposit via the equity re-baseline action — it never silently
-    accepts a 100x change on its own.
+    ceiling, a single-tick jump > ``_EQUITY_JUMP_REJECT_MULT`` x the last good
+    equity, and (EQ-DROP-1) a single-tick DROP larger than open live exposure
+    can explain. Both relative checks FAIL CLOSED (EQ-BASIS-3): they keep
+    rejecting for as long as the suspect value persists, and once the streak
+    passes ``_EQUITY_JUMP_ALERT_AFTER_REJECTS`` they alert the operator to
+    confirm a genuine deposit/withdrawal via the equity re-baseline action —
+    never silently accepting on their own.
+
+    The drop guard stands down for a DRAIN re-baseline tick and across an
+    equity-basis change (``source`` differs from the state's recorded source) —
+    both are legitimate step-downs handled by their own re-anchor paths.
     """
     try:
         eq = float(account_equity)
@@ -4293,8 +4380,68 @@ def _validate_equity_sample(account_equity: object, state: dict) -> tuple[bool, 
             f"(suspect; rejected {streak} tick(s) — confirm a genuine deposit via "
             "the equity re-baseline action)"
         )
+
+    # EQ-DROP-1: a drop no open position could have produced is a broken read,
+    # not a loss. REAL-CAPITAL, same-basis, non-rebaseline samples only — a
+    # paper session's equity swings on paper positions, which the live-notional
+    # bound knows nothing about (and paper never halts anyway, PAPER-HALT-2).
+    if (
+        last > 0
+        and eq < last
+        and not rebaseline
+        and source is not None
+        and _is_real_capital_equity_source(source)
+        and source == state.get("equity_source")
+    ):
+        drop = last - eq
+        if drop >= last * _EQUITY_DROP_MIN_FRACTION:
+            notional = _open_live_notional_usd()
+            if notional is not None:
+                allowance = notional * _EQUITY_DROP_EXPOSURE_MULT + _EQUITY_DROP_BUFFER_USD
+                if drop > allowance:
+                    streak = int(state.get("equity_reject_streak", 0) or 0) + 1
+                    state["equity_reject_streak"] = streak
+                    if streak >= _EQUITY_JUMP_ALERT_AFTER_REJECTS:
+                        _notify_equity_drop_anomaly(eq, last, drop, allowance, streak)
+                    return False, (
+                        f"equity dropped ${drop:,.2f} (${last:,.2f} -> ${eq:,.2f}) but open live "
+                        f"exposure can explain at most ${allowance:,.2f} — suspect partial read; "
+                        f"rejected {streak} tick(s). A genuine withdrawal is confirmed via the "
+                        "equity re-baseline action"
+                    )
+
     state["equity_reject_streak"] = 0
     return True, "ok"
+
+
+def _notify_equity_drop_anomaly(eq: float, last: float, drop: float, allowance: float, streak: int) -> None:
+    """EQ-DROP-1 counterpart of the jump alert: a persistent implausible DROP is
+    either a broken venue read or a real withdrawal — the operator decides."""
+    summary = (
+        f"Live equity source keeps reporting ${eq:,.2f} — a ${drop:,.2f} drop from the last good "
+        f"${last:,.2f}, but open live exposure can explain at most ${allowance:,.2f} "
+        f"({streak} consecutive ticks). Samples are being REJECTED (fail closed); risk anchors are "
+        "frozen at the last good reading. If funds were genuinely withdrawn, confirm it with "
+        "Re-baseline on the Risk page."
+    )
+    log.error("EQUITY DROP ANOMALY: %s", summary)
+    try:
+        log_activity("error", "risk", f"Equity drop anomaly: {summary}")
+    except Exception:
+        pass
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "equity_anomaly",
+            severity="warn",
+            source="risk",
+            title="Live equity source anomaly (implausible drop)",
+            summary=summary,
+            body=summary,
+            dedupe_key="equity_anomaly:drop",
+        )
+    except Exception as exc:
+        log.debug("Could not emit equity_anomaly notification: %s", exc)
 
 
 def _notify_equity_anomaly(eq: float, last: float, streak: int) -> None:
@@ -4342,7 +4489,10 @@ def _rejected_equity_result(state: dict, reason: str) -> dict:
     }
 
 
-def _update_equity_locked(account_equity: float, source: str, *, rebaseline: bool = False) -> dict:
+def _update_equity_locked(
+    account_equity: float, source: str, *,
+    rebaseline: bool = False, degraded: bool = False,
+) -> dict:
     state = _get_risk_state()
     prev_last_equity = float(state.get("last_equity") or 0.0)  # KS-CACHE-LOG: detect sharp accepted moves
 
@@ -4350,7 +4500,9 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
     # (high-water mark / kill-switch). A garbage sample is ignored and the next
     # good tick proceeds normally; the reject-streak counter is persisted so the
     # relative-jump guard can self-heal a sustained real change.
-    ok, reason = _validate_equity_sample(account_equity, state)
+    ok, reason = _validate_equity_sample(
+        account_equity, state, source=source, rebaseline=rebaseline
+    )
     if not ok:
         log.error(
             "Ignoring implausible equity sample (source=%s): %s — risk state unchanged.",
@@ -4599,10 +4751,18 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
     # breach latch off non-consecutive ticks), so it forces a blocking write too.
     _streak_reset = False
     if drawdown_pct >= max_drawdown and kill_switch_enabled:
-        _ks_streak = int(state.get("kill_switch_breach_streak") or 0) + 1
-        state["kill_switch_breach_streak"] = _ks_streak
-        if _ks_streak >= _HALT_CONFIRM_TICKS:
+        _ks_streak = _count_breach_tick(
+            state, "kill_switch_breach_streak", "kill_switch_breach_last_at", degraded
+        )
+        if _ks_streak is None:
+            log.warning(
+                "kill-switch breach NOT counted (%s) - drawdown %.1f%% (equity $%.2f, HWM $%.2f, source=%s)",
+                "degraded read" if degraded else "inside the confirmation spacing window",
+                drawdown_pct * 100, account_equity, hwm, source,
+            )
+        elif _ks_streak >= _HALT_CONFIRM_TICKS:
             state["kill_switch_breach_streak"] = 0
+            state.pop("kill_switch_breach_last_at", None)
             state["kill_switch_active"] = True
             state["kill_switch_triggered_at"] = get_now().isoformat()
             result["kill_switch"] = True
@@ -4618,19 +4778,29 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
                 f"Equity: ${account_equity:,.2f} (source={source}). All positions will be closed."
             ))
             return result
-        log.warning(
-            "kill-switch breach %d/%d awaiting confirmation - drawdown %.1f%% (equity $%.2f, HWM $%.2f, source=%s)",
-            _ks_streak, _HALT_CONFIRM_TICKS, drawdown_pct * 100, account_equity, hwm, source,
-        )
+        else:
+            log.warning(
+                "kill-switch breach %d/%d awaiting confirmation - drawdown %.1f%% (equity $%.2f, HWM $%.2f, source=%s)",
+                _ks_streak, _HALT_CONFIRM_TICKS, drawdown_pct * 100, account_equity, hwm, source,
+            )
     elif state.get("kill_switch_breach_streak"):
         state["kill_switch_breach_streak"] = 0
+        state.pop("kill_switch_breach_last_at", None)
         _streak_reset = True
 
     if daily_pnl_pct <= -daily_loss_limit and not state.get("daily_loss_halt"):
-        _dh_streak = int(state.get("daily_halt_breach_streak") or 0) + 1
-        state["daily_halt_breach_streak"] = _dh_streak
-        if _dh_streak >= _HALT_CONFIRM_TICKS:
+        _dh_streak = _count_breach_tick(
+            state, "daily_halt_breach_streak", "daily_halt_breach_last_at", degraded
+        )
+        if _dh_streak is None:
+            log.warning(
+                "daily-loss breach NOT counted (%s) - PnL %.1f%% (start $%.2f, now $%.2f)",
+                "degraded read" if degraded else "inside the confirmation spacing window",
+                daily_pnl_pct * 100, start_eq, account_equity,
+            )
+        elif _dh_streak >= _HALT_CONFIRM_TICKS:
             state["daily_halt_breach_streak"] = 0
+            state.pop("daily_halt_breach_last_at", None)
             state["daily_loss_halt"] = True
             state["daily_loss_halt_date"] = today
             result["daily_halt"] = True
@@ -4646,12 +4816,14 @@ def _update_equity_locked(account_equity: float, source: str, *, rebaseline: boo
                 f"now ${account_equity:,.2f}). No new positions until tomorrow."
             ))
             return result
-        log.warning(
-            "daily-loss breach %d/%d awaiting confirmation - PnL %.1f%% (start $%.2f, now $%.2f)",
-            _dh_streak, _HALT_CONFIRM_TICKS, daily_pnl_pct * 100, start_eq, account_equity,
-        )
+        else:
+            log.warning(
+                "daily-loss breach %d/%d awaiting confirmation - PnL %.1f%% (start $%.2f, now $%.2f)",
+                _dh_streak, _HALT_CONFIRM_TICKS, daily_pnl_pct * 100, start_eq, account_equity,
+            )
     elif state.get("daily_halt_breach_streak"):
         state["daily_halt_breach_streak"] = 0
+        state.pop("daily_halt_breach_last_at", None)
         _streak_reset = True
 
     # HALT-STREAK-1: a PENDING breach streak is the one piece of this snapshot

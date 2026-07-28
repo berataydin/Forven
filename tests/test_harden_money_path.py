@@ -445,6 +445,14 @@ def _drop_best_effort_writes(monkeypatch, risk, sink: list[str], *, succeed: boo
 
 
 class TestHaltStreakSurvivesContention:
+    @pytest.fixture(autouse=True)
+    def _instant_confirms(self, monkeypatch):
+        """These tests fire rapid synthetic breach ticks; HALT-CONFIRM-2 spacing
+        and the EQ-DROP-1 exposure bound are covered in test_equity_anchors.py."""
+        import forven.exchange.risk as risk
+        monkeypatch.setattr(risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
+        monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: float("inf"))
+
     def test_kill_switch_latches_when_best_effort_writes_are_dropped(
         self, forven_db, monkeypatch
     ):

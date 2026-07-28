@@ -1043,19 +1043,24 @@ def _spot_token_lookup(info: HyperliquidInfoClient) -> dict[int, str]:
 
 
 def _extract_spot_usdc_balance(info: HyperliquidInfoClient, wallet: str) -> tuple[float, float]:
-    """Return (total_usdc, free_usdc) from spot wallet state."""
+    """Return (total_usdc, free_usdc) from spot wallet state.
+
+    EQ-ATOMIC-1: a transport failure or malformed payload RAISES instead of
+    reading as zero. Spot is a LEG of the spot+perp equity sum — a silent zero
+    here served a perp-only "equity" ($8.13 for a $490 book) during the
+    2026-07-28 429 storm, poisoned the book equity cache, and latched a false
+    −48% daily halt. A client without the spot endpoint is feature absence,
+    not a failed read — that still reads as zero.
+    """
     if not hasattr(info, "spot_user_state"):
         return 0.0, 0.0
-    try:
-        payload = info.spot_user_state(wallet)
-    except Exception:
-        return 0.0, 0.0
+    payload = info.spot_user_state(wallet)
     if not isinstance(payload, dict):
-        return 0.0, 0.0
+        raise ValueError(f"spot state for {wallet} returned {type(payload).__name__}, not a dict")
 
     balances = payload.get("balances")
     if not isinstance(balances, list):
-        return 0.0, 0.0
+        raise ValueError(f"spot state for {wallet} carries no balances list")
 
     token_lookup = _spot_token_lookup(info)
     accepted_symbols = {"USDC", "USDT", "USD"}
@@ -2322,13 +2327,15 @@ def get_account_value(
     # the held margin and showed a $19 wallet as $39. Forven never places spot
     # orders, so a hold from a real spot order (the other thing that could set
     # it) doesn't occur; if it ever did, excluding it understates equity — the
-    # conservative direction. Best-effort: a spot-read failure degrades to
-    # perp-only.
-    spot_free = 0.0
-    try:
-        _spot_total, spot_free = _extract_spot_usdc_balance(info, address)
-    except Exception:
-        pass
+    # conservative direction.
+    #
+    # EQ-ATOMIC-1: the spot leg is part of the equity SUM, so a failed spot
+    # read fails the WHOLE read — callers substitute last-known-good or skip
+    # the tick. It used to degrade to perp-only "best effort", which is
+    # indistinguishable from a real crash downstream: on 2026-07-28 a 429
+    # storm read a $490 book as $8.13 (perp margin only), poisoned the book
+    # cache, and latched a false −48% daily-loss halt.
+    _spot_total, spot_free = _extract_spot_usdc_balance(info, address)
 
     perp_value = 0.0 if perp_value is None else float(perp_value)
     perp_raw_usd = 0.0 if perp_raw_usd is None else float(perp_raw_usd)

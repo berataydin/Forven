@@ -15,6 +15,11 @@ Two incidents pin the formula from both sides:
 
 Hence: accountValue = perp accountValue + free spot (total - hold), consistent
 whether collateral is in spot or perp, flat or in a position.
+
+3. EQ-ATOMIC-1 (2026-07-28 false daily halt) — the spot leg silently read as
+   zero during a 429 storm ("best-effort degrade to perp-only"), so a $490
+   book reported $8.13, poisoned the book equity cache, and latched a false
+   −48% daily-loss halt. A failed spot read must now fail the WHOLE read.
 """
 
 import pytest
@@ -84,10 +89,53 @@ def test_spot_hold_backing_perp_margin_not_double_counted(monkeypatch):
     assert acc["withdrawable"] == pytest.approx(0.15)
 
 
-def test_spot_read_failure_degrades_to_perp(monkeypatch):
+def test_spot_read_failure_fails_the_whole_read(monkeypatch):
+    """EQ-ATOMIC-1: a perp-only partial is indistinguishable from a real crash
+    downstream — the read RAISES so callers substitute last-known-good or skip
+    the tick, instead of serving $13.14 for a $329 wallet."""
     _patch(monkeypatch, perp_account_value="13.14", spot_total=316.0, spot_free=316.0)
     def _boom(info, addr):
         raise RuntimeError("spot read failed")
     monkeypatch.setattr(hl, "_extract_spot_usdc_balance", _boom)
-    acc = hl.get_account_value(testnet=True, account_address="0xLONG")
-    assert acc["accountValue"] == pytest.approx(13.14)  # best-effort: perp-only
+    with pytest.raises(RuntimeError, match="spot read failed"):
+        hl.get_account_value(testnet=True, account_address="0xLONG")
+
+
+def test_extract_spot_balance_raises_on_transport_and_shape_failures():
+    """EQ-ATOMIC-1: transport errors propagate; a 'null'/shapeless payload (what
+    a rate-limited CloudFront edge actually serves) is a FAILED read, not $0."""
+    class _RaisingInfo:
+        def spot_user_state(self, wallet):
+            raise ConnectionError("429 Too Many Requests")
+
+    with pytest.raises(ConnectionError):
+        hl._extract_spot_usdc_balance(_RaisingInfo(), "0x1")
+
+    class _NullInfo:
+        def spot_user_state(self, wallet):
+            return None  # json 'null' body from the rate limiter
+
+    with pytest.raises(ValueError):
+        hl._extract_spot_usdc_balance(_NullInfo(), "0x1")
+
+    class _NoBalances:
+        def spot_user_state(self, wallet):
+            return {"unexpected": 1}
+
+    with pytest.raises(ValueError):
+        hl._extract_spot_usdc_balance(_NoBalances(), "0x1")
+
+
+def test_extract_spot_balance_tolerates_feature_absence_and_empty_wallets():
+    """No spot endpoint on the client = feature absence, and an empty balances
+    list = a genuinely empty wallet — both still read as zero, no raise."""
+    class _NoSpotEndpoint:
+        pass
+
+    assert hl._extract_spot_usdc_balance(_NoSpotEndpoint(), "0x1") == (0.0, 0.0)
+
+    class _EmptyWallet:
+        def spot_user_state(self, wallet):
+            return {"balances": []}
+
+    assert hl._extract_spot_usdc_balance(_EmptyWallet(), "0x1") == (0.0, 0.0)

@@ -19,6 +19,21 @@ from forven.exchange.risk import (
 )
 
 
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _instant_halt_confirms(monkeypatch):
+    """These tests drive halt latches with INSTANT synthetic ticks against an
+    empty trades table. Neutralize the two orthogonal sample guards so latch
+    semantics stay the subject under test — HALT-CONFIRM-2 spacing and the
+    EQ-DROP-1 exposure bound have their own suite in test_equity_anchors.py."""
+    from forven.exchange import risk as _risk
+    monkeypatch.setattr(_risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
+    monkeypatch.setattr(_risk, "_open_live_notional_usd", lambda: float("inf"))
+
+
+
 def _risk_state() -> dict:
     from forven.sim.clock import sim_kv_key
 
