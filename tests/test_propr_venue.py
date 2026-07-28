@@ -417,8 +417,8 @@ def test_mirror_opens_fresh_roster_trade(mirror_env):
     assert order["asset"] == "BTC" and order["side"] == "buy"
     assert order["stop_loss_price"] == 48_000.0
     assert order["idempotency_key"] == "propr-mirror:T-m1"
-    # Sizing: 1% of $5,000 equity over a $2,000 stop distance = 0.025 BTC.
-    assert order["size"] == pytest.approx(0.025)
+    # Sizing: MIRROR_RISK_PCT (2%) of $5,000 equity over a $2,000 stop = 0.05 BTC.
+    assert order["size"] == pytest.approx(0.05)
     assert pm.get_state()["T-m1"]["status"] == "open"
 
 
@@ -453,7 +453,7 @@ def test_mirror_closes_when_source_closes(mirror_env):
     close = calls["closes"][0]
     # Closing a mirrored long = reduce-only SELL of the mirrored quantity.
     assert close["side"] == "sell"
-    assert close["size"] == pytest.approx(0.025)
+    assert close["size"] == pytest.approx(0.05)
     assert pm.get_state()["T-m2"]["status"] == "closed"
 
 
@@ -663,9 +663,9 @@ def test_halted_tick_blocks_opens_but_still_closes(mirror_env):
 
 
 def test_open_risk_at_stops_consumes_the_daily_budget(mirror_env):
-    """Three concurrent 1%-risk opens would stack $150 of stop risk — exactly
-    the venue's daily cap. The budget check defers the third at the $120 halt
-    line instead of letting simultaneous stop-outs fail the challenge."""
+    """Three concurrent 2%-risk opens would stack $300 of stop risk — double
+    the venue's daily cap. The budget check defers everything past the $120
+    halt line instead of letting simultaneous stop-outs fail the challenge."""
     pm, calls = mirror_env
     for i in range(3):
         _insert_trade(f"T-b{i}", "S-M1", asset=["BTC", "ETH", "SOL"][i])
@@ -675,12 +675,12 @@ def test_open_risk_at_stops_consumes_the_daily_budget(mirror_env):
     import unittest.mock as mock
     with mock.patch.object(propr, "get_all_mids", lambda testnet=True: mids):
         summary = pm.mirror_tick()
-    # $50 risk each against the $120 budget: two open, the third defers.
-    assert summary["opened"] == 2
-    assert summary.get("deferred") == 1
-    assert len(calls["orders"]) == 2
+    # $100 risk each against the $120 budget: one opens, the other two defer.
+    assert summary["opened"] == 1
+    assert summary.get("deferred") == 2
+    assert len(calls["orders"]) == 1
     deferred = [e for e in pm.get_state().values() if e.get("status") == "pending"]
-    assert len(deferred) == 1 and "deferred" in deferred[0]["reason"]
+    assert len(deferred) == 2 and all("deferred" in e["reason"] for e in deferred)
 
 
 def test_day_rollover_resets_the_daily_anchor(mirror_env):

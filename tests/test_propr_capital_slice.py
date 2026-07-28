@@ -33,13 +33,13 @@ def test_six_stopouts_no_longer_breach_the_challenge_rules(forven_db, monkeypatc
     equity, daily_limit, drawdown_allowance = 5000.0, 150.0, 300.0
 
     sl, _ = pm.mirror_equity_slice(equity)
-    size, _ = pm._size_mirror_order("BTC", MID, STOP, 0.01, 2.0, sl)
+    size, _ = pm._size_mirror_order("BTC", MID, STOP, 2.0, sl)
     worst_day = size * MID * 0.03 * 6
 
     assert worst_day < daily_limit, f"${worst_day:.2f} breaches the ${daily_limit} daily limit"
     assert worst_day < drawdown_allowance
     # And the pre-fix behaviour did breach, so this test is not vacuous.
-    old, _ = pm._size_mirror_order("BTC", MID, STOP, 0.01, 2.0, equity)
+    old, _ = pm._size_mirror_order("BTC", MID, STOP, 2.0, equity)
     assert old * MID * 0.03 * 6 > daily_limit
 
 
@@ -49,16 +49,16 @@ def test_worst_case_risk_is_capped_regardless_of_roster_size(forven_db, monkeypa
     for n in (1, 3, 6, 25):
         monkeypatch.setattr(pm, "mirror_roster", lambda n=n: {f"S{i}": "t" for i in range(n)})
         sl, _ = pm.mirror_equity_slice(equity)
-        size, _ = pm._size_mirror_order("BTC", MID, STOP, 0.01, 2.0, sl)
+        size, _ = pm._size_mirror_order("BTC", MID, STOP, 2.0, sl)
         total = size * MID * 0.03 * n
-        assert total == pytest.approx(equity * 0.01, rel=1e-6), f"broke at roster={n}"
+        assert total == pytest.approx(equity * pm.MIRROR_RISK_PCT, rel=1e-6), f"broke at roster={n}"
 
 
 def test_slice_only_ever_reduces_position_size(forven_db, monkeypatch):
     monkeypatch.setattr(pm, "mirror_roster", lambda: {f"S{i}": "t" for i in range(6)})
     sl, _ = pm.mirror_equity_slice(5000.0)
-    sliced, _ = pm._size_mirror_order("BTC", MID, STOP, 0.01, 2.0, sl)
-    full, _ = pm._size_mirror_order("BTC", MID, STOP, 0.01, 2.0, 5000.0)
+    sliced, _ = pm._size_mirror_order("BTC", MID, STOP, 2.0, sl)
+    full, _ = pm._size_mirror_order("BTC", MID, STOP, 2.0, 5000.0)
     assert sliced < full
 
 

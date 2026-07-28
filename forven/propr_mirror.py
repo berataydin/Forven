@@ -15,8 +15,9 @@ FORVEN_ALLOW_PROPR_LIVE is required).
 Semantics:
 * OPEN mirror — a roster strategy's paper/live trade opens => place a Propr
   market entry with the trade's stop/TP as a bracket. Sizing is independent of
-  the source: risk_pct (capped) of the CHALLENGE account's equity at the
-  trade's stop distance, notional-capped inside the venue's leverage room.
+  the source: a fixed MIRROR_RISK_PCT of the member's slice of the CHALLENGE
+  account at the trade's stop distance, notional-capped inside the venue's
+  leverage room.
   Entries are skipped (recorded, not retried) when they pre-date the strategy
   joining the roster, are older than the freshness window (a stale entry is a
   different trade than the strategy took), or price already crossed the stop.
@@ -93,9 +94,13 @@ DRAWDOWN_HALT_FRACTION = 0.8
 _FALLBACK_DAILY_LOSS_PCT = 3.0
 _FALLBACK_DRAWDOWN_PCT = 6.0
 
-# Risk defaults — independent of the source account's sizing.
-DEFAULT_RISK_PCT = 0.01
-MAX_RISK_PCT = 0.02
+# The mirror's OWN per-trade risk on the member's slice — deliberately NOT
+# inherited from the source trade's risk_pct: the challenge account has its own
+# goal (pass the phase) and its own kill rules, so aggression is set HERE. At
+# 2% of an ~$833 slice, six concurrent stop-outs total ~$100 — inside the $120
+# daily halt line — and the PROPR-3 risk budget defers anything that would
+# stack past it.
+MIRROR_RISK_PCT = 0.02
 # Notional headroom inside the venue's leverage caps (5x BTC/ETH, 2x rest).
 _NOTIONAL_LEVERAGE_HEADROOM = {"BTC": 4.5, "ETH": 4.5}
 _DEFAULT_NOTIONAL_HEADROOM = 1.9
@@ -511,14 +516,14 @@ def mirror_equity_slice(equity: float) -> tuple[float, dict]:
     with a 6-strategy roster that is not a theoretical over-allocation, it is a
     challenge-ending one:
 
-        per-trade risk  = 5000 * 1%      = $50
-        six stop-outs   = $300           = 2x the $150 daily-loss limit,
-                                           and the ENTIRE $300 drawdown allowance
+        per-trade risk  = 5000 * 2%      = $100
+        six stop-outs   = $600           = 4x the $150 daily-loss limit,
+                                           and 2x the $300 drawdown allowance
 
     i.e. one bad session inside the rules of the game ends the attempt. Dividing
-    first makes six simultaneous stop-outs $50 total — 33% of the daily limit —
-    and keeps worst-case exposure at MAX_RISK_PCT of the challenge no matter how
-    large the roster grows.
+    first makes six simultaneous stop-outs $100 total — 67% of the daily limit —
+    and keeps worst-case exposure at MIRROR_RISK_PCT of the challenge no matter
+    how large the roster grows.
 
     Returns (slice_usd, meta). Falls back to the FULL equity only when the roster
     cannot be read, which is the conservative direction here in the sense that it
@@ -535,18 +540,17 @@ def mirror_equity_slice(equity: float) -> tuple[float, dict]:
 
 
 def _size_mirror_order(
-    asset: str, mid: float, stop_price: float, risk_pct: float | None,
+    asset: str, mid: float, stop_price: float,
     leverage: float | None, equity: float,
 ) -> tuple[float, str | None]:
-    """Independent Propr sizing: risk fraction of this member's SLICE of challenge
-    equity at the stop distance, notional-capped inside the venue's leverage room.
-    Returns (size, skip_reason).
+    """Independent Propr sizing: MIRROR_RISK_PCT of this member's SLICE of
+    challenge equity at the stop distance, notional-capped inside the venue's
+    leverage room. Returns (size, skip_reason).
 
     ``equity`` is the member's slice (see mirror_equity_slice), not the account —
     the notional headroom below is therefore also per-slice, so N members cannot
     collectively exceed the challenge balance."""
-    risk = float(risk_pct) if risk_pct else DEFAULT_RISK_PCT
-    risk = min(max(risk, 0.0), MAX_RISK_PCT) or DEFAULT_RISK_PCT
+    risk = MIRROR_RISK_PCT
     stop_dist = abs(mid - stop_price)
     if stop_dist <= 0:
         return 0.0, "zero stop distance"
@@ -629,7 +633,7 @@ def _mirror_open(
     slice_usd, slice_meta = mirror_equity_slice(equity)
     entry["capital_slice"] = slice_meta
     size, skip_reason = _size_mirror_order(
-        asset, mid, stop_price, row.get("risk_pct"), row.get("leverage"), slice_usd
+        asset, mid, stop_price, row.get("leverage"), slice_usd
     )
     if skip_reason or size <= 0:
         entry.update({"status": "skipped", "reason": skip_reason or "size resolved to zero"})
