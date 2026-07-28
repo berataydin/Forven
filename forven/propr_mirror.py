@@ -99,8 +99,30 @@ _FALLBACK_DRAWDOWN_PCT = 6.0
 # goal (pass the phase) and its own kill rules, so aggression is set HERE. At
 # 2% of an ~$833 slice, six concurrent stop-outs total ~$100 — inside the $120
 # daily halt line — and the PROPR-3 risk budget defers anything that would
-# stack past it.
+# stack past it. MIRROR_RISK_PCT is the DEFAULT; the operator tunes the live
+# value from the Settings page (MIRROR_RISK_SETTING_KEY, stored as whole
+# percent like every other *_pct settings knob).
 MIRROR_RISK_PCT = 0.02
+MIRROR_RISK_SETTING_KEY = "propr_mirror_risk_pct"
+_MIRROR_RISK_MAX_PCT = 10.0
+
+
+def mirror_risk_fraction(settings: dict | None = None) -> float:
+    """The per-trade risk FRACTION the mirror sizes with.
+
+    Reads the operator's whole-percent setting (2 => 2%); anything unset,
+    non-numeric, or non-positive falls back to MIRROR_RISK_PCT, and the value
+    is capped at 10% — past that a single stop-out can breach the venue's
+    daily rules on its own, which no slice can save.
+    """
+    s = settings if isinstance(settings, dict) else _settings()
+    try:
+        pct = float(s.get(MIRROR_RISK_SETTING_KEY))
+    except (TypeError, ValueError):
+        return MIRROR_RISK_PCT
+    if not (pct > 0):  # also catches NaN, which fails every comparison
+        return MIRROR_RISK_PCT
+    return min(pct, _MIRROR_RISK_MAX_PCT) / 100.0
 # Notional headroom inside the venue's leverage caps (5x BTC/ETH, 2x rest).
 _NOTIONAL_LEVERAGE_HEADROOM = {"BTC": 4.5, "ETH": 4.5}
 _DEFAULT_NOTIONAL_HEADROOM = 1.9
@@ -543,14 +565,15 @@ def _size_mirror_order(
     asset: str, mid: float, stop_price: float,
     leverage: float | None, equity: float,
 ) -> tuple[float, str | None]:
-    """Independent Propr sizing: MIRROR_RISK_PCT of this member's SLICE of
-    challenge equity at the stop distance, notional-capped inside the venue's
-    leverage room. Returns (size, skip_reason).
+    """Independent Propr sizing: the operator's mirror risk (see
+    mirror_risk_fraction) of this member's SLICE of challenge equity at the
+    stop distance, notional-capped inside the venue's leverage room.
+    Returns (size, skip_reason).
 
     ``equity`` is the member's slice (see mirror_equity_slice), not the account —
     the notional headroom below is therefore also per-slice, so N members cannot
     collectively exceed the challenge balance."""
-    risk = MIRROR_RISK_PCT
+    risk = mirror_risk_fraction()
     stop_dist = abs(mid - stop_price)
     if stop_dist <= 0:
         return 0.0, "zero stop distance"

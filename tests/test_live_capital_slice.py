@@ -135,6 +135,22 @@ def test_book_sizing_base_does_not_double_count_a_shared_address(forven_db, monk
     assert scanner._book_sizing_equity("long") == pytest.approx(490.5)
 
 
+def test_book_sizing_base_toggle_reverts_to_routed_book_only(forven_db, monkeypatch):
+    """The Settings-page escape hatch: live_slice_combined_books=false restores
+    the pre-SLICE-BASE-1 routed-book-only base."""
+    from forven.exchange import books
+
+    scanner = _patch_books(
+        monkeypatch,
+        {"long": "0xlong", "short": "0xshort"},
+        {"0xlong": 508.7, "0xshort": 490.5},
+    )
+    monkeypatch.setattr(books, "_settings", lambda s=None: {"live_slice_combined_books": False})
+    assert scanner._book_sizing_equity("short") == pytest.approx(490.5)
+    monkeypatch.setattr(books, "_settings", lambda s=None: {"live_slice_combined_books": True})
+    assert scanner._book_sizing_equity("short") == pytest.approx(999.2)
+
+
 # --------------------------------------------------------------------------- #
 # What the slice does to sizing — the actual defect
 # --------------------------------------------------------------------------- #

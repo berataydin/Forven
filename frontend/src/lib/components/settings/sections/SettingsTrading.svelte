@@ -20,9 +20,21 @@
 	const AREA = 'trading' as const;
 
 	const allSubs = SETTINGS_SUBSECTIONS.filter((s) => s.area === AREA);
-	$: subs = variant === 'wizard' && visibleSubsections
+	// The Propr mirror group renders only while the Propr integration is on —
+	// the same gate as the sidebar's /propr link.
+	let proprEnabled = false;
+	onMount(async () => {
+		try {
+			const { getProprEnabled } = await import('$lib/api/propr');
+			proprEnabled = await getProprEnabled();
+		} catch {
+			proprEnabled = false;
+		}
+	});
+	$: subs = (variant === 'wizard' && visibleSubsections
 		? allSubs.filter((s) => visibleSubsections!.includes(s.id))
-		: allSubs;
+		: allSubs
+	).filter((s) => s.id !== 'trading-propr-mirror' || proprEnabled);
 	const areaEntries = SETTINGS_MANIFEST.filter((e) => e.area === AREA);
 	$: entriesBySub = Object.fromEntries(
 		subs.map((s) => [s.id, areaEntries.filter((e) => e.subsection === s.id)]),

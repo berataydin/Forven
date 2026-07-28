@@ -85,6 +85,35 @@ def test_empty_roster_floors_at_one(forven_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# MIRROR-RISK-1: the operator-tunable mirror risk (Settings page knob)
+# ---------------------------------------------------------------------------
+
+def test_mirror_risk_defaults_to_the_constant(forven_db):
+    assert pm.mirror_risk_fraction({}) == pytest.approx(pm.MIRROR_RISK_PCT)
+
+
+def test_mirror_risk_reads_the_whole_percent_setting(forven_db):
+    assert pm.mirror_risk_fraction({pm.MIRROR_RISK_SETTING_KEY: 4}) == pytest.approx(0.04)
+    assert pm.mirror_risk_fraction({pm.MIRROR_RISK_SETTING_KEY: "1.5"}) == pytest.approx(0.015)
+
+
+def test_mirror_risk_rejects_garbage_and_caps_at_ten_percent(forven_db):
+    for bad in (None, "", "nan", float("nan"), 0, -3):
+        assert pm.mirror_risk_fraction({pm.MIRROR_RISK_SETTING_KEY: bad}) == pytest.approx(
+            pm.MIRROR_RISK_PCT
+        ), f"{bad!r} must fall back to the default"
+    assert pm.mirror_risk_fraction({pm.MIRROR_RISK_SETTING_KEY: 50}) == pytest.approx(0.10)
+
+
+def test_sizing_honors_the_tuned_mirror_risk(forven_db, monkeypatch):
+    """The knob must reach the order, not just the reader."""
+    monkeypatch.setattr(pm, "mirror_risk_fraction", lambda settings=None: 0.04)
+    size, _ = pm._size_mirror_order("BTC", MID, STOP, 2.0, 1000.0)
+    # 4% of $1,000 over a $3 stop distance.
+    assert size == pytest.approx(1000.0 * 0.04 / 3.0)
+
+
+# ---------------------------------------------------------------------------
 # PROPR-ORDER-SHAPE — the request body, pinned against the LIVE API's behaviour
 # ---------------------------------------------------------------------------
 

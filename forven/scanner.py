@@ -657,6 +657,14 @@ def _book_sizing_equity(open_book: str) -> float | None:
     eq = _book_account_equity(addr)
     if not eq or eq <= 0:
         return None
+    # Settings-page escape hatch: the operator can revert to routed-book-only
+    # slicing (the pre-SLICE-BASE-1 behaviour, half-size slices).
+    try:
+        combined = bool(books._settings().get("live_slice_combined_books", True))
+    except Exception:  # noqa: BLE001 — an unreadable toggle keeps the default
+        combined = True
+    if not combined:
+        return eq
     other = "short" if str(open_book).strip().lower() == "long" else "long"
     try:
         other_addr = books.book_address(other)

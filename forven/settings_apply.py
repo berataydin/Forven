@@ -88,13 +88,14 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "hyperliquid_long_book_address": "",
     "hyperliquid_short_book_address": "",
     "hyperliquid_use_cross_margin": False,
+    # SLICE-BASE-1: size live opens off the combined long+short pool (a strategy
+    # deploys one direction at a time). Off = routed-book-only (half slices).
+    "live_slice_combined_books": True,
+    # Propr mirror per-trade risk, whole percent of the member's slice.
+    "propr_mirror_risk_pct": 2,
     "liq_distance_warn_pct": 15,
     "liq_distance_critical_pct": 7,
     "cooldown_after_loss_hours": 0,
-    "strategy_name": "Momentum Breakout",
-    "strategy_symbol": "BTC/USDT",
-    "strategy_timeframe": "1h",
-    "strategy_parameters": {},
     "agent_model_keys": _DEFAULT_AGENT_MODEL_KEYS,
     "backup_ai_provider": "none",
     "backup_ai_model": "",
@@ -380,7 +381,6 @@ _DEFAULT_PIPELINE_SETTINGS = {
 def _default_settings_payload() -> dict:
     payload = dict(_DEFAULT_SETTINGS_PAYLOAD)
     payload["updated_at"] = _now()
-    payload["strategy_parameters"] = {}
     payload["research_settings"] = _default_research_settings_payload()
     payload["data_engine_settings"] = _default_data_engine_settings_payload()
     return payload
@@ -666,7 +666,9 @@ _SETTINGS_SECTION_KNOWN_KEYS: dict[str, frozenset[str]] = {
         # direction books + margin mode
         "live_books_enabled", "hyperliquid_long_book_address",
         "hyperliquid_short_book_address", "hyperliquid_use_cross_margin",
-        "live_equity_include_master",
+        "live_equity_include_master", "live_slice_combined_books",
+        # Propr challenge mirror (page group hidden unless propr is enabled)
+        "propr_mirror_risk_pct",
         # liquidation proximity alerts
         "liq_distance_warn_pct", "liq_distance_critical_pct",
         # PORT-1 / SIZE-CAP-1 / BOOK-BUDGET-1 / CORR-1 live portfolio budget
@@ -762,6 +764,9 @@ _SETTINGS_SECTION_NUMERIC_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
         "live_max_price_impact_bps": (0.0001, 10000.0),
         "regime_min_confidence": (0.0, 1.0),
         "regime_gate_min_confidence": (0.0, 1.0),
+        # Whole percent of the member's challenge slice; the mirror caps its
+        # own read at 10% (mirror_risk_fraction), the rail matches.
+        "propr_mirror_risk_pct": (0.0001, 10.0),
     },
 }
 

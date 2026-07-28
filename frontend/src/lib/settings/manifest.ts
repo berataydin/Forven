@@ -106,6 +106,7 @@ export const SETTINGS_SUBSECTIONS: SettingsSubsection[] = [
   { id: 'trading-risk-position-sizing', area: 'trading', label: 'Position sizing', description: 'Max position size and max concurrent positions.' },
   { id: 'trading-risk-loss-limits', area: 'trading', label: 'Loss limits', description: 'Daily-loss, drawdown, and cooldown guardrails.', deepLinkTo: '/risk' },
   { id: 'trading-risk-regime-gating', area: 'trading', label: 'Regime gating', description: 'Strict/soft gating of strategies by detected market regime.', deepLinkTo: '/lab' },
+  { id: 'trading-propr-mirror', area: 'trading', label: 'Propr challenge mirror', description: 'Sizing for the strategy mirror on the Propr challenge account. Roster and enable/disable live on the Propr page; this section only appears while the Propr integration is enabled.', deepLinkTo: '/propr' },
   { id: 'trading-risk-advanced', area: 'trading', label: 'Risk advanced', description: 'Rarely-changed risk filter overrides.', advanced: true },
 
   // Portfolio — the layer above individual strategies (PORT-LAYER).
@@ -334,6 +335,19 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     description:
       'Hyperliquid sub-account address that holds LIVE short exposure. While blank, the system runs LONG ONLY — short signals are skipped with a warning until a short sub-account is configured (a fresh mainnet wallet may need $100k cumulative volume to create a 2nd sub-account).',
     usedBy: ['forven.exchange.books', 'forven.scanner'],
+  },
+  {
+    id: 'risk.live_slice_combined_books',
+    label: 'Slice live capital across BOTH books',
+    default: true,
+    type: 'toggle',
+    area: 'hyperliquid',
+    subsection: 'hl-direction-books',
+    backendSection: 'risk',
+    backendPath: 'live_slice_combined_books',
+    description:
+      'SLICE-BASE-1: each live strategy sizes off (long book + short book) / cohort size — a strategy deploys one direction at a time, so the whole pool is its working capital. OFF reverts to slicing only the routed book, halving every position. The routed book still fronts the margin either way.',
+    usedBy: ['forven.scanner'],
   },
   {
     id: 'risk.hyperliquid_use_cross_margin',
@@ -1064,6 +1078,24 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     usedBy: ['forven.regime'],
     deepLinkTo: '/risk',
     advanced: true,
+  },
+
+  // Propr challenge mirror (section hidden unless the Propr integration is
+  // enabled — SettingsTrading.svelte gates it on getProprEnabled()).
+  {
+    id: 'risk.propr_mirror_risk_pct',
+    label: 'Mirror risk per trade',
+    unit: '%',
+    default: 2,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-propr-mirror',
+    backendSection: 'risk',
+    backendPath: 'propr_mirror_risk_pct',
+    description:
+      'Loss-at-stop per mirrored trade, as a percent of the strategy’s equal slice of the challenge account. The mirror sizes independently of the source trade. Six concurrent stop-outs at 2% of a 6-strategy roster total ~4% of the account — inside a 3%/day challenge rule’s 80% halt line; the daily risk budget defers opens that would stack past it. Capped at 10%.',
+    usedBy: ['forven.propr_mirror'],
+    deepLinkTo: '/propr',
   },
 
   // Risk: advanced

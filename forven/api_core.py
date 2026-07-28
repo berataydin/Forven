@@ -1654,6 +1654,20 @@ def _apply_settings_section(section: str, payload: dict, actor: str = "ui") -> d
                 payload.get("live_equity_include_master"),
                 bool(updates.get("live_equity_include_master", False)),
             )
+        # SLICE-BASE-1: size live opens off the combined long+short pool
+        # (forven.scanner._book_sizing_equity). Off = routed-book-only slices.
+        if "live_slice_combined_books" in payload:
+            updates["live_slice_combined_books"] = _coerce_bool(
+                payload.get("live_slice_combined_books"),
+                bool(updates.get("live_slice_combined_books", True)),
+            )
+        # Propr mirror per-trade risk, whole percent of the member's slice
+        # (forven.propr_mirror.mirror_risk_fraction).
+        if "propr_mirror_risk_pct" in payload:
+            updates["propr_mirror_risk_pct"] = _coerce_float(
+                payload.get("propr_mirror_risk_pct"),
+                _coerce_float(updates.get("propr_mirror_risk_pct"), 2.0),
+            )
         # LIQ-1: order-time liquidity guard (forven.exchange.liquidity).
         if "live_liquidity_guard_enabled" in payload:
             updates["live_liquidity_guard_enabled"] = _coerce_bool(
@@ -1737,12 +1751,11 @@ def _apply_settings_section(section: str, payload: dict, actor: str = "ui") -> d
             )
 
     elif section == "strategy":
-        if "name" in payload:
-            updates["strategy_name"] = str(payload.get("name") or "").strip()
-        if "symbol" in payload:
-            updates["strategy_symbol"] = str(payload.get("symbol") or "").strip()
-        if "timeframe" in payload:
-            updates["strategy_timeframe"] = str(payload.get("timeframe") or "").strip()
+        # The legacy single-strategy fields (strategy_name / strategy_symbol /
+        # strategy_timeframe / strategy_parameters) were written here for years
+        # and read by NOTHING — strategies have lived in their own table since
+        # the container redesign. Removed 2026-07-28; only the self-healing
+        # toggle in this section is real.
         if "self_healing_enabled" in payload:
             updates["self_healing_enabled"] = _coerce_bool(payload.get("self_healing_enabled"), updates["self_healing_enabled"])
 
