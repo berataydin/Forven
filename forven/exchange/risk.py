@@ -1746,32 +1746,47 @@ def can_open(
                     # daemon tick (the flag is otherwise written only by the
                     # tick-driven update_equity).
                     #
+                    # Books ENABLED (M9-BOOKS-1): the daily baseline
+                    # (start_equity) is the book-AGGREGATE written by the
+                    # daemon's _book_aware_account_value, so the only valid
+                    # comparison is the daemon's last VALIDATED aggregate —
+                    # never the routed-account read fetched above (master OR
+                    # subaccount; comparing either would false-halt). The
+                    # aggregate basis is GLOBAL, so this runs for EVERY live
+                    # open regardless of which account the order routes to —
+                    # a configured book subaccount previously skipped the
+                    # recompute entirely (cross-review blocker on fbf45285).
+                    # No fresh same-basis aggregate => the daily rule CANNOT
+                    # be verified => refuse the open, the same fail-closed
+                    # policy as the margin check above.
                     # Books DISABLED: reuse acct_val just fetched — no extra
-                    # HTTP call, same basis as the daily baseline.
-                    # Books ENABLED (M9-BOOKS-1): acct_val here is MASTER-only
-                    # while the daily baseline (start_equity) is the
-                    # book-AGGREGATE written by the daemon's
-                    # _book_aware_account_value — comparing the two would fire
-                    # a false halt. Use the daemon's last VALIDATED aggregate
-                    # instead: same basis, moved by every ACCEPTED tick — so a
-                    # breaching read refuses opens as soon as it is accepted,
-                    # before the 3-tick latch confirms. Before this, the
-                    # recompute was skipped entirely with books on, and new
-                    # opens sailed through the whole unlatched window.
-                    # (account_address not in margin_kwargs already ensures
-                    # we're on the master wallet.)
+                    # HTTP call, same basis as the daily baseline (master
+                    # wallet only; account_address not in margin_kwargs
+                    # ensures that).
                     _books_on = False
                     try:
                         from forven.exchange import books as _books_mod
                         _books_on = _books_mod.books_enabled()
                     except Exception:
                         _books_on = False
-                    if "account_address" not in margin_kwargs:
+                    if _books_on:
+                        _agg_eq = _validated_books_equity()
+                        if _agg_eq is None:
+                            return False, 0.0, (
+                                "Cannot verify book-aggregate equity (missing, stale, or "
+                                "wrong-basis daemon reading) — refusing to open a new live "
+                                "position until a fresh aggregate tick arrives."
+                            )
                         try:
-                            _halt_eq = float(acct_val)
-                            if _books_on:
-                                _halt_eq = _last_validated_real_equity() or 0.0
-                            if _halt_eq > 0 and _recompute_daily_halt_from_equity(_halt_eq):
+                            if _recompute_daily_halt_from_equity(_agg_eq):
+                                return False, 0.0, (
+                                    "Daily loss limit reached — no new positions until tomorrow."
+                                )
+                        except Exception as _halt_exc:
+                            log.debug("Daily-halt open-path recompute failed: %s", _halt_exc)
+                    elif "account_address" not in margin_kwargs:
+                        try:
+                            if _recompute_daily_halt_from_equity(float(acct_val)):
                                 return False, 0.0, (
                                     "Daily loss limit reached — no new positions until tomorrow."
                                 )
@@ -4172,26 +4187,41 @@ def update_equity(
         )
 
 
-def _last_validated_real_equity() -> float | None:
-    """The last equity sample ACCEPTED by update_equity, provided it came from
-    a real-capital source — the book-AGGREGATE basis when books are on.
+# M9-BOOKS-1: the books-mode open path may only compare SAME-BASIS equity to
+# the aggregate daily baseline — and it must be fresh. A stale, missing, or
+# wrong-basis reading means the daily rule CANNOT be verified, and the caller
+# refuses the open outright (fail closed, the same policy as the margin
+# check) rather than silently standing down.
+_M9_BOOKS_EQUITY_SOURCES = {"books_only", "books_aggregate"}
+_M9_BOOKS_EQUITY_MAX_AGE_SECONDS = 300.0
 
-    The M9 open-path recompute uses this in books mode: the master-only read
-    fetched for the margin check cannot be compared to the aggregate daily
-    baseline (false-halt hazard, see the can_open gate comment), but the
-    daemon-written aggregate can — and an ACCEPTED breaching tick moves it
-    before the 3-tick latch confirms, so opens are refused from the first
-    accepted breaching read. Returns None when absent, non-positive, or
-    paper-sourced — callers stand down (the pre-fix behavior)."""
+
+def _validated_books_equity() -> float | None:
+    """The last equity sample ACCEPTED by update_equity, provided it is
+    books-basis (``books_only``/``books_aggregate``) and no older than
+    ``_M9_BOOKS_EQUITY_MAX_AGE_SECONDS``.
+
+    The M9 open-path recompute uses this in books mode: the routed-account
+    read fetched for the margin check cannot be compared to the aggregate
+    daily baseline (false-halt hazard, see the can_open gate comment), but
+    the daemon-written aggregate can — and an ACCEPTED breaching tick moves
+    it before the 3-tick latch confirms, so opens are refused from the first
+    accepted breaching read. Returns None when the reading is absent,
+    non-positive, wrong-basis, unstamped, or stale — the books-mode caller
+    treats None as \"cannot verify the daily rule\" and REFUSES the open."""
     try:
         with _RISK_STATE_LOCK:
             state = _get_risk_state()
-            src = state.get("equity_source")
+            src = str(state.get("equity_source") or "").strip().lower()
             eq = float(state.get("last_equity") or 0.0)
-        if eq > 0 and src is not None and _is_real_capital_equity_source(str(src)):
-            return eq
-        return None
-    except Exception:  # noqa: BLE001 — an unreadable state stands the check down, never blocks the open path
+            stamp = state.get("updated_at")
+        if eq <= 0 or src not in _M9_BOOKS_EQUITY_SOURCES or not stamp:
+            return None
+        age = (get_now() - datetime.fromisoformat(str(stamp))).total_seconds()
+        if age > _M9_BOOKS_EQUITY_MAX_AGE_SECONDS:
+            return None
+        return eq
+    except Exception:  # noqa: BLE001 — unreadable state = cannot verify; the books caller fails closed on None
         return None
 
 
@@ -4342,28 +4372,41 @@ _EQUITY_NOTABLE_MOVE_MULT = 2.0
 _EQUITY_DROP_EXPOSURE_MULT = 2.0
 _EQUITY_DROP_BUFFER_USD = 25.0
 _EQUITY_DROP_MIN_FRACTION = 0.10
-# EQ-DROP-2: the bound must also count live trades CLOSED recently. In a real
-# crash the explaining positions are stopped out or liquidated FIRST, so by the
-# time a delayed/429-storm read recovers, the loss's positions are no longer
-# `status='OPEN'` — an open-only bound then rejects the genuine drop as a
-# phantom and the daily halt / kill-switch can never latch (fail-closed forever,
-# the exact inverse of the 2026-07-28 incident this guard was built for).
+# EQ-DROP-2: the bound must also count live trades CLOSED since the last
+# ACCEPTED equity sample. In a real crash the explaining positions are stopped
+# out or liquidated FIRST, so by the time a delayed/429-storm read recovers,
+# the loss's positions are no longer `status='OPEN'` — an open-only bound then
+# rejects the genuine drop as a phantom and the daily halt / kill-switch can
+# never latch (fail-closed forever, the exact inverse of the 2026-07-28
+# incident this guard was built for). The cutoff is CAUSAL — the anchor's own
+# timestamp — because a close that predates the anchor is already reflected IN
+# the anchor and cannot explain a later delta; a wall-clock window let normal
+# turnover launder a phantom (cross-review blocker on fbf45285). The wall-clock
+# constant survives only as the fallback when no anchor stamp exists.
 _EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES = 30.0
 
 
-def _open_live_notional_usd() -> float | None:
-    """Total |notional| of OPEN live trades plus live trades CLOSED within the
-    last ``_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES``, or None when unreadable.
+def _open_live_notional_usd(anchor_at: str | None = None) -> float | None:
+    """Total |notional| of OPEN live trades plus live trades CLOSED after
+    ``anchor_at`` (the last ACCEPTED equity sample's ``updated_at`` stamp), or
+    None when unreadable.
 
-    EQ-DROP-1's plausibility bound. Recently-closed trades count because a
+    EQ-DROP-1's plausibility bound. Closes after the anchor count because a
     crash's positions close BEFORE a storm-delayed equity read arrives
-    (EQ-DROP-2); a phantom partial read has no such recent closes, so the
-    2026-07-28 rejection behavior is unchanged. On None the drop guard stands
-    down (an unreadable trades table must not suppress a genuine halt)."""
+    (EQ-DROP-2); closes BEFORE the anchor are excluded — their PnL is already
+    in the anchor, so counting them would let ordinary recent turnover explain
+    (and accept) a partial-wallet phantom. A phantom read has no post-anchor
+    closes, so the 2026-07-28 rejection behavior is unchanged. Without a
+    usable anchor stamp the cutoff falls back to a
+    ``_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES`` wall-clock window. On None
+    the drop guard stands down (an unreadable trades table must not suppress
+    a genuine halt)."""
     try:
-        cutoff = (
-            get_now() - timedelta(minutes=_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES)
-        ).isoformat()
+        cutoff = str(anchor_at or "").strip()
+        if not cutoff:
+            cutoff = (
+                get_now() - timedelta(minutes=_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES)
+            ).isoformat()
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT entry_price, fill_entry_price, size FROM trades "
@@ -4444,7 +4487,9 @@ def _validate_equity_sample(
     ):
         drop = last - eq
         if drop >= last * _EQUITY_DROP_MIN_FRACTION:
-            notional = _open_live_notional_usd()
+            # `updated_at` is written on every ACCEPTED tick alongside
+            # last_equity — it is the anchor's own timestamp (EQ-DROP-2).
+            notional = _open_live_notional_usd(anchor_at=state.get("updated_at"))
             if notional is not None:
                 allowance = notional * _EQUITY_DROP_EXPOSURE_MULT + _EQUITY_DROP_BUFFER_USD
                 if drop > allowance:

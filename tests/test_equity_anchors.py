@@ -38,7 +38,7 @@ def test_jump_guard_never_self_heals(forven_db):
 
 def test_jump_guard_still_accepts_losses_and_normal_moves(forven_db, monkeypatch):
     # EQ-DROP-1: a 50% loss flows through when open exposure can explain it.
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 200.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 200.0)
     state = {"last_equity": 600.0}
     ok, _ = risk._validate_equity_sample(300.0, state)  # $300 drop <= 2x$200 + $25
     assert ok
@@ -110,7 +110,7 @@ def test_same_basis_drop_without_drain_flag_still_draws_down(forven_db, monkeypa
     Open exposure covers the drop (EQ-DROP-1's bound is about IMPOSSIBLE losses,
     not real ones) and the confirmation spacing is zeroed so three back-to-back
     test ticks still count as independent (HALT-CONFIRM-2 has its own tests)."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 200.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 200.0)
     monkeypatch.setattr(risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
     _seed_live_state(675.0, 675.0, source="books_only")
     result = risk.update_equity(359.0, "books_only")  # rebaseline defaults False
@@ -349,7 +349,7 @@ def test_drop_guard_rejects_the_2026_07_28_phantom(forven_db, monkeypatch):
     """Incident replay: a 429 storm served one book's perp margin without its
     spot leg — $999.28 -> $516.82 — while total open live notional was ~$16.
     The sample must be REJECTED with anchors frozen: no halt, no drawdown."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 16.3)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 16.3)
     _seed_live_state(999.45, 999.28, source="books_only")
     _seed_daily(999.28)
     for _ in range(3):
@@ -365,7 +365,7 @@ def test_drop_guard_rejects_the_2026_07_28_phantom(forven_db, monkeypatch):
 def test_drop_guard_alerts_operator_after_persistent_rejects(forven_db, monkeypatch):
     from forven.notifications import list_notifications, update_notification_preferences
     update_notification_preferences({"discord_mode": "shadow"})
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 0.0)
     state = {"last_equity": 999.0, "equity_source": "books_only"}
     for _ in range(risk._EQUITY_JUMP_ALERT_AFTER_REJECTS):
         ok, reason = risk._validate_equity_sample(500.0, state, source="books_only")
@@ -375,11 +375,11 @@ def test_drop_guard_alerts_operator_after_persistent_rejects(forven_db, monkeypa
 
 
 def test_drop_guard_ignores_small_drops_and_covered_losses(forven_db, monkeypatch):
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 0.0)
     state = {"last_equity": 1000.0, "equity_source": "books_only"}
     ok, _ = risk._validate_equity_sample(950.0, state, source="books_only")
     assert ok, "a 5% drop is inside normal variance — never second-guessed"
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 400.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 400.0)
     state = {"last_equity": 1000.0, "equity_source": "books_only"}
     ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
     assert ok, "a 60% drop covered by open exposure is a real loss — flows through"
@@ -388,14 +388,14 @@ def test_drop_guard_ignores_small_drops_and_covered_losses(forven_db, monkeypatc
 def test_drop_guard_stands_down_when_notional_unreadable(forven_db, monkeypatch):
     """An unreadable trades table must not suppress a genuine halt — the guard
     accepts the sample and the normal drawdown machinery judges it."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: None)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: None)
     state = {"last_equity": 1000.0, "equity_source": "books_only"}
     ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
     assert ok
 
 
 def test_drop_guard_skips_basis_change_and_rebaseline_ticks(forven_db, monkeypatch):
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 0.0)
     state = {"last_equity": 1000.0, "equity_source": "books_aggregate"}
     ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
     assert ok, "a basis change is re-anchored by its own path, not judged as a drop"
@@ -408,7 +408,7 @@ def test_degraded_ticks_never_confirm_a_halt(forven_db, monkeypatch):
     """HALT-CONFIRM-2: a tick built on substituted/failed wallet reads can breach
     all it wants — it cannot advance the confirmation streak, so a venue outage
     can never confirm its own phantom."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 500.0)
     kv_set("kill_switch_enabled", False)
     _seed_live_state(675.0, 675.0, source="books_only")
     _seed_daily(675.0)
@@ -425,7 +425,7 @@ def test_confirmations_require_spacing_between_ticks(forven_db, monkeypatch):
     and the halt latches on the third INDEPENDENT one."""
     from datetime import timedelta
 
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 500.0)
     kv_set("kill_switch_enabled", False)
     _seed_live_state(675.0, 675.0, source="books_only")
     _seed_daily(675.0)
@@ -465,22 +465,44 @@ def _seed_closed_live_trade(trade_id, notional, closed_ago_sql="-5 minutes"):
         )
 
 
-def test_drop_bound_counts_recently_closed_live_trades(forven_db):
-    """EQ-DROP-2: a crash's positions are stopped out BEFORE a storm-delayed
-    equity read recovers — the bound must count them or the genuine drop is
-    rejected forever and the daily halt / kill-switch never latch."""
-    _seed_closed_live_trade("c-recent", 500.0, "-5 minutes")
-    assert risk._open_live_notional_usd() == pytest.approx(500.0)
+def _minutes_ago(minutes):
+    from datetime import timedelta
 
-    state = {"last_equity": 1000.0, "equity_source": "books_only"}
+    return (risk.get_now() - timedelta(minutes=minutes)).isoformat()
+
+
+def test_drop_bound_counts_closes_after_the_anchor(forven_db):
+    """EQ-DROP-2: a crash's positions are stopped out AFTER the last accepted
+    anchor and BEFORE the storm-delayed read recovers — the bound must count
+    them or the genuine drop is rejected forever and the halt never latches."""
+    _seed_closed_live_trade("c-post-anchor", 500.0, "-5 minutes")
+    anchor = _minutes_ago(10)  # anchored BEFORE the close — its loss is unexplained
+    assert risk._open_live_notional_usd(anchor_at=anchor) == pytest.approx(500.0)
+
+    state = {"last_equity": 1000.0, "equity_source": "books_only", "updated_at": anchor}
     ok, _ = risk._validate_equity_sample(550.0, state, source="books_only")
-    assert ok, "a 45% drop explained by a just-closed 500-notional trade is a REAL loss"
+    assert ok, "a 45% drop explained by a post-anchor 500-notional close is a REAL loss"
 
 
-def test_drop_bound_ignores_stale_closes_and_still_rejects_phantoms(forven_db):
-    """The window is bounded: an hours-old close explains nothing, and the
-    2026-07-28 phantom class (big drop, no open exposure, no recent closes)
-    stays rejected — through the real DB query, not a monkeypatch."""
+def test_drop_bound_excludes_closes_already_reflected_in_anchor(forven_db):
+    """Cross-review blocker on fbf45285: closes that PRE-date the anchor are
+    already in the anchor's value and cannot explain a later delta — ordinary
+    turnover must not launder a partial-wallet phantom."""
+    for i in range(3):
+        _seed_closed_live_trade(f"c-pre-anchor-{i}", 250.0, "-5 minutes")
+    anchor = _minutes_ago(2)  # anchored AFTER the closes — their PnL is inside it
+    assert risk._open_live_notional_usd(anchor_at=anchor) == pytest.approx(0.0)
+
+    state = {"last_equity": 1000.0, "equity_source": "books_only", "updated_at": anchor}
+    ok, reason = risk._validate_equity_sample(500.0, state, source="books_only")
+    assert not ok and "suspect partial read" in reason
+
+
+def test_drop_bound_falls_back_to_window_without_anchor_stamp(forven_db):
+    """No usable anchor stamp -> bounded wall-clock fallback: an hours-old
+    close explains nothing, and the 2026-07-28 phantom class (big drop, no
+    open exposure, no recent closes) stays rejected — through the real DB
+    query, not a monkeypatch."""
     _seed_closed_live_trade("c-stale", 500.0, "-2 hours")
     assert risk._open_live_notional_usd() == pytest.approx(0.0)
 
@@ -489,47 +511,101 @@ def test_drop_bound_ignores_stale_closes_and_still_rejects_phantoms(forven_db):
     assert not ok and "suspect partial read" in reason
 
 
-def test_m9_books_open_path_refuses_on_validated_aggregate(forven_db, monkeypatch):
-    """M9-BOOKS-1: with books enabled, the open-path daily-halt recompute uses
-    the daemon's last VALIDATED aggregate — a healthy master-only read must not
-    hide a crashed aggregate (the pre-fix gate skipped the recompute entirely,
-    so new opens sailed through the whole unlatched window)."""
+def _books_live_gate(monkeypatch, *, short_addr="", captured=None):
+    """Arm the can_open live margin gate with books enabled."""
     import forven.config as config
     import forven.exchange.hyperliquid as hl
 
     kv_set("forven:settings", {
         "live_books_enabled": True,
         "hyperliquid_long_book_address": "",
-        "hyperliquid_short_book_address": "0xShortBook",
+        "hyperliquid_short_book_address": short_addr,
     })
     monkeypatch.setattr(config, "get_execution_mode", lambda: "live")
-    # Master wallet reads HEALTHY — exactly the basis mismatch the old gate
-    # comment warned about. The crash lives only in the aggregate.
-    monkeypatch.setattr(hl, "get_account_value",
-                        lambda **kw: {"accountValue": 999.0, "totalMarginUsed": 0.0})
+
+    def _fake_account_value(**kw):
+        if captured is not None:
+            captured.update(kw)
+        return {"accountValue": 999.0, "totalMarginUsed": 0.0}
+
+    monkeypatch.setattr(hl, "get_account_value", _fake_account_value)
     monkeypatch.setattr(hl, "resolve_configured_testnet", lambda: True)
-    kv_set("risk_state", {"last_equity": 600.0, "equity_source": "books_aggregate"})
+
+
+def _seed_aggregate(equity, *, source="books_aggregate", age_minutes=1):
+    kv_set("risk_state", {
+        "last_equity": equity,
+        "equity_source": source,
+        "updated_at": _minutes_ago(age_minutes),
+    })
+
+
+def test_m9_books_open_path_refuses_on_validated_aggregate(forven_db, monkeypatch):
+    """M9-BOOKS-1: with books enabled, the open-path daily-halt recompute uses
+    the daemon's last VALIDATED aggregate — a healthy master-only read must not
+    hide a crashed aggregate (the pre-fix gate skipped the recompute entirely,
+    so new opens sailed through the whole unlatched window)."""
+    _books_live_gate(monkeypatch)
     kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
 
+    _seed_aggregate(600.0)
     allowed, _r, reason = risk.can_open(
         "BTC", "long", "s", risk_pct=0.01, execution_type="live", book="long"
     )
     assert allowed is False
     assert "Daily loss limit" in reason
 
-    # Healthy aggregate -> no false halt from the master/aggregate basis mix.
-    kv_set("risk_state", {"last_equity": 990.0, "equity_source": "books_aggregate"})
+    # Healthy fresh aggregate -> no false halt from the basis mix.
+    _seed_aggregate(990.0)
     allowed, _r, reason = risk.can_open(
         "BTC", "long", "s2", risk_pct=0.01, execution_type="live", book="long"
     )
     assert allowed is True, reason
 
-    # Non-real-capital source -> the check stands down (pre-fix behavior).
-    kv_set("risk_state", {"last_equity": 600.0, "equity_source": "paper_session"})
+
+def test_m9_books_gate_runs_for_configured_book_subaccounts(forven_db, monkeypatch):
+    """Cross-review blocker on fbf45285: an order routed to a CONFIGURED book
+    subaccount sets account_address — the aggregate check is GLOBAL and must
+    run for it all the same."""
+    captured = {}
+    _books_live_gate(monkeypatch, short_addr="0xShortBookSubAccount", captured=captured)
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+    _seed_aggregate(600.0)
+
+    allowed, _r, reason = risk.can_open(
+        "ETH", "short", "s", risk_pct=0.01, execution_type="live", book="short"
+    )
+    assert captured.get("account_address") == "0xShortBookSubAccount", (
+        "probe expectation: the margin read routed to the subaccount"
+    )
+    assert allowed is False
+    assert "Daily loss limit" in reason
+
+
+def test_m9_books_fails_closed_without_fresh_same_basis_aggregate(forven_db, monkeypatch):
+    """Stale, missing, or wrong-basis aggregate state = the daily rule cannot
+    be verified -> the open is REFUSED explicitly (margin-check policy), not
+    silently waved through."""
+    _books_live_gate(monkeypatch)
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+
+    _seed_aggregate(990.0, age_minutes=10)  # stale: > _M9_BOOKS_EQUITY_MAX_AGE_SECONDS
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False and "Cannot verify book-aggregate equity" in reason
+
+    kv_set("risk_state", {"last_equity": 990.0, "equity_source": "books_aggregate"})
+    allowed, _r, reason = risk.can_open(  # missing stamp
+        "BTC", "long", "s2", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False and "Cannot verify book-aggregate equity" in reason
+
+    _seed_aggregate(990.0, source="exchange")  # wrong basis for books mode
     allowed, _r, reason = risk.can_open(
         "BTC", "long", "s3", risk_pct=0.01, execution_type="live", book="long"
     )
-    assert allowed is True, reason
+    assert allowed is False and "Cannot verify book-aggregate equity" in reason
 
 
 def test_degraded_tick_does_not_reset_breach_streak(forven_db, monkeypatch):
@@ -539,7 +615,7 @@ def test_degraded_tick_does_not_reset_breach_streak(forven_db, monkeypatch):
     genuine halt indefinitely). A CLEAN non-breaching tick still resets."""
     from datetime import timedelta
 
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 500.0)
     kv_set("kill_switch_enabled", False)
     _seed_live_state(675.0, 675.0, source="books_only")
     _seed_daily(675.0)

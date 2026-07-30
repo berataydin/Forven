@@ -451,7 +451,7 @@ class TestHaltStreakSurvivesContention:
         and the EQ-DROP-1 exposure bound are covered in test_equity_anchors.py."""
         import forven.exchange.risk as risk
         monkeypatch.setattr(risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
-        monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: float("inf"))
+        monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: float("inf"))
 
     def test_kill_switch_latches_when_best_effort_writes_are_dropped(
         self, forven_db, monkeypatch
