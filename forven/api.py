@@ -39,7 +39,6 @@ from forven.routers.approvals import router as approvals_router
 from forven.routers.auth import router as auth_router
 from forven.routers.agents import router as agents_router
 from forven.routers.agent_toolsets import router as agent_toolsets_router
-from forven.routers.dashboard_snapshot import router as dashboard_snapshot_router
 from forven.routers.data import router as data_router
 from forven.routers.deepdive import router as deepdive_router
 from forven.routers.assistant import router as assistant_router
@@ -335,22 +334,6 @@ async def lifespan(_app: FastAPI):
         init_db()
     except Exception:
         log.exception("Database schema init failed at startup.")
-
-    # Dashboard snapshot producer: read-only cache refresher behind
-    # GET /api/dashboard/snapshot. Runs in EVERY API process (not gated by the
-    # runtime-worker lock) because the dashboard must render truthfully even
-    # when this process is a pure control plane. Own thread + own event loop
-    # so a slow source read can never touch the request loop.
-    try:
-        from forven.dashboard_snapshot import run_snapshot_producer
-
-        _spawn_supervised_runtime_thread(
-            "dashboard-snapshot",
-            lambda: run_snapshot_producer(),
-            initial_delay_seconds=2.0,
-        )
-    except Exception:
-        log.exception("Dashboard snapshot producer failed to start (continuing).")
 
     try:
         from forven.gauntlet.engine import recover_stale_running_steps
@@ -775,7 +758,6 @@ app.include_router(data_gap_router)
 app.include_router(approvals_router)
 app.include_router(ops_router)
 app.include_router(analytics_router)
-app.include_router(dashboard_snapshot_router)
 app.include_router(data_router)
 app.include_router(tasks_router)
 app.include_router(trading_router)
