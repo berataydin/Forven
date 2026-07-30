@@ -511,7 +511,7 @@ def test_drop_bound_falls_back_to_window_without_anchor_stamp(forven_db):
     assert not ok and "suspect partial read" in reason
 
 
-def _books_live_gate(monkeypatch, *, short_addr="", captured=None):
+def _books_live_gate(monkeypatch, *, short_addr="", captured=None, acct_val=999.0):
     """Arm the can_open live margin gate with books enabled."""
     import forven.config as config
     import forven.exchange.hyperliquid as hl
@@ -526,7 +526,7 @@ def _books_live_gate(monkeypatch, *, short_addr="", captured=None):
     def _fake_account_value(**kw):
         if captured is not None:
             captured.update(kw)
-        return {"accountValue": 999.0, "totalMarginUsed": 0.0}
+        return {"accountValue": acct_val, "totalMarginUsed": 0.0}
 
     monkeypatch.setattr(hl, "get_account_value", _fake_account_value)
     monkeypatch.setattr(hl, "resolve_configured_testnet", lambda: True)
@@ -606,6 +606,46 @@ def test_m9_books_fails_closed_without_fresh_same_basis_aggregate(forven_db, mon
         "BTC", "long", "s3", risk_pct=0.01, execution_type="live", book="long"
     )
     assert allowed is False and "Cannot verify book-aggregate equity" in reason
+
+
+def test_margin_gate_fails_closed_on_zero_account_value(forven_db, monkeypatch):
+    """Cross-review blocker on 41e5dd85: get_account_value normalizes
+    missing/non-numeric perp fields to 0.0 and returns NORMALLY — the old
+    `if acct_val > 0` nesting then skipped the margin check AND the books M9
+    gate on that shape. A successful read of a non-positive value is still
+    'cannot verify' and must refuse the open."""
+    captured = {}
+    _books_live_gate(
+        monkeypatch, short_addr="0xShortBookSubAccount", captured=captured, acct_val=0.0
+    )
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+    _seed_aggregate(600.0)
+
+    allowed, _r, reason = risk.can_open(
+        "ETH", "short", "s", risk_pct=0.01, execution_type="live", book="short"
+    )
+    assert captured.get("account_address") == "0xShortBookSubAccount"
+    assert allowed is False
+    assert "Cannot verify exchange margin" in reason
+
+
+def test_margin_gate_fails_closed_on_zero_value_books_off(forven_db, monkeypatch):
+    """Same boundary with books disabled — the zero-value fail-open predates
+    the books work and closes for every forced-live deployment."""
+    import forven.config as config
+    import forven.exchange.hyperliquid as hl
+
+    kv_set("forven:settings", {"live_books_enabled": False})
+    monkeypatch.setattr(config, "get_execution_mode", lambda: "live")
+    monkeypatch.setattr(hl, "get_account_value",
+                        lambda **kw: {"accountValue": 0.0, "totalMarginUsed": 0.0})
+    monkeypatch.setattr(hl, "resolve_configured_testnet", lambda: True)
+
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s", risk_pct=0.01, execution_type="live"
+    )
+    assert allowed is False
+    assert "Cannot verify exchange margin" in reason
 
 
 def test_degraded_tick_does_not_reset_breach_streak(forven_db, monkeypatch):

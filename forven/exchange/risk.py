@@ -1735,63 +1735,78 @@ def can_open(
                 acc = get_account_value(
                     testnet=resolve_configured_testnet(), **margin_kwargs
                 )
-                acct_val = acc.get("accountValue", 0)
+                try:
+                    acct_val = float(acc.get("accountValue", 0) or 0)
+                except (TypeError, ValueError):
+                    acct_val = 0.0
                 margin_used = acc.get("totalMarginUsed", 0)
-                if acct_val > 0:
-                    margin_ratio = margin_used / acct_val
-                    if margin_ratio >= 0.80:
-                        return False, 0.0, f"Hyperliquid margin limit: {margin_ratio:.1%} used >= 80% threshold. Cannot open new positions."
-                    # M9: recompute the daily-loss halt from live equity so a
-                    # halt-worthy loss is caught AT OPEN, not only on the next
-                    # daemon tick (the flag is otherwise written only by the
-                    # tick-driven update_equity).
-                    #
-                    # Books ENABLED (M9-BOOKS-1): the daily baseline
-                    # (start_equity) is the book-AGGREGATE written by the
-                    # daemon's _book_aware_account_value, so the only valid
-                    # comparison is the daemon's last VALIDATED aggregate —
-                    # never the routed-account read fetched above (master OR
-                    # subaccount; comparing either would false-halt). The
-                    # aggregate basis is GLOBAL, so this runs for EVERY live
-                    # open regardless of which account the order routes to —
-                    # a configured book subaccount previously skipped the
-                    # recompute entirely (cross-review blocker on fbf45285).
-                    # No fresh same-basis aggregate => the daily rule CANNOT
-                    # be verified => refuse the open, the same fail-closed
-                    # policy as the margin check above.
-                    # Books DISABLED: reuse acct_val just fetched — no extra
-                    # HTTP call, same basis as the daily baseline (master
-                    # wallet only; account_address not in margin_kwargs
-                    # ensures that).
+                # Rule 0c fail-closed, second half: a SUCCESSFUL read that
+                # reports a non-positive/non-finite value is still "cannot
+                # verify" — get_account_value normalizes missing/non-numeric
+                # perp fields to 0.0 and returns normally, and the old
+                # `if acct_val > 0` nesting silently skipped BOTH the margin
+                # check and the books M9 gate on exactly that shape
+                # (cross-review blocker on 41e5dd85). An account that truly
+                # holds $0 cannot fund an open anyway.
+                if not math.isfinite(acct_val) or acct_val <= 0:
+                    return False, 0.0, (
+                        f"Cannot verify exchange margin (account value reads {acct_val!r}) "
+                        "— refusing to open a new live position."
+                    )
+                margin_ratio = margin_used / acct_val
+                if margin_ratio >= 0.80:
+                    return False, 0.0, f"Hyperliquid margin limit: {margin_ratio:.1%} used >= 80% threshold. Cannot open new positions."
+                # M9: recompute the daily-loss halt from live equity so a
+                # halt-worthy loss is caught AT OPEN, not only on the next
+                # daemon tick (the flag is otherwise written only by the
+                # tick-driven update_equity).
+                #
+                # Books ENABLED (M9-BOOKS-1): the daily baseline
+                # (start_equity) is the book-AGGREGATE written by the
+                # daemon's _book_aware_account_value, so the only valid
+                # comparison is the daemon's last VALIDATED aggregate —
+                # never the routed-account read fetched above (master OR
+                # subaccount; comparing either would false-halt). The
+                # aggregate basis is GLOBAL, so this runs for EVERY live
+                # open regardless of which account the order routes to —
+                # a configured book subaccount previously skipped the
+                # recompute entirely (cross-review blocker on fbf45285).
+                # No fresh same-basis aggregate => the daily rule CANNOT
+                # be verified => refuse the open, the same fail-closed
+                # policy as the margin check above.
+                # Books DISABLED: reuse acct_val just fetched — no extra
+                # HTTP call, same basis as the daily baseline (master
+                # wallet only; account_address not in margin_kwargs
+                # ensures that).
+                _books_on = False
+                try:
+                    from forven.exchange import books as _books_mod
+                    _books_on = _books_mod.books_enabled()
+                except Exception:
                     _books_on = False
+                if _books_on:
+                    _agg_eq = _validated_books_equity()
+                    if _agg_eq is None:
+                        return False, 0.0, (
+                            "Cannot verify book-aggregate equity (missing, stale, or "
+                            "wrong-basis daemon reading) — refusing to open a new live "
+                            "position until a fresh aggregate tick arrives."
+                        )
                     try:
-                        from forven.exchange import books as _books_mod
-                        _books_on = _books_mod.books_enabled()
-                    except Exception:
-                        _books_on = False
-                    if _books_on:
-                        _agg_eq = _validated_books_equity()
-                        if _agg_eq is None:
+                        if _recompute_daily_halt_from_equity(_agg_eq):
                             return False, 0.0, (
-                                "Cannot verify book-aggregate equity (missing, stale, or "
-                                "wrong-basis daemon reading) — refusing to open a new live "
-                                "position until a fresh aggregate tick arrives."
+                                "Daily loss limit reached — no new positions until tomorrow."
                             )
-                        try:
-                            if _recompute_daily_halt_from_equity(_agg_eq):
-                                return False, 0.0, (
-                                    "Daily loss limit reached — no new positions until tomorrow."
-                                )
-                        except Exception as _halt_exc:
-                            log.debug("Daily-halt open-path recompute failed: %s", _halt_exc)
-                    elif "account_address" not in margin_kwargs:
-                        try:
-                            if _recompute_daily_halt_from_equity(float(acct_val)):
-                                return False, 0.0, (
-                                    "Daily loss limit reached — no new positions until tomorrow."
-                                )
-                        except Exception as _halt_exc:
-                            log.debug("Daily-halt open-path recompute failed: %s", _halt_exc)
+                    except Exception as _halt_exc:
+                        log.debug("Daily-halt open-path recompute failed: %s", _halt_exc)
+                elif "account_address" not in margin_kwargs:
+                    try:
+                        if _recompute_daily_halt_from_equity(acct_val):
+                            return False, 0.0, (
+                                "Daily loss limit reached — no new positions until tomorrow."
+                            )
+                    except Exception as _halt_exc:
+                        log.debug("Daily-halt open-path recompute failed: %s", _halt_exc)
             except Exception as e:
                 log.warning("Could not fetch Hyperliquid account value for margin check: %s", e)
                 return False, 0.0, (
