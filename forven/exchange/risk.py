@@ -1741,28 +1741,37 @@ def can_open(
                     margin_ratio = margin_used / acct_val
                     if margin_ratio >= 0.80:
                         return False, 0.0, f"Hyperliquid margin limit: {margin_ratio:.1%} used >= 80% threshold. Cannot open new positions."
-                    # M9: recompute the daily-loss halt from this live equity so a
+                    # M9: recompute the daily-loss halt from live equity so a
                     # halt-worthy loss is caught AT OPEN, not only on the next
                     # daemon tick (the flag is otherwise written only by the
-                    # tick-driven update_equity). Reuses the equity just fetched
-                    # — no extra HTTP call.
+                    # tick-driven update_equity).
                     #
-                    # ONLY when books are DISABLED: with books enabled the daily
-                    # baseline (start_equity) is the book-AGGREGATE equity written
-                    # by the daemon's _book_aware_account_value, while acct_val
-                    # here is MASTER-only — comparing the two would fire a false
-                    # halt. The daemon's aggregate path is the authority when
-                    # books are on. (account_address not in margin_kwargs already
-                    # ensures we're on the master wallet.)
+                    # Books DISABLED: reuse acct_val just fetched — no extra
+                    # HTTP call, same basis as the daily baseline.
+                    # Books ENABLED (M9-BOOKS-1): acct_val here is MASTER-only
+                    # while the daily baseline (start_equity) is the
+                    # book-AGGREGATE written by the daemon's
+                    # _book_aware_account_value — comparing the two would fire
+                    # a false halt. Use the daemon's last VALIDATED aggregate
+                    # instead: same basis, moved by every ACCEPTED tick — so a
+                    # breaching read refuses opens as soon as it is accepted,
+                    # before the 3-tick latch confirms. Before this, the
+                    # recompute was skipped entirely with books on, and new
+                    # opens sailed through the whole unlatched window.
+                    # (account_address not in margin_kwargs already ensures
+                    # we're on the master wallet.)
                     _books_on = False
                     try:
                         from forven.exchange import books as _books_mod
                         _books_on = _books_mod.books_enabled()
                     except Exception:
                         _books_on = False
-                    if not _books_on and "account_address" not in margin_kwargs:
+                    if "account_address" not in margin_kwargs:
                         try:
-                            if _recompute_daily_halt_from_equity(float(acct_val)):
+                            _halt_eq = float(acct_val)
+                            if _books_on:
+                                _halt_eq = _last_validated_real_equity() or 0.0
+                            if _halt_eq > 0 and _recompute_daily_halt_from_equity(_halt_eq):
                                 return False, 0.0, (
                                     "Daily loss limit reached — no new positions until tomorrow."
                                 )
@@ -4163,6 +4172,29 @@ def update_equity(
         )
 
 
+def _last_validated_real_equity() -> float | None:
+    """The last equity sample ACCEPTED by update_equity, provided it came from
+    a real-capital source — the book-AGGREGATE basis when books are on.
+
+    The M9 open-path recompute uses this in books mode: the master-only read
+    fetched for the margin check cannot be compared to the aggregate daily
+    baseline (false-halt hazard, see the can_open gate comment), but the
+    daemon-written aggregate can — and an ACCEPTED breaching tick moves it
+    before the 3-tick latch confirms, so opens are refused from the first
+    accepted breaching read. Returns None when absent, non-positive, or
+    paper-sourced — callers stand down (the pre-fix behavior)."""
+    try:
+        with _RISK_STATE_LOCK:
+            state = _get_risk_state()
+            src = state.get("equity_source")
+            eq = float(state.get("last_equity") or 0.0)
+        if eq > 0 and src is not None and _is_real_capital_equity_source(str(src)):
+            return eq
+        return None
+    except Exception:  # noqa: BLE001 — an unreadable state stands the check down, never blocks the open path
+        return None
+
+
 def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
     """M9: fire (or report) the daily-loss halt from live equity on the OPEN path.
 
@@ -4310,18 +4342,35 @@ _EQUITY_NOTABLE_MOVE_MULT = 2.0
 _EQUITY_DROP_EXPOSURE_MULT = 2.0
 _EQUITY_DROP_BUFFER_USD = 25.0
 _EQUITY_DROP_MIN_FRACTION = 0.10
+# EQ-DROP-2: the bound must also count live trades CLOSED recently. In a real
+# crash the explaining positions are stopped out or liquidated FIRST, so by the
+# time a delayed/429-storm read recovers, the loss's positions are no longer
+# `status='OPEN'` — an open-only bound then rejects the genuine drop as a
+# phantom and the daily halt / kill-switch can never latch (fail-closed forever,
+# the exact inverse of the 2026-07-28 incident this guard was built for).
+_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES = 30.0
 
 
 def _open_live_notional_usd() -> float | None:
-    """Total |notional| of OPEN live trades, or None when unreadable.
+    """Total |notional| of OPEN live trades plus live trades CLOSED within the
+    last ``_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES``, or None when unreadable.
 
-    EQ-DROP-1's plausibility bound. On None the drop guard stands down (an
-    unreadable trades table must not suppress a genuine halt)."""
+    EQ-DROP-1's plausibility bound. Recently-closed trades count because a
+    crash's positions close BEFORE a storm-delayed equity read arrives
+    (EQ-DROP-2); a phantom partial read has no such recent closes, so the
+    2026-07-28 rejection behavior is unchanged. On None the drop guard stands
+    down (an unreadable trades table must not suppress a genuine halt)."""
     try:
+        cutoff = (
+            get_now() - timedelta(minutes=_EQUITY_DROP_RECENT_CLOSE_WINDOW_MINUTES)
+        ).isoformat()
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT entry_price, fill_entry_price, size FROM trades "
-                "WHERE status = 'OPEN' AND LOWER(COALESCE(execution_type, 'live')) = 'live'"
+                "WHERE LOWER(COALESCE(execution_type, 'live')) = 'live' "
+                "AND (status = 'OPEN' OR (status = 'CLOSED' AND closed_at IS NOT NULL "
+                "AND julianday(closed_at) >= julianday(?)))",
+                (cutoff,),
             ).fetchall()
         total = 0.0
         for r in rows:
@@ -4419,10 +4468,13 @@ def _notify_equity_drop_anomaly(eq: float, last: float, drop: float, allowance: 
     either a broken venue read or a real withdrawal — the operator decides."""
     summary = (
         f"Live equity source keeps reporting ${eq:,.2f} — a ${drop:,.2f} drop from the last good "
-        f"${last:,.2f}, but open live exposure can explain at most ${allowance:,.2f} "
-        f"({streak} consecutive ticks). Samples are being REJECTED (fail closed); risk anchors are "
-        "frozen at the last good reading. If funds were genuinely withdrawn, confirm it with "
-        "Re-baseline on the Risk page."
+        f"${last:,.2f}, but live exposure (open + recently closed) can explain at most "
+        f"${allowance:,.2f} ({streak} consecutive ticks). Samples are being REJECTED (fail closed); "
+        "risk anchors are frozen at the last good reading. If funds were genuinely withdrawn, "
+        "confirm it with Re-baseline on the Risk page. CAUTION: if this could be a REAL trading "
+        "loss (positions recently stopped out or liquidated), verify fills on the venue FIRST — "
+        "Re-baseline resets the daily-loss baseline to the current value, which erases the day's "
+        "loss from the daily rule."
     )
     log.error("EQUITY DROP ANOMALY: %s", summary)
     try:
@@ -4783,7 +4835,12 @@ def _update_equity_locked(
                 "kill-switch breach %d/%d awaiting confirmation - drawdown %.1f%% (equity $%.2f, HWM $%.2f, source=%s)",
                 _ks_streak, _HALT_CONFIRM_TICKS, drawdown_pct * 100, account_equity, hwm, source,
             )
-    elif state.get("kill_switch_breach_streak"):
+    elif state.get("kill_switch_breach_streak") and not degraded:
+        # HALT-CONFIRM-3: a DEGRADED tick can never ADVANCE a streak, so it
+        # must not RESET one either — its substituted cache value can mask a
+        # real breach, and letting it wipe progress lets an intermittent storm
+        # defer a genuine latch indefinitely. Leave the streak for the next
+        # clean tick to judge.
         state["kill_switch_breach_streak"] = 0
         state.pop("kill_switch_breach_last_at", None)
         _streak_reset = True
@@ -4821,7 +4878,9 @@ def _update_equity_locked(
                 "daily-loss breach %d/%d awaiting confirmation - PnL %.1f%% (start $%.2f, now $%.2f)",
                 _dh_streak, _HALT_CONFIRM_TICKS, daily_pnl_pct * 100, start_eq, account_equity,
             )
-    elif state.get("daily_halt_breach_streak"):
+    elif state.get("daily_halt_breach_streak") and not degraded:
+        # HALT-CONFIRM-3: same as the kill-switch branch — degraded ticks
+        # neither count nor reset.
         state["daily_halt_breach_streak"] = 0
         state.pop("daily_halt_breach_last_at", None)
         _streak_reset = True

@@ -443,3 +443,128 @@ def test_confirmations_require_spacing_between_ticks(forven_db, monkeypatch):
     result = risk.update_equity(359.0, "books_only")  # counts: 3/3 — latches
     assert result.get("daily_halt") is True
     assert kv_get("risk_state", {}).get("daily_loss_halt") is True
+
+
+# ------------------------------------------------- EQ-DROP-2 / M9-BOOKS-1
+
+
+def _seed_closed_live_trade(trade_id, notional, closed_ago_sql="-5 minutes"):
+    """A live trade CLOSED `closed_ago_sql` ago with entry*size == notional."""
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO trades
+            (id, strategy, strategy_id, asset, direction, entry_price, size, risk_pct,
+             leverage, status, execution_type, opened_at, closed_at)
+            VALUES (?, 's', 's', 'BTC', 'long', ?, 1.0, 0.01, 1.0, 'CLOSED', 'live',
+                    datetime('now', '-1 hour'), datetime('now', ?))
+            """,
+            (trade_id, float(notional), closed_ago_sql),
+        )
+
+
+def test_drop_bound_counts_recently_closed_live_trades(forven_db):
+    """EQ-DROP-2: a crash's positions are stopped out BEFORE a storm-delayed
+    equity read recovers — the bound must count them or the genuine drop is
+    rejected forever and the daily halt / kill-switch never latch."""
+    _seed_closed_live_trade("c-recent", 500.0, "-5 minutes")
+    assert risk._open_live_notional_usd() == pytest.approx(500.0)
+
+    state = {"last_equity": 1000.0, "equity_source": "books_only"}
+    ok, _ = risk._validate_equity_sample(550.0, state, source="books_only")
+    assert ok, "a 45% drop explained by a just-closed 500-notional trade is a REAL loss"
+
+
+def test_drop_bound_ignores_stale_closes_and_still_rejects_phantoms(forven_db):
+    """The window is bounded: an hours-old close explains nothing, and the
+    2026-07-28 phantom class (big drop, no open exposure, no recent closes)
+    stays rejected — through the real DB query, not a monkeypatch."""
+    _seed_closed_live_trade("c-stale", 500.0, "-2 hours")
+    assert risk._open_live_notional_usd() == pytest.approx(0.0)
+
+    state = {"last_equity": 999.28, "equity_source": "books_only"}
+    ok, reason = risk._validate_equity_sample(516.82, state, source="books_only")
+    assert not ok and "suspect partial read" in reason
+
+
+def test_m9_books_open_path_refuses_on_validated_aggregate(forven_db, monkeypatch):
+    """M9-BOOKS-1: with books enabled, the open-path daily-halt recompute uses
+    the daemon's last VALIDATED aggregate — a healthy master-only read must not
+    hide a crashed aggregate (the pre-fix gate skipped the recompute entirely,
+    so new opens sailed through the whole unlatched window)."""
+    import forven.config as config
+    import forven.exchange.hyperliquid as hl
+
+    kv_set("forven:settings", {
+        "live_books_enabled": True,
+        "hyperliquid_long_book_address": "",
+        "hyperliquid_short_book_address": "0xShortBook",
+    })
+    monkeypatch.setattr(config, "get_execution_mode", lambda: "live")
+    # Master wallet reads HEALTHY — exactly the basis mismatch the old gate
+    # comment warned about. The crash lives only in the aggregate.
+    monkeypatch.setattr(hl, "get_account_value",
+                        lambda **kw: {"accountValue": 999.0, "totalMarginUsed": 0.0})
+    monkeypatch.setattr(hl, "resolve_configured_testnet", lambda: True)
+    kv_set("risk_state", {"last_equity": 600.0, "equity_source": "books_aggregate"})
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False
+    assert "Daily loss limit" in reason
+
+    # Healthy aggregate -> no false halt from the master/aggregate basis mix.
+    kv_set("risk_state", {"last_equity": 990.0, "equity_source": "books_aggregate"})
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s2", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is True, reason
+
+    # Non-real-capital source -> the check stands down (pre-fix behavior).
+    kv_set("risk_state", {"last_equity": 600.0, "equity_source": "paper_session"})
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s3", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is True, reason
+
+
+def test_degraded_tick_does_not_reset_breach_streak(forven_db, monkeypatch):
+    """HALT-CONFIRM-3: a degraded tick can neither COUNT (HALT-CONFIRM-2) nor
+    RESET a live streak — a substituted cache value that masks the breach must
+    not wipe real confirmation progress (else an intermittent storm defers a
+    genuine halt indefinitely). A CLEAN non-breaching tick still resets."""
+    from datetime import timedelta
+
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    kv_set("kill_switch_enabled", False)
+    _seed_live_state(675.0, 675.0, source="books_only")
+    _seed_daily(675.0)
+
+    base = risk.get_now()
+    current = {"t": base}
+    monkeypatch.setattr(risk, "get_now", lambda: current["t"])
+
+    risk.update_equity(359.0, "books_only")                      # counts: 1/3
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 1
+    current["t"] = base + timedelta(seconds=25)
+    risk.update_equity(675.0, "books_only", degraded=True)       # masked: must NOT reset
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 1
+    current["t"] = base + timedelta(seconds=50)
+    risk.update_equity(359.0, "books_only")                      # counts: 2/3
+    current["t"] = base + timedelta(seconds=75)
+    result = risk.update_equity(359.0, "books_only")             # counts: 3/3 — latches
+    assert result.get("daily_halt") is True
+
+    # Control: a CLEAN recovery tick still clears the streak.
+    kv_set("risk_state", {})
+    _seed_live_state(675.0, 675.0, source="books_only")
+    _seed_daily(675.0)
+    current["t"] = base + timedelta(seconds=200)
+    risk.update_equity(359.0, "books_only")                      # counts: 1/3
+    current["t"] = base + timedelta(seconds=225)
+    risk.update_equity(675.0, "books_only")                      # clean recovery: resets
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 0
