@@ -18,7 +18,6 @@ def _instant_halt_confirms(monkeypatch):
     monkeypatch.setattr(_risk, "_open_live_notional_usd", lambda: float("inf"))
 
 
-
 def test_drawdown_percent_tracks_high_water_mark(forven_db):
     first = update_equity(10000.0)
     assert first["high_water_mark"] == 10000.0
