@@ -64,7 +64,8 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "yfinance>=0.2",
     "yt-dlp>=2025.1.0",
-    "mcp>=1.0",
+    # Forven uses mcp.server.fastmcp, which was removed in MCP 2.x.
+    "mcp>=1.0,<2",
     "PyYAML>=6.0",
 ]
 

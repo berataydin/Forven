@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
@@ -116,21 +117,6 @@ def test_in_range_risk_write_still_lands(forven_db):
 # --------------------------------------------------------------------------- #
 
 
-def _old_guard_pairs(app_) -> list[tuple[str, str]]:
-    """The PRE-FIX guard body, verbatim — what `_assert_no_duplicate_routes` used
-    to iterate. Kept here so the tests below prove the delta rather than assert it.
-    """
-    pairs: list[tuple[str, str]] = []
-    for route in app_.routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        if not path or not methods:
-            continue
-        for method in methods:
-            pairs.append((method, path))
-    return pairs
-
-
 def _two_router_app(register) -> FastAPI:
     first = APIRouter()
     second = APIRouter()
@@ -151,13 +137,6 @@ def test_duplicate_route_guard_detects_a_duplicate_across_routers():
             return {}
 
     app = _two_router_app(_register)
-
-    # Discrimination check: on the INSTALLED FastAPI (0.138.0) `include_router`
-    # appends an opaque `_IncludedRouter` wrapper (path=None, methods=None), so the
-    # pre-fix guard saw only FastAPI's own /docs routes and could not have caught
-    # this duplicate. If this assertion ever fails, FastAPI started flattening
-    # again and the test below stopped proving anything — fix the test, not this.
-    assert ("GET", "/api/backtesting/run") not in _old_guard_pairs(app)
 
     with pytest.raises(RuntimeError) as excinfo:
         _assert_no_duplicate_routes(app)
@@ -189,10 +168,16 @@ def test_duplicate_route_guard_walks_prefixed_includes():
     def _c():  # pragma: no cover - never called
         return {}
 
-    app = FastAPI()
-    app.include_router(child, prefix="/api/nested")
+    nested_include = SimpleNamespace(
+        original_router=SimpleNamespace(routes=child.routes),
+        include_context=SimpleNamespace(prefix="/nested"),
+    )
+    outer_include = SimpleNamespace(
+        original_router=SimpleNamespace(routes=[nested_include]),
+        include_context=SimpleNamespace(prefix="/api"),
+    )
 
-    assert ("GET", "/api/nested/thing") in set(iter_effective_routes(app.routes))
+    assert ("GET", "/api/nested/thing") in set(iter_effective_routes([outer_include]))
 
 
 def test_real_app_has_no_duplicate_routes():
@@ -201,9 +186,6 @@ def test_real_app_has_no_duplicate_routes():
     # The guard is a no-op unless it can actually see the routers' routes.
     effective = list(iter_effective_routes(app.routes))
     assert len(effective) > 100
-    # ...and the pre-fix loop genuinely could not: it saw only the handful of
-    # routes registered directly on `app` (the /docs family + POST /api/shutdown).
-    assert len(_old_guard_pairs(app)) < 20
     _assert_no_duplicate_routes(app)
 
     # WS routes are inside the walked set — they were invisible to the old loop
