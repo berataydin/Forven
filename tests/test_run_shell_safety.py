@@ -6,7 +6,9 @@ import asyncio
 
 import pytest
 
+from forven.agents import tool_registry
 from forven.agents import tools_core
+from forven.agents.context import reset_tool_context, set_tool_context
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +28,30 @@ def test_run_shell_disabled_by_default(monkeypatch):
     out = asyncio.run(tools_core._tool_run_shell("echo hello"))
     assert "Blocked" in out
     assert "disabled by default" in out
+
+
+def test_run_shell_is_denied_in_research_context(monkeypatch):
+    """Untrusted research content cannot reach the opt-in shell primitive."""
+    monkeypatch.setattr(tool_registry, "_load_toolset_overrides", lambda *_args: {})
+
+    registered = tool_registry._REGISTRY["run_shell"]
+    assert registered.category == "catastrophic"
+
+    available = {
+        tool["name"] for tool in tool_registry.get_tools_for_agent(None, context="research")
+    }
+    assert "run_shell" not in available
+
+    tokens = set_tool_context(None, "T0001", tools_context="research")
+    try:
+        out = asyncio.run(tool_registry.execute_tool("run_shell", {"command": "echo hello"}))
+    finally:
+        reset_tool_context(tokens)
+
+    assert out == (
+        "Tool 'run_shell' (category 'catastrophic') is disabled "
+        "in the 'research' context."
+    )
 
 
 def test_program_basename_strips_path_and_ext():
