@@ -854,12 +854,12 @@ async def shutdown(request: Request):
 # a real directory. Mount is registered last so explicit API routes always win,
 # and html=True makes StaticFiles resolve SPA deep links to index.html.
 #
-# The bare "GET /" is NOT handled here. FastAPI keeps included routers as internal
-# `_IncludedRouter` wrappers instead of flattening their APIRoutes into
-# app.router.routes, so the filter that used to live here ("drop any route whose
-# path == '/'") matched nothing and left routers/status.py:root() shadowing the SPA
-# index — the packaged app served API JSON at "/". That route now serves index.html
-# itself when this env var is set; see routers/status.py.
+# The bare "GET /" is NOT handled here. FastAPI's representation of included
+# routers varies by release: some versions flatten their APIRoutes, while others
+# retain internal wrappers. The filter that used to live here assumed a flat list
+# and therefore missed routers/status.py:root() under the wrapped representation,
+# shadowing the SPA index. That route now serves index.html itself when this env
+# var is set; see routers/status.py.
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 _frontend_dir = os.environ.get("FORVEN_FRONTEND_DIR")
@@ -875,25 +875,15 @@ if _frontend_dir and os.path.isdir(_frontend_dir):
 def iter_effective_routes(routes, prefix: str = ""):
     """Yield ``(method, path)`` for every route a request can actually reach.
 
-    API-04: on the FastAPI we pin (0.138.0) ``app.routes`` is NOT the flat list it
-    looks like. Since 0.13x, ``include_router`` appends a single internal
-    ``fastapi.routing._IncludedRouter`` wrapper (routing.py:1518) holding
-    ``original_router`` + ``include_context``, instead of flattening the child
-    APIRoutes into ``app.router.routes``; the wrapper's own ``path``/``methods``
-    are None. Measured on this app: ``app.routes`` is 41 ``_IncludedRouter`` + 4
-    built-in docs ``Route`` + the 1 directly-decorated ``APIRoute``, so the old
-    guard's ``getattr(route, "path"/"methods")`` loop saw 9 (method, path) pairs —
-    the docs routes and POST /api/shutdown — and NONE of the 479 real ones. It
-    could not fire. Same root cause as the ``path == "/"`` filter that let
-    routers/status.py:root() shadow the packaged SPA index (fixed in 2711c779);
-    this walks the wrappers instead of assuming the flattening.
+    API-04: FastAPI has used both flat route lists and internal included-router
+    wrappers across supported releases. Under the wrapped representation, a
+    top-level ``path``/``methods`` loop sees only directly registered routes and
+    silently misses the included application routes it is meant to protect.
 
-    (Older FastAPIs — 0.133 and earlier — really did flatten, and there
-    ``_IncludedRouter``/``original_router`` do not exist at all. That is why this
-    is duck-typed on ``original_router`` / ``include_context.prefix`` rather than
-    isinstance-checked: it yields the same set either way, so an upgrade or a
-    downgrade cannot silently disarm the guard. The branch is live, not dead, on
-    the installed version.)
+    The wrapper traversal is deliberately duck-typed on ``original_router`` and
+    ``include_context.prefix`` rather than coupled to a private FastAPI class.
+    Flat routes pass through the normal branch, so both representations yield the
+    same effective ``(method, path)`` set.
 
     Mounts (StaticFiles) are skipped: they own a subtree, not a method+path.
     """
