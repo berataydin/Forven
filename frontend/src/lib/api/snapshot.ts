@@ -1,6 +1,6 @@
 /**
  * Client for GET /api/dashboard/snapshot — the single server-timestamped
- * system-truth payload behind /dashboard-preview (contract v1).
+ * system-truth payload behind the operations dashboard (contract v1).
  *
  * Truth rules mirrored from the backend contract:
  * - a section's `data` is the last GOOD payload; `status` says how much to
