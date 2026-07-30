@@ -1,75 +1,169 @@
 <script lang="ts">
-	/**
-	 * The operations dashboard. Renders ENTIRELY from GET /api/dashboard/snapshot:
-	 * one server-timestamped payload, per-section truth status, and a derived
-	 * "needs attention" inbox. Sections keep last-good data through backend
-	 * outages and say so explicitly — unknown never renders as a reassuring zero.
-	 *
-	 * Tiers: attention → money → machine → research.
-	 */
-	import { onDestroy, onMount } from 'svelte';
+	import { onMount, onDestroy } from "svelte";
+	import {
+		getDashboardOverview,
+		getDashboardActivity,
+		getDashboardWinners,
+	} from "$lib/api";
+	import type {
+		DashboardOverview,
+		DashboardActivityItem,
+		WinnerEntry,
+	} from "$lib/api";
+	import { backendConnected } from "$lib/stores";
 	import {
 		createRealtimeRefresh,
 		type RealtimeRefreshController,
-	} from '$lib/utils/realtime';
-	import { refreshSnapshot, snapshotState } from '$lib/stores/dashboardSnapshotStore';
-	import SnapshotSection from '$lib/components/dashboard_snapshot/SnapshotSection.svelte';
-	import AttentionInbox from '$lib/components/dashboard_snapshot/AttentionInbox.svelte';
-	import KpisStrip from '$lib/components/dashboard_snapshot/KpisStrip.svelte';
-	import TradingTile from '$lib/components/dashboard_snapshot/TradingTile.svelte';
-	import EquityTile from '$lib/components/dashboard_snapshot/EquityTile.svelte';
-	import PaperTile from '$lib/components/dashboard_snapshot/PaperTile.svelte';
-	import SystemTile from '$lib/components/dashboard_snapshot/SystemTile.svelte';
-	import DataTile from '$lib/components/dashboard_snapshot/DataTile.svelte';
-	import SchedulerTile from '$lib/components/dashboard_snapshot/SchedulerTile.svelte';
-	import AgentsTile from '$lib/components/dashboard_snapshot/AgentsTile.svelte';
-	import PipelineTile from '$lib/components/dashboard_snapshot/PipelineTile.svelte';
-	import LeaderboardTile from '$lib/components/dashboard_snapshot/LeaderboardTile.svelte';
-	import { fmtAge } from '$lib/components/dashboard_snapshot/format';
+	} from "$lib/utils/realtime";
+	import OpsHeaderStrip from "$lib/components/dashboard/OpsHeaderStrip.svelte";
+	import SystemPulsePanel from "$lib/components/dashboard/SystemPulsePanel.svelte";
+	import DataIntegrityPanel from "$lib/components/dashboard/DataIntegrityPanel.svelte";
+	import AlertsFeed from "$lib/components/dashboard/AlertsFeed.svelte";
+	import SchedulerWatchPanel from "$lib/components/dashboard/SchedulerWatchPanel.svelte";
+	import PaperSessionSummary from "$lib/components/dashboard/PaperSessionSummary.svelte";
+	import PipelineFlowPanel from "$lib/components/dashboard/PipelineFlowPanel.svelte";
+	import AgentHeartbeat from "$lib/components/dashboard/AgentHeartbeat.svelte";
+	import ActivityStream from "$lib/components/dashboard/ActivityStream.svelte";
+	import StrategyLeaderboard from "$lib/components/dashboard/StrategyLeaderboard.svelte";
+	import EquityOverlay from "$lib/components/dashboard/EquityOverlay.svelte";
+	import Skeleton from "$lib/components/Skeleton.svelte";
+	import LiveTradingPanel from "$lib/components/dashboard/LiveTradingPanel.svelte";
+	import CriticalAlertsBanner from "$lib/components/dashboard/CriticalAlertsBanner.svelte";
+	import CrucibleResearchPanel from "$lib/components/dashboard/CrucibleResearchPanel.svelte";
 
-	// Client poll is cheap by contract: the endpoint serves a cached payload
-	// and never runs a data source read.
-	const POLL_MS = 10_000;
-	// After this many consecutive failed polls the page-level OFFLINE state
-	// engages (single miss = transient; data stays visible either way).
-	const OFFLINE_AFTER_FAILURES = 2;
+	/** Loader data from +page.ts — provides initial dashboard payload. */
+	export let data: {
+		overview: DashboardOverview | null;
+		activity: DashboardActivityItem[];
+		winners: WinnerEntry[];
+	};
 
-	let realtime: RealtimeRefreshController | null = null;
-	let clock: ReturnType<typeof setInterval> | null = null;
-	let now = Date.now();
+	// Seed local state from loader data so the page renders on frame 1.
+	let overview: DashboardOverview | null = data.overview;
+	let activity: DashboardActivityItem[] = data.activity;
+	let winners: WinnerEntry[] = data.winners;
 
-	$: state = $snapshotState;
-	$: snapshot = state.snapshot;
-	$: sections = snapshot?.sections ?? {};
-	$: inboxItems = snapshot?.inbox?.data?.items ?? [];
-	$: clientOffline = state.consecutiveFailures >= OFFLINE_AFTER_FAILURES;
-	$: offlineForText = state.failedSince ? fmtAge(new Date(state.failedSince).toISOString(), now) : null;
+	let loadingError = "";
+	let loading = !data.overview;
+	let primaryRealtime: RealtimeRefreshController | null = null;
+	let primaryLoadingInFlight = false;
+	let primaryDashboardLoaded = !!data.overview;
+	const DASHBOARD_TIMEOUT_MS = 8_000;
 
-	onMount(() => {
-		void refreshSnapshot();
-		realtime = createRealtimeRefresh(refreshSnapshot, {
-			fallbackMs: POLL_MS,
-			wsDebounceMs: 2000,
+	// Persisted activity-stream expand/collapse (full firehose; alerts have
+	// their own always-visible feed).
+	const ACTIVITY_KEY = "dashboard.activityStream.expanded";
+	let activityExpanded = false;
+
+	function toggleActivity() {
+		activityExpanded = !activityExpanded;
+		try {
+			localStorage.setItem(ACTIVITY_KEY, String(activityExpanded));
+		} catch {
+			// localStorage may be unavailable (private mode / SSR harness); ignore.
+		}
+	}
+
+	function withTimeout<T>(
+		promise: Promise<T>,
+		label: string,
+		timeoutMs = DASHBOARD_TIMEOUT_MS,
+	): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error(`${label} timed out`)),
+				timeoutMs,
+			);
+			promise.then(
+				(value) => {
+					clearTimeout(timer);
+					resolve(value);
+				},
+				(err) => {
+					clearTimeout(timer);
+					reject(err);
+				},
+			);
+		});
+	}
+
+	async function loadDashboard() {
+		if (primaryLoadingInFlight) return;
+		primaryLoadingInFlight = true;
+
+		try {
+			const results = await Promise.allSettled([
+				withTimeout(getDashboardOverview(), "overview"),
+				withTimeout(getDashboardActivity(40), "activity"),
+				withTimeout(getDashboardWinners(10), "winners"),
+			]);
+			const [overviewResult, activityResult, winnersResult] = results;
+
+			if (overviewResult.status === "fulfilled") {
+				overview = overviewResult.value;
+				loadingError = "";
+			}
+			if (activityResult.status === "fulfilled")
+				activity = activityResult.value;
+			if (winnersResult.status === "fulfilled")
+				winners = winnersResult.value;
+
+			// An always-on dashboard must not die on a transient miss: keep the
+			// last good data on screen and only surface an error when we have
+			// nothing at all to show. The ops header independently shows
+			// backend reachability, so a stale-but-rendered dashboard is
+			// visibly distinguishable from a healthy one.
+			const allFailed = results.every((entry) => entry.status === "rejected");
+			if (allFailed && !overview) {
+				loadingError = $backendConnected
+					? "Dashboard data is temporarily unavailable. Retrying in background."
+					: "Backend connection is still initializing. Dashboard will auto-retry.";
+			}
+
+			loading = false;
+			primaryDashboardLoaded = true;
+		} finally {
+			primaryLoadingInFlight = false;
+		}
+	}
+
+	function startPrimaryRealtime() {
+		if (primaryRealtime) return;
+		primaryRealtime = createRealtimeRefresh(loadDashboard, {
+			fallbackMs: 30_000,
+			wsDebounceMs: 5000,
 			wsEvents: [
-				'kill_switch_activated',
-				'kill_switch_cleared',
-				'risk_alert',
-				'approval_created',
-				'approval_resolved',
-				'strategy_promoted',
-				'task_failed',
+				"strategy_promoted",
+				"kill_switch_activated",
+				"kill_switch_cleared",
+				"agent_stalled",
 			],
 			pollWhenWsOfflineOnly: false,
 		});
-		realtime.start();
-		clock = setInterval(() => {
-			now = Date.now();
-		}, 1000);
+		primaryRealtime.start();
+	}
+
+	function stopPrimaryRealtime() {
+		primaryRealtime?.stop();
+		primaryRealtime = null;
+	}
+
+	onMount(() => {
+		try {
+			activityExpanded = localStorage.getItem(ACTIVITY_KEY) === "true";
+		} catch {
+			activityExpanded = false;
+		}
+
+		if (!primaryDashboardLoaded) {
+			loading = true;
+			void loadDashboard();
+		}
+		startPrimaryRealtime();
 	});
 
 	onDestroy(() => {
-		realtime?.stop();
-		if (clock) clearInterval(clock);
+		stopPrimaryRealtime();
 	});
 </script>
 
@@ -77,97 +171,103 @@
 	<title>Operations | Forven</title>
 	<meta
 		name="description"
-		content="Decision-first operations dashboard: one system-truth snapshot, needs-attention inbox, and explicit staleness on every tile."
+		content="Always-on operations dashboard: system health, data integrity, pipeline flow, paper trading, and alerts."
 	/>
 </svelte:head>
 
-<div class="flex h-full min-h-0 flex-col gap-3 overflow-hidden bg-black px-4 py-6">
-	<div class="flex-shrink-0 border-b border-[#222] pb-3">
-		<div class="flex items-center justify-between gap-3">
-			<h1 class="text-lg font-bold uppercase tracking-widest text-white">Operations</h1>
-			<div class="text-right font-mono text-[10px] uppercase tracking-wider">
-				{#if clientOffline}
-					<div class="border border-red-800 bg-red-500/10 px-2 py-1 text-red-400" data-testid="page-offline">
-						Backend unreachable{offlineForText ? ` for ${offlineForText}` : ''} — showing last snapshot
-					</div>
-				{:else if snapshot?.generated_at}
-					<div class="text-[#555]" data-testid="page-generated">
-						snapshot generated {fmtAge(snapshot.generated_at, now)} ago
-					</div>
-				{/if}
-			</div>
-		</div>
+<div
+	class="relative flex h-full min-h-0 flex-col gap-4 overflow-hidden bg-black px-4 py-6"
+>
+	<CriticalAlertsBanner />
+
+	<div class="flex-shrink-0 border-b border-[#222] pb-4">
+		<h1 class="text-lg font-bold uppercase tracking-widest text-white">Dashboard</h1>
+		<p class="mt-1 text-xs text-[#666]">
+			Live operations, trading exposure, agent activity, and strategy pipeline health.
+		</p>
 	</div>
 
-	{#if !snapshot}
-		<div class="text-xs text-gray-500" data-testid="page-loading">
-			{clientOffline ? 'Backend unreachable — no snapshot received yet.' : 'Loading snapshot…'}
+	<OpsHeaderStrip autopilot={overview?.autopilot ?? null} kpis={overview?.kpis ?? null} />
+
+	{#if loading && !overview}
+		<div class="min-h-[220px] grid grid-cols-[1fr_1fr_1fr] gap-2">
+			<div class="border border-[#222] p-4 bg-[#050505]"><Skeleton rows={6} /></div>
+			<div class="border border-[#222] p-4 bg-[#050505]"><Skeleton rows={6} /></div>
+			<div class="border border-[#222] p-4 bg-[#050505]"><Skeleton rows={6} /></div>
+		</div>
+		<div class="min-h-[240px] grid grid-cols-2 gap-2">
+			<div class="border border-[#222] p-4 bg-[#050505]"><Skeleton rows={8} /></div>
+			<div class="border border-[#222] p-4 bg-[#050505]"><Skeleton rows={8} /></div>
 		</div>
 	{:else}
-		<div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-			<div class="space-y-3 pb-3">
-				<KpisStrip data={sections.kpis?.data ?? null} />
+		<div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+			<div class="space-y-2 pb-2">
+				<!-- Monitor row: is the machine alive, is the data trustworthy, what needs attention -->
+				<div class="grid grid-cols-1 gap-2 lg:h-[330px] lg:grid-cols-3">
+					<div class="flex min-h-0 flex-col gap-2">
+						<div class="min-h-0 flex-1"><SystemPulsePanel /></div>
+						<div class="min-h-0 flex-1"><DataIntegrityPanel /></div>
+					</div>
+					<div class="h-[240px] min-h-0 lg:h-auto"><AlertsFeed /></div>
+					<div class="h-[240px] min-h-0 lg:h-auto"><SchedulerWatchPanel /></div>
+				</div>
 
-				<!-- Tier 1: what needs me right now -->
-				<section>
-					<h2 class="mb-1 text-[10px] font-bold uppercase tracking-widest text-gray-400">Needs attention now</h2>
-					{#if snapshot.inbox?.status === 'unavailable'}
-						<div class="border border-[#333] bg-[#0a0a0a] px-3 py-2 text-xs text-gray-500" data-testid="inbox-unavailable">
-							Attention inbox has no data yet — unknown, not "all clear".
+				<!-- Trading row: what is the money doing right now -->
+				<div class="flex-shrink-0 space-y-2">
+					<LiveTradingPanel />
+				</div>
+				<div class="flex-shrink-0">
+					<PaperSessionSummary />
+				</div>
+
+				<!-- Agent activity + pipeline flow, side by side -->
+				<div class="flex-shrink-0 grid grid-cols-1 gap-2 lg:grid-cols-2 lg:h-[260px]">
+					<div class="h-[240px] min-h-0 lg:h-auto"><AgentHeartbeat /></div>
+					<div class="h-[240px] min-h-0 lg:h-auto"><PipelineFlowPanel /></div>
+				</div>
+
+				<!-- Research: active crucibles + recent verdicts -->
+				<div class="flex-shrink-0 h-[180px]">
+					<CrucibleResearchPanel />
+				</div>
+
+				<div
+					class="flex-shrink-0 min-h-[180px] overflow-hidden terminal-card p-1.5"
+				>
+					<EquityOverlay />
+				</div>
+
+				<div class="flex-shrink-0 h-[230px]">
+					<StrategyLeaderboard {winners} />
+				</div>
+
+				<!-- Full activity firehose (alerts have their own panel above) -->
+				<div class="flex-shrink-0 terminal-card">
+					<button
+						type="button"
+						class="w-full text-left px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-[#888] hover:text-white transition-colors"
+						on:click={toggleActivity}
+						aria-expanded={activityExpanded}
+						aria-controls="activity-stream-panel"
+						data-testid="activity-stream-toggle"
+					>
+						Activity Stream {activityExpanded ? "▾" : "▸"}
+					</button>
+					{#if activityExpanded}
+						<div id="activity-stream-panel" class="max-h-[280px] overflow-auto">
+							<ActivityStream items={activity} />
 						</div>
-					{:else}
-						<AttentionInbox items={inboxItems} {now} />
 					{/if}
-				</section>
-
-				<!-- Tier 2: what is the money doing -->
-				<section>
-					<h2 class="mb-1 text-[10px] font-bold uppercase tracking-widest text-gray-400">Money</h2>
-					<div class="grid grid-cols-1 gap-2 lg:grid-cols-3">
-						<SnapshotSection title="Trading" section={sections.trading} {now} {clientOffline} href="/trading" testid="dash-trading" let:data>
-							<TradingTile {data} />
-						</SnapshotSection>
-						<SnapshotSection title="Equity" section={sections.equity} {now} {clientOffline} href="/portfolio" testid="dash-equity" let:data>
-							<EquityTile {data} />
-						</SnapshotSection>
-						<SnapshotSection title="Paper sessions" section={sections.paper} {now} {clientOffline} href="/paper-trades" testid="dash-paper" let:data>
-							<PaperTile {data} />
-						</SnapshotSection>
-					</div>
-				</section>
-
-				<!-- Tier 3: is the machine alive -->
-				<section>
-					<h2 class="mb-1 text-[10px] font-bold uppercase tracking-widest text-gray-400">Machine</h2>
-					<div class="grid grid-cols-1 gap-2 md:grid-cols-2 lg:grid-cols-4">
-						<SnapshotSection title="System" section={sections.system} {now} {clientOffline} href="/diagnostics" testid="dash-system" let:data>
-							<SystemTile {data} />
-						</SnapshotSection>
-						<SnapshotSection title="Data" section={sections.data} {now} {clientOffline} href="/data" testid="dash-data" let:data>
-							<DataTile {data} {now} />
-						</SnapshotSection>
-						<SnapshotSection title="Scheduler" section={sections.scheduler} {now} {clientOffline} href="/agents" testid="dash-scheduler" let:data>
-							<SchedulerTile {data} {now} />
-						</SnapshotSection>
-						<SnapshotSection title="Agents" section={sections.agents} {now} {clientOffline} href="/agents" testid="dash-agents" let:data>
-							<AgentsTile {data} />
-						</SnapshotSection>
-					</div>
-				</section>
-
-				<!-- Tier 4: research funnel -->
-				<section>
-					<h2 class="mb-1 text-[10px] font-bold uppercase tracking-widest text-gray-400">Research</h2>
-					<div class="grid grid-cols-1 gap-2 lg:grid-cols-2">
-						<SnapshotSection title="Pipeline" section={sections.pipeline} {now} {clientOffline} href="/pipeline" testid="dash-pipeline" let:data>
-							<PipelineTile {data} />
-						</SnapshotSection>
-						<SnapshotSection title="Leaderboard" section={sections.leaderboard} {now} {clientOffline} href="/all-trades" testid="dash-leaderboard" let:data>
-							<LeaderboardTile {data} />
-						</SnapshotSection>
-					</div>
-				</section>
+				</div>
 			</div>
+		</div>
+	{/if}
+
+	{#if loadingError}
+		<div
+			class="flex-shrink-0 border border-red-900 bg-red-500/5 px-4 py-2 text-xs text-red-400"
+		>
+			{loadingError}
 		</div>
 	{/if}
 </div>
