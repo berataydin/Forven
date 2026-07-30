@@ -37,7 +37,6 @@ def _instant_halt_confirms(monkeypatch):
     monkeypatch.setattr(_risk, "_open_live_notional_usd", lambda: float("inf"))
 
 
-
 class TestModeAwareRiskLimits:
     """Risk limits change based on execution mode."""
 
