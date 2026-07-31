@@ -38,7 +38,7 @@ def test_jump_guard_never_self_heals(forven_db):
 
 def test_jump_guard_still_accepts_losses_and_normal_moves(forven_db, monkeypatch):
     # EQ-DROP-1: a 50% loss flows through when open exposure can explain it.
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 200.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 200.0)
     state = {"last_equity": 600.0}
     ok, _ = risk._validate_equity_sample(300.0, state)  # $300 drop <= 2x$200 + $25
     assert ok
@@ -110,7 +110,7 @@ def test_same_basis_drop_without_drain_flag_still_draws_down(forven_db, monkeypa
     Open exposure covers the drop (EQ-DROP-1's bound is about IMPOSSIBLE losses,
     not real ones) and the confirmation spacing is zeroed so three back-to-back
     test ticks still count as independent (HALT-CONFIRM-2 has its own tests)."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 200.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 200.0)
     monkeypatch.setattr(risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
     _seed_live_state(675.0, 675.0, source="books_only")
     result = risk.update_equity(359.0, "books_only")  # rebaseline defaults False
@@ -349,7 +349,7 @@ def test_drop_guard_rejects_the_2026_07_28_phantom(forven_db, monkeypatch):
     """Incident replay: a 429 storm served one book's perp margin without its
     spot leg — $999.28 -> $516.82 — while total open live notional was ~$16.
     The sample must be REJECTED with anchors frozen: no halt, no drawdown."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 16.3)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 16.3)
     _seed_live_state(999.45, 999.28, source="books_only")
     _seed_daily(999.28)
     for _ in range(3):
@@ -365,7 +365,7 @@ def test_drop_guard_rejects_the_2026_07_28_phantom(forven_db, monkeypatch):
 def test_drop_guard_alerts_operator_after_persistent_rejects(forven_db, monkeypatch):
     from forven.notifications import list_notifications, update_notification_preferences
     update_notification_preferences({"discord_mode": "shadow"})
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 0.0)
     state = {"last_equity": 999.0, "equity_source": "books_only"}
     for _ in range(risk._EQUITY_JUMP_ALERT_AFTER_REJECTS):
         ok, reason = risk._validate_equity_sample(500.0, state, source="books_only")
@@ -375,11 +375,11 @@ def test_drop_guard_alerts_operator_after_persistent_rejects(forven_db, monkeypa
 
 
 def test_drop_guard_ignores_small_drops_and_covered_losses(forven_db, monkeypatch):
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 0.0)
     state = {"last_equity": 1000.0, "equity_source": "books_only"}
     ok, _ = risk._validate_equity_sample(950.0, state, source="books_only")
     assert ok, "a 5% drop is inside normal variance — never second-guessed"
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 400.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 400.0)
     state = {"last_equity": 1000.0, "equity_source": "books_only"}
     ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
     assert ok, "a 60% drop covered by open exposure is a real loss — flows through"
@@ -388,14 +388,14 @@ def test_drop_guard_ignores_small_drops_and_covered_losses(forven_db, monkeypatc
 def test_drop_guard_stands_down_when_notional_unreadable(forven_db, monkeypatch):
     """An unreadable trades table must not suppress a genuine halt — the guard
     accepts the sample and the normal drawdown machinery judges it."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: None)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: None)
     state = {"last_equity": 1000.0, "equity_source": "books_only"}
     ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
     assert ok
 
 
 def test_drop_guard_skips_basis_change_and_rebaseline_ticks(forven_db, monkeypatch):
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 0.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 0.0)
     state = {"last_equity": 1000.0, "equity_source": "books_aggregate"}
     ok, _ = risk._validate_equity_sample(400.0, state, source="books_only")
     assert ok, "a basis change is re-anchored by its own path, not judged as a drop"
@@ -408,7 +408,7 @@ def test_degraded_ticks_never_confirm_a_halt(forven_db, monkeypatch):
     """HALT-CONFIRM-2: a tick built on substituted/failed wallet reads can breach
     all it wants — it cannot advance the confirmation streak, so a venue outage
     can never confirm its own phantom."""
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 500.0)
     kv_set("kill_switch_enabled", False)
     _seed_live_state(675.0, 675.0, source="books_only")
     _seed_daily(675.0)
@@ -425,7 +425,7 @@ def test_confirmations_require_spacing_between_ticks(forven_db, monkeypatch):
     and the halt latches on the third INDEPENDENT one."""
     from datetime import timedelta
 
-    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda: 500.0)
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 500.0)
     kv_set("kill_switch_enabled", False)
     _seed_live_state(675.0, 675.0, source="books_only")
     _seed_daily(675.0)
@@ -443,3 +443,271 @@ def test_confirmations_require_spacing_between_ticks(forven_db, monkeypatch):
     result = risk.update_equity(359.0, "books_only")  # counts: 3/3 — latches
     assert result.get("daily_halt") is True
     assert kv_get("risk_state", {}).get("daily_loss_halt") is True
+
+
+# ------------------------------------------------- EQ-DROP-2 / M9-BOOKS-1
+
+
+def _seed_closed_live_trade(trade_id, notional, closed_ago_sql="-5 minutes"):
+    """A live trade CLOSED `closed_ago_sql` ago with entry*size == notional."""
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO trades
+            (id, strategy, strategy_id, asset, direction, entry_price, size, risk_pct,
+             leverage, status, execution_type, opened_at, closed_at)
+            VALUES (?, 's', 's', 'BTC', 'long', ?, 1.0, 0.01, 1.0, 'CLOSED', 'live',
+                    datetime('now', '-1 hour'), datetime('now', ?))
+            """,
+            (trade_id, float(notional), closed_ago_sql),
+        )
+
+
+def _minutes_ago(minutes):
+    from datetime import timedelta
+
+    return (risk.get_now() - timedelta(minutes=minutes)).isoformat()
+
+
+def test_drop_bound_counts_closes_after_the_anchor(forven_db):
+    """EQ-DROP-2: a crash's positions are stopped out AFTER the last accepted
+    anchor and BEFORE the storm-delayed read recovers — the bound must count
+    them or the genuine drop is rejected forever and the halt never latches."""
+    _seed_closed_live_trade("c-post-anchor", 500.0, "-5 minutes")
+    anchor = _minutes_ago(10)  # anchored BEFORE the close — its loss is unexplained
+    assert risk._open_live_notional_usd(anchor_at=anchor) == pytest.approx(500.0)
+
+    state = {"last_equity": 1000.0, "equity_source": "books_only", "updated_at": anchor}
+    ok, _ = risk._validate_equity_sample(550.0, state, source="books_only")
+    assert ok, "a 45% drop explained by a post-anchor 500-notional close is a REAL loss"
+
+
+def test_drop_bound_excludes_closes_already_reflected_in_anchor(forven_db):
+    """Cross-review blocker on fbf45285: closes that PRE-date the anchor are
+    already in the anchor's value and cannot explain a later delta — ordinary
+    turnover must not launder a partial-wallet phantom."""
+    for i in range(3):
+        _seed_closed_live_trade(f"c-pre-anchor-{i}", 250.0, "-5 minutes")
+    anchor = _minutes_ago(2)  # anchored AFTER the closes — their PnL is inside it
+    assert risk._open_live_notional_usd(anchor_at=anchor) == pytest.approx(0.0)
+
+    state = {"last_equity": 1000.0, "equity_source": "books_only", "updated_at": anchor}
+    ok, reason = risk._validate_equity_sample(500.0, state, source="books_only")
+    assert not ok and "suspect partial read" in reason
+
+
+def test_drop_bound_falls_back_to_window_without_anchor_stamp(forven_db):
+    """No usable anchor stamp -> bounded wall-clock fallback: an hours-old
+    close explains nothing, and the 2026-07-28 phantom class (big drop, no
+    open exposure, no recent closes) stays rejected — through the real DB
+    query, not a monkeypatch."""
+    _seed_closed_live_trade("c-stale", 500.0, "-2 hours")
+    assert risk._open_live_notional_usd() == pytest.approx(0.0)
+
+    state = {"last_equity": 999.28, "equity_source": "books_only"}
+    ok, reason = risk._validate_equity_sample(516.82, state, source="books_only")
+    assert not ok and "suspect partial read" in reason
+
+
+def _books_live_gate(monkeypatch, *, short_addr="", captured=None, acct_val=999.0):
+    """Arm the can_open live margin gate with books enabled."""
+    import forven.config as config
+    import forven.exchange.hyperliquid as hl
+
+    kv_set("forven:settings", {
+        "live_books_enabled": True,
+        "hyperliquid_long_book_address": "",
+        "hyperliquid_short_book_address": short_addr,
+    })
+    monkeypatch.setattr(config, "get_execution_mode", lambda: "live")
+
+    def _fake_account_value(**kw):
+        if captured is not None:
+            captured.update(kw)
+        return {"accountValue": acct_val, "totalMarginUsed": 0.0}
+
+    monkeypatch.setattr(hl, "get_account_value", _fake_account_value)
+    monkeypatch.setattr(hl, "resolve_configured_testnet", lambda: True)
+
+
+def _seed_aggregate(equity, *, source="books_aggregate", age_minutes=1):
+    kv_set("risk_state", {
+        "last_equity": equity,
+        "equity_source": source,
+        "updated_at": _minutes_ago(age_minutes),
+    })
+
+
+def test_m9_books_open_path_refuses_on_validated_aggregate(forven_db, monkeypatch):
+    """M9-BOOKS-1: with books enabled, the open-path daily-halt recompute uses
+    the daemon's last VALIDATED aggregate — a healthy master-only read must not
+    hide a crashed aggregate (the pre-fix gate skipped the recompute entirely,
+    so new opens sailed through the whole unlatched window)."""
+    _books_live_gate(monkeypatch)
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+
+    _seed_aggregate(600.0)
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False
+    assert "Daily loss limit" in reason
+
+    # Healthy fresh aggregate -> no false halt from the basis mix.
+    _seed_aggregate(990.0)
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s2", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is True, reason
+
+
+def test_m9_books_gate_runs_for_configured_book_subaccounts(forven_db, monkeypatch):
+    """Cross-review blocker on fbf45285: an order routed to a CONFIGURED book
+    subaccount sets account_address — the aggregate check is GLOBAL and must
+    run for it all the same."""
+    captured = {}
+    _books_live_gate(monkeypatch, short_addr="0xShortBookSubAccount", captured=captured)
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+    _seed_aggregate(600.0)
+
+    allowed, _r, reason = risk.can_open(
+        "ETH", "short", "s", risk_pct=0.01, execution_type="live", book="short"
+    )
+    assert captured.get("account_address") == "0xShortBookSubAccount", (
+        "probe expectation: the margin read routed to the subaccount"
+    )
+    assert allowed is False
+    assert "Daily loss limit" in reason
+
+
+def test_m9_books_fails_closed_without_fresh_same_basis_aggregate(forven_db, monkeypatch):
+    """Stale, missing, or wrong-basis aggregate state = the daily rule cannot
+    be verified -> the open is REFUSED explicitly (margin-check policy), not
+    silently waved through."""
+    _books_live_gate(monkeypatch)
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+
+    _seed_aggregate(990.0, age_minutes=10)  # stale: > _M9_BOOKS_EQUITY_MAX_AGE_SECONDS
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False and "Cannot verify book-aggregate equity" in reason
+
+    kv_set("risk_state", {"last_equity": 990.0, "equity_source": "books_aggregate"})
+    allowed, _r, reason = risk.can_open(  # missing stamp
+        "BTC", "long", "s2", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False and "Cannot verify book-aggregate equity" in reason
+
+    _seed_aggregate(990.0, source="exchange")  # wrong basis for books mode
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s3", risk_pct=0.01, execution_type="live", book="long"
+    )
+    assert allowed is False and "Cannot verify book-aggregate equity" in reason
+
+
+def test_margin_gate_fails_closed_on_zero_account_value(forven_db, monkeypatch):
+    """Cross-review blocker on 41e5dd85: get_account_value normalizes
+    missing/non-numeric perp fields to 0.0 and returns NORMALLY — the old
+    `if acct_val > 0` nesting then skipped the margin check AND the books M9
+    gate on that shape. A successful read of a non-positive value is still
+    'cannot verify' and must refuse the open."""
+    captured = {}
+    _books_live_gate(
+        monkeypatch, short_addr="0xShortBookSubAccount", captured=captured, acct_val=0.0
+    )
+    kv_set("daily_risk", {"date": get_today().isoformat(), "start_equity": 1000.0})
+    _seed_aggregate(600.0)
+
+    allowed, _r, reason = risk.can_open(
+        "ETH", "short", "s", risk_pct=0.01, execution_type="live", book="short"
+    )
+    assert captured.get("account_address") == "0xShortBookSubAccount"
+    assert allowed is False
+    assert "Cannot verify exchange margin" in reason
+
+
+def test_margin_gate_fails_closed_on_zero_value_books_off(forven_db, monkeypatch):
+    """Same boundary with books disabled — the zero-value fail-open predates
+    the books work and closes for every forced-live deployment."""
+    import forven.config as config
+    import forven.exchange.hyperliquid as hl
+
+    kv_set("forven:settings", {"live_books_enabled": False})
+    monkeypatch.setattr(config, "get_execution_mode", lambda: "live")
+    monkeypatch.setattr(hl, "get_account_value",
+                        lambda **kw: {"accountValue": 0.0, "totalMarginUsed": 0.0})
+    monkeypatch.setattr(hl, "resolve_configured_testnet", lambda: True)
+
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", "s", risk_pct=0.01, execution_type="live"
+    )
+    assert allowed is False
+    assert "Cannot verify exchange margin" in reason
+
+
+@pytest.mark.parametrize("exec_type", ["paper", "paper_challenger", "simulation"])
+def test_rule_0c_never_gates_paper_opens(forven_db, monkeypatch, exec_type):
+    """PAPER-HALT-1: Rule 0c is a real-capital margin gate, so it must be
+    scoped away from paper exactly like the Rule 0 halts. A paper open never
+    reaches the exchange, and every Rule 0c refusal is fail-closed — so
+    leaving paper inside the block lets a real-wallet condition freeze all
+    paper research. Concretely: with books enabled the master perp account
+    legitimately reads 0 (capital lives in the book sub-accounts), which
+    refused EVERY paper open on a live deploy."""
+    _books_live_gate(monkeypatch, acct_val=0.0)
+
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", f"s-{exec_type}", risk_pct=0.01, execution_type=exec_type
+    )
+    assert allowed is True, reason
+
+
+def test_rule_0c_still_gates_unscoped_opens(forven_db, monkeypatch):
+    """Counterpart to the above: an open with NO execution_type is the legacy
+    live scope and must stay inside Rule 0c."""
+    _books_live_gate(monkeypatch, acct_val=0.0)
+
+    allowed, _r, reason = risk.can_open("BTC", "long", "s-legacy", risk_pct=0.01)
+    assert allowed is False
+    assert "Cannot verify exchange margin" in reason
+
+
+def test_degraded_tick_does_not_reset_breach_streak(forven_db, monkeypatch):
+    """HALT-CONFIRM-3: a degraded tick can neither COUNT (HALT-CONFIRM-2) nor
+    RESET a live streak — a substituted cache value that masks the breach must
+    not wipe real confirmation progress (else an intermittent storm defers a
+    genuine halt indefinitely). A CLEAN non-breaching tick still resets."""
+    from datetime import timedelta
+
+    monkeypatch.setattr(risk, "_open_live_notional_usd", lambda anchor_at=None: 500.0)
+    kv_set("kill_switch_enabled", False)
+    _seed_live_state(675.0, 675.0, source="books_only")
+    _seed_daily(675.0)
+
+    base = risk.get_now()
+    current = {"t": base}
+    monkeypatch.setattr(risk, "get_now", lambda: current["t"])
+
+    risk.update_equity(359.0, "books_only")                      # counts: 1/3
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 1
+    current["t"] = base + timedelta(seconds=25)
+    risk.update_equity(675.0, "books_only", degraded=True)       # masked: must NOT reset
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 1
+    current["t"] = base + timedelta(seconds=50)
+    risk.update_equity(359.0, "books_only")                      # counts: 2/3
+    current["t"] = base + timedelta(seconds=75)
+    result = risk.update_equity(359.0, "books_only")             # counts: 3/3 — latches
+    assert result.get("daily_halt") is True
+
+    # Control: a CLEAN recovery tick still clears the streak.
+    kv_set("risk_state", {})
+    _seed_live_state(675.0, 675.0, source="books_only")
+    _seed_daily(675.0)
+    current["t"] = base + timedelta(seconds=200)
+    risk.update_equity(359.0, "books_only")                      # counts: 1/3
+    current["t"] = base + timedelta(seconds=225)
+    risk.update_equity(675.0, "books_only")                      # clean recovery: resets
+    assert int(kv_get("risk_state", {}).get("daily_halt_breach_streak") or 0) == 0
