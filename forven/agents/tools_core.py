@@ -185,6 +185,7 @@ async def _kill_shell_process_tree(proc: asyncio.subprocess.Process) -> None:
         "required": ["command"],
     },
     is_async=True,
+    category="catastrophic",
 )
 async def _tool_run_shell(command: str) -> str:
     """Execute a shell command with timeout."""
