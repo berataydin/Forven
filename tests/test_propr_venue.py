@@ -134,6 +134,11 @@ def test_open_ignores_a_fresh_but_stale_paper_verdict(monkeypatch):
     still INSIDE the 300 s TTL, so the pre-fix guard served it and admitted
     real-capital opens the operator never opted into — for up to a full TTL
     after the account stopped being paper.
+
+    Hermetic by construction: everything past the guard is stubbed and
+    _create_orders is a tripwire, so if the cached-paper bug ever comes back
+    the test fails HERE — a safety regression test must never have to reach
+    Hyperliquid or an authenticated Propr endpoint to prove the failure.
     """
     from forven.exchange import propr
 
@@ -148,9 +153,61 @@ def test_open_ignores_a_fresh_but_stale_paper_verdict(monkeypatch):
         propr, "get_challenge_attempt",
         lambda attempt_id: {"account": {"type": "funded"}},
     )
+    # Stub the whole post-guard path (as armed_propr does) …
+    monkeypatch.setattr(propr, "get_all_mids", lambda testnet=True: {"BTC": 50_000.0})
+    monkeypatch.setattr(propr, "_quantize_size", lambda asset, size: float(size))
+    monkeypatch.setattr(propr, "_round_price", lambda price, asset: float(price))
+    import forven.exchange.liquidity as liquidity
+    monkeypatch.setattr(liquidity, "check_order_liquidity", lambda *a, **k: (True, None))
+
+    # … and make order creation the tripwire (AssertionError is not caught by
+    # market_order's ProprApiError handler, so it surfaces as the failure).
+    def _tripwire(account_id, orders, group_id=None):
+        raise AssertionError(
+            "regression: an order reached the venue — the open guard served the "
+            "stale cached 'paper' verdict instead of re-verifying"
+        )
+
+    monkeypatch.setattr(propr, "_create_orders", _tripwire)
 
     with pytest.raises(RuntimeError, match="not verifiably a paper"):
         propr.market_order("BTC", "buy", 0.001)
+
+
+def test_failed_forced_refresh_drops_the_cached_verdict(monkeypatch):
+    """The guard's forced re-read failing must INVALIDATE the cache, not just
+    return None: get_status() renders orders_allowed from the next non-forced
+    read, and a surviving still-fresh "paper" entry would tell the operator
+    opens are allowed seconds after the guard refused one for the very same
+    unverifiable account."""
+    from forven.exchange import propr
+
+    monkeypatch.setitem(propr._account_type_cache, "type", "paper")
+    monkeypatch.setitem(propr._account_type_cache, "at", time.time() - 1.0)
+
+    def _venue_down(force_refresh=False):
+        raise propr.ProprApiError(0, "venue unreachable")
+
+    monkeypatch.setattr(propr, "resolve_account", _venue_down)
+
+    assert propr.get_account_type(force_refresh=True) is None
+    # The pinned sequence: the stale verdict is GONE, not waiting to resurface.
+    assert propr._account_type_cache["type"] is None
+    assert propr.get_account_type() is None
+
+
+def test_unverifiable_type_read_drops_the_cached_verdict(monkeypatch):
+    """Same drop when the venue answers but reports no usable account type."""
+    from forven.exchange import propr
+
+    monkeypatch.setitem(propr._account_type_cache, "type", "paper")
+    monkeypatch.setitem(propr._account_type_cache, "at", time.time() - 1.0)
+    monkeypatch.setattr(propr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setattr(propr, "get_challenge_attempt", lambda attempt_id: {"account": {}})
+
+    assert propr.get_account_type(force_refresh=True) is None
+    assert propr._account_type_cache["type"] is None
+    assert propr.get_account_type() is None
 
 
 def test_open_guard_still_honours_a_live_paper_verdict(monkeypatch):

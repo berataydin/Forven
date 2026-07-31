@@ -216,7 +216,11 @@ def get_account_type(force_refresh: bool = False) -> str | None:
     """The exchange-reported Propr account type ('paper' during a trial).
 
     Cached briefly; a stale cache is NEVER trusted for the paper bypass — an
-    expired entry re-reads, and a failed re-read returns None (fail closed).
+    expired entry re-reads, and a failed re-read returns None (fail closed)
+    AND drops any cached verdict. Without the drop, the open guard's forced
+    re-read failing would leave a still-fresh "paper" entry behind for the
+    next NON-forced read, so get_status() would render orders_allowed=true
+    seconds after the guard refused an open for the same unverifiable account.
     """
     now = time.time()
     if (
@@ -233,8 +237,10 @@ def get_account_type(force_refresh: bool = False) -> str | None:
         if raw:
             _account_type_cache.update({"type": raw, "at": now})
             return raw
+        _account_type_cache.update({"type": None, "at": 0.0})
         return None
     except ProprApiError as exc:
+        _account_type_cache.update({"type": None, "at": 0.0})
         log.warning("Could not verify Propr account type (fail closed): %s", exc)
         return None
 
