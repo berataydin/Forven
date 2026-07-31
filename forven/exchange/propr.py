@@ -1416,13 +1416,26 @@ def get_status(include_remote: bool = True) -> dict:
             if isinstance(attempt, dict) and attempt:
                 status["attempt_status"] = attempt.get("status")
             status["account_type"] = get_account_type()
-            # Orders place when the operator opted in OR the account is a
+            # OPENS place when the operator opted in OR the account is a
             # verifiable paper/trial account — the page renders this truth.
             status["orders_allowed"] = bool(
                 status["allow_live"] or status["account_type"] == "paper"
             )
+            # EXITS are a separate permission (PROPR-PERM-2) and need no opt-in,
+            # reported explicitly so the page never has to infer "can I get out?"
+            # from the open-oriented flag — telling an operator they are locked
+            # in when they are not is the failure this whole change exists to
+            # prevent.
+            status["closes_allowed"] = True
         except ProprApiError as exc:
             status["account_error"] = str(exc)
+            # Account resolution failed, so NEITHER permission can be honoured:
+            # every order path, exits included, calls resolve_account() and will
+            # raise the same error. Say so rather than leaving the flags unset —
+            # an absent orders_allowed reads as False downstream and would let
+            # the page promise exits that cannot actually be placed.
+            status["orders_allowed"] = False
+            status["closes_allowed"] = False
         status["connected"] = True
     except ProprApiError as exc:
         status["connected"] = False

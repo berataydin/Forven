@@ -180,8 +180,10 @@ def propr_mirror_tick_now():
 def propr_close_position(body: ClosePositionRequest):
     """Manual reduce-only close of a Propr position from the page.
 
-    Placement is still gated by the adapter's FORVEN_ALLOW_PROPR_LIVE guard —
-    without it this returns the guard's refusal instead of closing.
+    NOT gated by FORVEN_ALLOW_PROPR_LIVE. A close is risk-REDUCING, so it goes
+    through the adapter's reduce lane (PROPR-PERM-2), which asks only for the
+    integration flag — refusing an exit would strand the position this endpoint
+    exists to unwind. Opens are the ones that need the opt-in.
     """
     _require_enabled()
     if not body.confirm:

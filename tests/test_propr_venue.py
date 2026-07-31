@@ -127,6 +127,52 @@ def _converted_to_funded(monkeypatch):
     return propr
 
 
+def _status_stubs(monkeypatch):
+    from forven.exchange import propr
+
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.delenv("FORVEN_ALLOW_PROPR_LIVE", raising=False)
+    monkeypatch.setattr(propr, "get_api_key", lambda: "k")
+    monkeypatch.setattr(propr, "get_user", lambda: {"userId": "u-1"})
+    monkeypatch.setattr(propr, "get_account_value",
+                        lambda *a, **k: {"accountValue": 5000.0})
+    return propr
+
+
+def test_status_reports_exits_as_their_own_permission(monkeypatch):
+    """PROPR-PERM-2 in the operator status. After conversion, opens are refused
+    but exits are not — the page must be able to say so from the status rather
+    than infer "can I get out?" from the open-oriented flag."""
+    propr = _status_stubs(monkeypatch)
+    monkeypatch.setattr(propr, "resolve_account",
+                        lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setattr(propr, "get_account_type", lambda force_refresh=False: "funded")
+
+    status = propr.get_status()
+    assert status["orders_allowed"] is False
+    assert status["closes_allowed"] is True
+
+
+def test_status_fails_both_permissions_when_the_account_cannot_resolve(monkeypatch):
+    """Codex review finding on 06018b18: get_status() left orders_allowed UNSET
+    when resolve_account() raised, which reads as False downstream — so the
+    disarmed banner fired and promised that closes, protective legs and cancels
+    "all still work". They do not: every one of them calls resolve_account() and
+    raises the same error. Neither permission is honourable in that state."""
+    propr = _status_stubs(monkeypatch)
+
+    def _boom(force_refresh=False):
+        raise propr.ProprApiError(0, "challenge-attempt lookup failed")
+
+    monkeypatch.setattr(propr, "resolve_account", _boom)
+
+    status = propr.get_status()
+    assert status["connected"] is True
+    assert "challenge-attempt lookup failed" in status["account_error"]
+    assert status["orders_allowed"] is False
+    assert status["closes_allowed"] is False
+
+
 def test_open_ignores_a_fresh_but_stale_paper_verdict(monkeypatch):
     """PROPR-PERM-1: the paper bypass must re-verify, not read its own cache.
 

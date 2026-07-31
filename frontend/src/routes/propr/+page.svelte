@@ -418,7 +418,14 @@
 				<h2 class="text-sm font-bold uppercase tracking-wider text-white">Connection</h2>
 				<span class="text-[10px] text-[#666]">{status?.base_url}</span>
 			</div>
-			{#if status?.connected && !status?.orders_allowed}
+			{#if status?.connected && status?.account_error}
+				<div class="border border-red-900 bg-red-500/5 px-3 py-2 text-[11px] text-red-400">
+					Propr answered, but your ACCOUNT could not be resolved ({status.account_error}).
+					Nothing can be placed until that clears — opens, closes, protective legs and cancels
+					all resolve the same account and will fail with this error. This is a venue or
+					connection problem, not the permission gate.
+				</div>
+			{:else if status?.connected && !status?.orders_allowed}
 				<div class="border border-yellow-900 bg-yellow-500/5 px-3 py-2 text-[11px] text-yellow-500">
 					NEW POSITIONS are DISARMED: the account is not verifiably a paper/trial account
 					(type: {status?.account_type ?? 'unknown'}) and the backend live opt-in is not set.
