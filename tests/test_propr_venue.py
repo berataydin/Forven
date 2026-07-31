@@ -12,6 +12,7 @@ stamped-venue close routing.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -96,7 +97,7 @@ def test_market_order_refuses_without_opt_in_or_paper_account(monkeypatch):
         propr.market_order("BTC", "buy", 0.001)
 
 
-def test_real_account_type_fails_closed(monkeypatch):
+def test_real_account_type_fails_closed_for_opens(monkeypatch):
     from forven.exchange import propr
 
     monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
@@ -104,9 +105,233 @@ def test_real_account_type_fails_closed(monkeypatch):
     # The evaluation ended: Propr now reports a funded/real account type.
     monkeypatch.setattr(propr, "get_account_type", lambda force_refresh=False: "live")
     with pytest.raises(RuntimeError, match="not verifiably a paper"):
-        propr.close_position("BTC", 0.001, "sell")
+        propr.market_order("BTC", "buy", 0.001)
+    with pytest.raises(RuntimeError, match="not verifiably a paper"):
+        propr.limit_order("BTC", "buy", 0.001, 50_000.0)
     with pytest.raises(RuntimeError, match="not verifiably a paper"):
         propr.set_leverage("BTC", 2.0)
+
+
+# ---------------------------------------------------------------------------
+# PROPR-PERM: opening and closing are separate permissions
+# ---------------------------------------------------------------------------
+
+def _converted_to_funded(monkeypatch):
+    """The account Propr just flipped from trial to funded, no operator opt-in."""
+    from forven.exchange import propr
+
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.delenv("FORVEN_ALLOW_PROPR_LIVE", raising=False)
+    monkeypatch.setattr(propr, "get_account_type", lambda force_refresh=False: "funded")
+    monkeypatch.setattr(propr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    return propr
+
+
+def _status_stubs(monkeypatch):
+    from forven.exchange import propr
+
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.delenv("FORVEN_ALLOW_PROPR_LIVE", raising=False)
+    monkeypatch.setattr(propr, "get_api_key", lambda: "k")
+    monkeypatch.setattr(propr, "get_user", lambda: {"userId": "u-1"})
+    monkeypatch.setattr(propr, "get_account_value",
+                        lambda *a, **k: {"accountValue": 5000.0})
+    return propr
+
+
+def test_status_reports_exits_as_their_own_permission(monkeypatch):
+    """PROPR-PERM-2 in the operator status. After conversion, opens are refused
+    but exits are not — the page must be able to say so from the status rather
+    than infer "can I get out?" from the open-oriented flag."""
+    propr = _status_stubs(monkeypatch)
+    monkeypatch.setattr(propr, "resolve_account",
+                        lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setattr(propr, "get_account_type", lambda force_refresh=False: "funded")
+
+    status = propr.get_status()
+    assert status["orders_allowed"] is False
+    assert status["closes_allowed"] is True
+
+
+def test_status_fails_both_permissions_when_the_account_cannot_resolve(monkeypatch):
+    """Codex review finding on 06018b18: get_status() left orders_allowed UNSET
+    when resolve_account() raised, which reads as False downstream — so the
+    disarmed banner fired and promised that closes, protective legs and cancels
+    "all still work". They do not: every one of them calls resolve_account() and
+    raises the same error. Neither permission is honourable in that state."""
+    propr = _status_stubs(monkeypatch)
+
+    def _boom(force_refresh=False):
+        raise propr.ProprApiError(0, "challenge-attempt lookup failed")
+
+    monkeypatch.setattr(propr, "resolve_account", _boom)
+
+    status = propr.get_status()
+    assert status["connected"] is True
+    assert "challenge-attempt lookup failed" in status["account_error"]
+    assert status["orders_allowed"] is False
+    assert status["closes_allowed"] is False
+
+
+def test_open_ignores_a_fresh_but_stale_paper_verdict(monkeypatch):
+    """PROPR-PERM-1: the paper bypass must re-verify, not read its own cache.
+
+    A "paper" entry written seconds before Propr flips the attempt to funded is
+    still INSIDE the 300 s TTL, so the pre-fix guard served it and admitted
+    real-capital opens the operator never opted into — for up to a full TTL
+    after the account stopped being paper.
+
+    Hermetic by construction: everything past the guard is stubbed and
+    _create_orders is a tripwire, so if the cached-paper bug ever comes back
+    the test fails HERE — a safety regression test must never have to reach
+    Hyperliquid or an authenticated Propr endpoint to prove the failure.
+    """
+    from forven.exchange import propr
+
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.delenv("FORVEN_ALLOW_PROPR_LIVE", raising=False)
+    # Cached one second ago, i.e. 299 s of TTL left.
+    monkeypatch.setitem(propr._account_type_cache, "type", "paper")
+    monkeypatch.setitem(propr._account_type_cache, "at", time.time() - 1.0)
+    # The venue's current truth: the evaluation converted.
+    monkeypatch.setattr(propr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setattr(
+        propr, "get_challenge_attempt",
+        lambda attempt_id: {"account": {"type": "funded"}},
+    )
+    # Stub the whole post-guard path (as armed_propr does) …
+    monkeypatch.setattr(propr, "get_all_mids", lambda testnet=True: {"BTC": 50_000.0})
+    monkeypatch.setattr(propr, "_quantize_size", lambda asset, size: float(size))
+    monkeypatch.setattr(propr, "_round_price", lambda price, asset: float(price))
+    import forven.exchange.liquidity as liquidity
+    monkeypatch.setattr(liquidity, "check_order_liquidity", lambda *a, **k: (True, None))
+
+    # … and make order creation the tripwire (AssertionError is not caught by
+    # market_order's ProprApiError handler, so it surfaces as the failure).
+    def _tripwire(account_id, orders, group_id=None):
+        raise AssertionError(
+            "regression: an order reached the venue — the open guard served the "
+            "stale cached 'paper' verdict instead of re-verifying"
+        )
+
+    monkeypatch.setattr(propr, "_create_orders", _tripwire)
+
+    with pytest.raises(RuntimeError, match="not verifiably a paper"):
+        propr.market_order("BTC", "buy", 0.001)
+
+
+def test_failed_forced_refresh_drops_the_cached_verdict(monkeypatch):
+    """The guard's forced re-read failing must INVALIDATE the cache, not just
+    return None: get_status() renders orders_allowed from the next non-forced
+    read, and a surviving still-fresh "paper" entry would tell the operator
+    opens are allowed seconds after the guard refused one for the very same
+    unverifiable account."""
+    from forven.exchange import propr
+
+    monkeypatch.setitem(propr._account_type_cache, "type", "paper")
+    monkeypatch.setitem(propr._account_type_cache, "at", time.time() - 1.0)
+
+    def _venue_down(force_refresh=False):
+        raise propr.ProprApiError(0, "venue unreachable")
+
+    monkeypatch.setattr(propr, "resolve_account", _venue_down)
+
+    assert propr.get_account_type(force_refresh=True) is None
+    # The pinned sequence: the stale verdict is GONE, not waiting to resurface.
+    assert propr._account_type_cache["type"] is None
+    assert propr.get_account_type() is None
+
+
+def test_unverifiable_type_read_drops_the_cached_verdict(monkeypatch):
+    """Same drop when the venue answers but reports no usable account type."""
+    from forven.exchange import propr
+
+    monkeypatch.setitem(propr._account_type_cache, "type", "paper")
+    monkeypatch.setitem(propr._account_type_cache, "at", time.time() - 1.0)
+    monkeypatch.setattr(propr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setattr(propr, "get_challenge_attempt", lambda attempt_id: {"account": {}})
+
+    assert propr.get_account_type(force_refresh=True) is None
+    assert propr._account_type_cache["type"] is None
+    assert propr.get_account_type() is None
+
+
+def test_open_guard_still_honours_a_live_paper_verdict(monkeypatch):
+    """Counterpart: forcing the refresh must not break the legitimate bypass."""
+    from forven.exchange import propr
+
+    monkeypatch.setenv("FORVEN_PROPR_ENABLED", "1")
+    monkeypatch.delenv("FORVEN_ALLOW_PROPR_LIVE", raising=False)
+    monkeypatch.setattr(propr, "resolve_account", lambda force_refresh=False: ("acct-1", "att-1"))
+    monkeypatch.setattr(
+        propr, "get_challenge_attempt",
+        lambda attempt_id: {"account": {"type": "paper"}},
+    )
+    propr._assert_propr_open_allowed()  # must not raise
+
+
+def test_reduce_guard_survives_conversion_to_funded(monkeypatch):
+    """PROPR-PERM-2: an exit is not an open. Once the bypass dies, the operator
+    must still be able to get OUT of whatever is already on the book."""
+    propr = _converted_to_funded(monkeypatch)
+
+    propr._assert_propr_reduce_allowed()  # must not raise
+    with pytest.raises(RuntimeError, match="not verifiably a paper"):
+        propr._assert_propr_open_allowed()
+
+
+def test_reduce_guard_still_requires_the_integration_flag(monkeypatch):
+    """The hidden flag is the floor under BOTH lanes — with Propr switched off
+    there is no session to be exiting from."""
+    from forven.exchange import propr
+
+    monkeypatch.delenv("FORVEN_PROPR_ENABLED", raising=False)
+    monkeypatch.delenv("FORVEN_ALLOW_PROPR_LIVE", raising=False)
+    with pytest.raises(RuntimeError, match="not enabled"):
+        propr._assert_propr_reduce_allowed()
+
+
+def test_close_position_reaches_the_venue_after_conversion(monkeypatch):
+    """End-to-end on the path that matters: a reduce-only close on a converted
+    account must get all the way to the venue call, not die at the guard."""
+    propr = _converted_to_funded(monkeypatch)
+    monkeypatch.setattr(propr, "get_all_mids", lambda testnet=True: {"BTC": 50_000.0})
+    monkeypatch.setattr(propr, "_quantize_size", lambda asset, size: float(size))
+    monkeypatch.setattr(propr, "_round_price", lambda price, asset: float(price))
+
+    def _boom(account_id, orders, group_id=None):
+        assert orders[0]["reduceOnly"] is True
+        raise propr.ProprApiError(0, "reached the venue")
+
+    monkeypatch.setattr(propr, "_create_orders", _boom)
+
+    result = propr.close_position("BTC", 0.001, "sell")
+    assert "reached the venue" in result["error"]
+
+
+def test_protective_leg_reaches_the_venue_after_conversion(monkeypatch):
+    """A stop can only ever be armed against an ALREADY-OPEN position, so it
+    caps risk — losing the ability to place one is the opposite of safe."""
+    propr = _converted_to_funded(monkeypatch)
+    monkeypatch.setattr(propr, "_find_position", lambda asset, direction: None)
+
+    result = propr._place_conditional(
+        "BTC", "long", 0.001, 49_000.0, "stop_market", "stop",
+    )
+    assert "no open Propr BTC long position to protect" in result["error"]
+
+
+def test_cancel_reaches_the_venue_after_conversion(monkeypatch):
+    """Cancel is how a stop gets re-placed; blocking it freezes stop management."""
+    propr = _converted_to_funded(monkeypatch)
+
+    def _boom(method, path, **kwargs):
+        raise propr.ProprApiError(0, "reached the venue")
+
+    monkeypatch.setattr(propr, "_request", _boom)
+
+    result = propr.cancel_order("BTC", "order-1")
+    assert "reached the venue" in result["error"]
 
 
 # ---------------------------------------------------------------------------

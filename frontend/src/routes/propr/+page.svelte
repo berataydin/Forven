@@ -379,7 +379,7 @@
 						class={`text-xs px-2 py-1 border ${accountIsPaper ? 'text-[#c9a227] border-[#8a6d1a]' : 'text-red-400 border-red-800'}`}
 						title={accountIsPaper
 							? 'Propr reports this account as a paper/trial account — mirrored orders spend no real money.'
-							: 'Propr reports this account as REAL — orders require the backend live opt-in.'}
+							: 'Propr reports this account as REAL — NEW positions require the backend live opt-in. Closes, protective legs and cancels are unaffected.'}
 					>
 						{accountIsPaper ? 'PAPER ACCOUNT' : `REAL (${status.account_type})`}
 					</span>
@@ -418,18 +418,27 @@
 				<h2 class="text-sm font-bold uppercase tracking-wider text-white">Connection</h2>
 				<span class="text-[10px] text-[#666]">{status?.base_url}</span>
 			</div>
-			{#if status?.connected && !status?.orders_allowed}
+			{#if status?.connected && status?.account_error}
+				<div class="border border-red-900 bg-red-500/5 px-3 py-2 text-[11px] text-red-400">
+					Propr answered, but your ACCOUNT could not be resolved ({status.account_error}).
+					Nothing can be placed until that clears — opens, closes, protective legs and cancels
+					all resolve the same account and will fail with this error. This is a venue or
+					connection problem, not the permission gate.
+				</div>
+			{:else if status?.connected && !status?.orders_allowed}
 				<div class="border border-yellow-900 bg-yellow-500/5 px-3 py-2 text-[11px] text-yellow-500">
-					Order placement is DISARMED: the account is not verifiably a paper/trial account
+					NEW POSITIONS are DISARMED: the account is not verifiably a paper/trial account
 					(type: {status?.account_type ?? 'unknown'}) and the backend live opt-in is not set.
-					Reads work; every open/close is refused. This is the designed behavior for when the
-					evaluation ends and the account becomes real.
+					This is the designed behavior for when the evaluation ends and the account becomes
+					real. You are NOT locked in: closing a position, arming a stop or take-profit, and
+					cancelling an order all still work (PROPR-PERM-2) — only opens need the opt-in.
 				</div>
 			{:else if accountIsPaper && !status?.allow_live}
 				<div class="border border-[#1a2438] bg-[#050a12] px-3 py-2 text-[11px] text-[#9ab]">
 					Orders are allowed WITHOUT the backend live opt-in because Propr reports this account
-					as paper — verified against the exchange every few minutes. The moment the evaluation
-					ends and the account type changes, order placement fails closed automatically.
+					as paper — re-verified against the exchange on every single open, not from a cache
+					(PROPR-PERM-1). The moment the evaluation ends and the account type changes, new
+					positions fail closed automatically; exits keep working.
 				</div>
 			{/if}
 			<div class="grid grid-cols-1 md:grid-cols-3 gap-2 items-end text-[11px]">

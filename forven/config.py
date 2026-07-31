@@ -230,9 +230,11 @@ def propr_enabled() -> bool:
     FORVEN_ALLOW_MAINNET guard, an operator must already know this exists to
     turn it on: set FORVEN_PROPR_ENABLED=1 in the environment, or hand-write
     "propr_enabled": true into config.json. The flag controls VISIBILITY only
-    (the Propr nav page + /api/propr routes); actually placing a Propr order
+    (the Propr nav page + /api/propr routes); OPENING a Propr position
     additionally requires FORVEN_ALLOW_PROPR_LIVE=1 (see forven.exchange.propr —
-    Propr has no testnet, every order is real challenge-account money).
+    Propr has no testnet, every entry is real challenge-account money). Closes,
+    protective legs and cancels need only this flag: refusing an exit strands a
+    live position rather than protecting it (PROPR-PERM-2).
 
     Beta builds are unconditionally OFF, same reasoning as the paper lock in
     get_execution_mode: a packaged-build tester must not be able to reach a

@@ -14,10 +14,16 @@ Safety model — Propr has NO testnet, every order spends real challenge money:
   deliberately absent from the settings manifest/UI; an operator must know to
   set ``FORVEN_PROPR_ENABLED=1`` (or hand-edit config.json). Gates the nav
   page, the /api/propr routes, and venue selection.
-* ``_assert_propr_execution_allowed()`` — every order-placing/cancelling call
-  additionally requires ``FORVEN_ALLOW_PROPR_LIVE=1``, the direct analog of
-  the FORVEN_ALLOW_MAINNET guard. Read-only calls (positions/attempts/status)
-  deliberately do NOT require it.
+* ``_assert_propr_open_allowed()`` — every RISK-INCREASING call (entries,
+  leverage) additionally requires ``FORVEN_ALLOW_PROPR_LIVE=1``, the direct
+  analog of the FORVEN_ALLOW_MAINNET guard, unless the account verifies as a
+  paper/trial account on a FRESH read. Read-only calls (positions/attempts/
+  status) deliberately do NOT require it.
+* ``_assert_propr_reduce_allowed()`` — every RISK-REDUCING call (reduce-only
+  closes, protective stop/TP legs, cancels) requires the integration flag and
+  nothing more. Permission to open and permission to close are separate
+  permissions: refusing an exit does not protect the account, it strands a
+  live position. See PROPR-PERM-2.
 * Sim redirect — an active sim clock routes to the shared mock exchange
   exactly like the Hyperliquid adapter, so paper/sim can never reach Propr.
 
@@ -122,19 +128,12 @@ def allow_live() -> bool:
     return _is_truthy(os.environ.get("FORVEN_ALLOW_PROPR_LIVE"))
 
 
-def _assert_propr_execution_allowed() -> None:
-    """Single chokepoint guarding every Propr order-placing/cancelling call.
+def _assert_propr_integration_enabled() -> None:
+    """The hidden-flag floor under BOTH permission lanes below.
 
-    Two ways through (read-only functions deliberately do NOT call this):
-
-    * FORVEN_ALLOW_PROPR_LIVE=1 — the explicit real-money opt-in, or
-    * the account is VERIFIABLY a paper/trial account right now: Propr reports
-      ``account.type`` on the challenge attempt ("paper" during a free-trial
-      evaluation), re-verified at most _ACCOUNT_TYPE_CACHE_TTL_S old. The
-      moment Propr flips the account to a funded type — the evaluation ending
-      is exactly when it "becomes real" — this bypass dies and every order
-      fails closed until the operator sets the env opt-in. A failed or
-      ambiguous type read also fails closed.
+    Nothing that touches the venue runs with the integration switched off —
+    that much is unconditional, because with the flag unset there is no
+    operator intent to be talking to Propr at all.
     """
     if not propr_enabled():
         raise RuntimeError(
@@ -142,17 +141,71 @@ def _assert_propr_execution_allowed() -> None:
             "(FORVEN_PROPR_ENABLED is unset). This hidden flag is intentional — "
             "see forven/exchange/propr.py."
         )
+
+
+def _assert_propr_open_allowed() -> None:
+    """Chokepoint for RISK-INCREASING Propr calls (entries, leverage).
+
+    Two ways through (read-only functions deliberately do NOT call this):
+
+    * FORVEN_ALLOW_PROPR_LIVE=1 — the explicit real-money opt-in, or
+    * the account is VERIFIABLY a paper/trial account RIGHT NOW: Propr reports
+      ``account.type`` on the challenge attempt ("paper" during a free-trial
+      evaluation). The moment Propr flips the account to a funded type — the
+      evaluation ending is exactly when it "becomes real" — this bypass dies
+      and every new position fails closed until the operator sets the env
+      opt-in. A failed or ambiguous type read also fails closed.
+
+    PROPR-PERM-1: the type read is FORCED FRESH. get_account_type() otherwise
+    serves a cached verdict for up to _ACCOUNT_TYPE_CACHE_TTL_S (300 s), and
+    the single instant this guard exists for — conversion from paper to funded
+    — is precisely when a cached "paper" is WRONG. A stale-but-unexpired entry
+    written seconds before the flip let the bypass outlive the trial by up to a
+    full TTL, admitting real-capital opens the operator never opted into. The
+    bypass now re-verifies on every open; an unreachable venue reads None and
+    refuses, which is the safe direction for an entry (and cannot strand a
+    position, because exits go through _assert_propr_reduce_allowed instead).
+    """
+    _assert_propr_integration_enabled()
     if allow_live():
         return
-    account_type = get_account_type()
+    account_type = get_account_type(force_refresh=True)
     if account_type == "paper":
         return
     raise RuntimeError(
-        "Refusing to place a Propr order: the account is not verifiably a "
+        "Refusing to open a Propr position: the account is not verifiably a "
         f"paper/trial account (exchange-reported type={account_type!r}) and "
         "FORVEN_ALLOW_PROPR_LIVE is not set. Once a challenge account is real, "
-        "orders need that explicit opt-in on top of FORVEN_PROPR_ENABLED."
+        "new positions need that explicit opt-in on top of FORVEN_PROPR_ENABLED."
     )
+
+
+def _assert_propr_reduce_allowed() -> None:
+    """Chokepoint for RISK-REDUCING Propr calls (exits, protective legs, cancels).
+
+    PROPR-PERM-2: permission to OPEN and permission to CLOSE are not the same
+    permission, and conflating them inverts the guard's own purpose. The
+    real-money opt-in exists to stop capital going OUT on risk the operator did
+    not authorize. A reduce-only close, a stop/take-profit leg placed against an
+    ALREADY-OPEN position, and the cancel that lets a stop be re-placed all
+    reduce or hold exposure flat — none of them can spend new risk. Refusing
+    them does not protect the account; it strands a live position with no exit
+    and no way to manage its protective orders, which is strictly the more
+    dangerous failure.
+
+    That was live behaviour, not theory: the paper bypass expires 300 s after
+    Propr flips the attempt to funded, and from that moment the single old
+    chokepoint blocked close_position() and _place_conditional() too. So the
+    same conversion that (pre-PROPR-PERM-1) let unauthorised opens through
+    would then lock the operator out of closing what those opens created.
+    close_position() already states the principle in its own size-fallback
+    branch — "attempting beats refusing (a refusal strands a live position)" —
+    and this restores it at the guard.
+
+    The integration flag still applies: with FORVEN_PROPR_ENABLED unset there
+    is no Propr session to be exiting from in the first place.
+    """
+    _assert_propr_integration_enabled()
 
 
 _account_type_cache: dict = {"type": None, "at": 0.0}
@@ -163,7 +216,11 @@ def get_account_type(force_refresh: bool = False) -> str | None:
     """The exchange-reported Propr account type ('paper' during a trial).
 
     Cached briefly; a stale cache is NEVER trusted for the paper bypass — an
-    expired entry re-reads, and a failed re-read returns None (fail closed).
+    expired entry re-reads, and a failed re-read returns None (fail closed)
+    AND drops any cached verdict. Without the drop, the open guard's forced
+    re-read failing would leave a still-fresh "paper" entry behind for the
+    next NON-forced read, so get_status() would render orders_allowed=true
+    seconds after the guard refused an open for the same unverifiable account.
     """
     now = time.time()
     if (
@@ -180,8 +237,10 @@ def get_account_type(force_refresh: bool = False) -> str | None:
         if raw:
             _account_type_cache.update({"type": raw, "at": now})
             return raw
+        _account_type_cache.update({"type": None, "at": 0.0})
         return None
     except ProprApiError as exc:
+        _account_type_cache.update({"type": None, "at": 0.0})
         log.warning("Could not verify Propr account type (fail closed): %s", exc)
         return None
 
@@ -689,7 +748,7 @@ def market_order(
         from forven.sim.mock_exchange import sim_market_order
         return sim_market_order(asset, side, size, stop_loss_price, take_profit_price)
 
-    _assert_propr_execution_allowed()
+    _assert_propr_open_allowed()
     if vault_address:
         return {"error": "Propr does not support sub-account routing (vault_address)"}
 
@@ -846,7 +905,7 @@ def limit_order(
         from forven.sim.mock_exchange import sim_market_order
         return sim_market_order(asset, side, size, stop_loss_price, take_profit_price)
 
-    _assert_propr_execution_allowed()
+    _assert_propr_open_allowed()
     if vault_address:
         return {"error": "Propr does not support sub-account routing (vault_address)"}
 
@@ -890,7 +949,10 @@ def limit_order(
 
 def cancel_order(asset: str, oid, testnet: bool = True, vault_address: str | None = None) -> dict:
     """Cancel by orderId. A 400 means already filled/cancelled — surfaced, not raised."""
-    _assert_propr_execution_allowed()
+    # Reduce lane: a cancel can never create exposure, and blocking it is how
+    # a protective stop becomes unreplaceable (cancel-then-re-place is the only
+    # way this venue moves a stop).
+    _assert_propr_reduce_allowed()
     account_id, _ = resolve_account()
     try:
         _request(
@@ -1023,7 +1085,9 @@ def _place_conditional(
 ) -> dict:
     """Shared stop_market / take_profit_market placement against an existing
     position (Propr requires the positionId for standalone conditionals)."""
-    _assert_propr_execution_allowed()
+    # Reduce lane: this only ever arms a stop/TP against an ALREADY-OPEN
+    # position (Propr requires the positionId), so it can only cap risk.
+    _assert_propr_reduce_allowed()
     asset_n = normalize_asset(asset)
     is_long = str(position_direction).strip().lower() in ("long", "buy", "b")
     # The caller typically arms a leg moments after the entry filled; the
@@ -1099,7 +1163,9 @@ def close_position(
         from forven.sim.mock_exchange import sim_close_position
         return sim_close_position(asset, size, side)
 
-    _assert_propr_execution_allowed()
+    # Reduce lane: reduceOnly below makes this strictly an exit. Getting out is
+    # never the thing the real-money opt-in is protecting against.
+    _assert_propr_reduce_allowed()
     asset_n = normalize_asset(asset)
     is_buy = str(side).strip().lower() in ("b", "buy")
     # Closing with a BUY reduces a SHORT; closing with a SELL reduces a LONG —
@@ -1250,7 +1316,8 @@ def set_leverage(
     if is_sim_active():
         return {"leverage": leverage, "sim": True}
 
-    _assert_propr_execution_allowed()
+    # Open lane: raising leverage raises risk on every subsequent entry.
+    _assert_propr_open_allowed()
     asset_n = normalize_asset(asset)
     requested = max(1.0, float(leverage))
     cap = _effective_leverage_limit(asset_n)
@@ -1349,13 +1416,26 @@ def get_status(include_remote: bool = True) -> dict:
             if isinstance(attempt, dict) and attempt:
                 status["attempt_status"] = attempt.get("status")
             status["account_type"] = get_account_type()
-            # Orders place when the operator opted in OR the account is a
+            # OPENS place when the operator opted in OR the account is a
             # verifiable paper/trial account — the page renders this truth.
             status["orders_allowed"] = bool(
                 status["allow_live"] or status["account_type"] == "paper"
             )
+            # EXITS are a separate permission (PROPR-PERM-2) and need no opt-in,
+            # reported explicitly so the page never has to infer "can I get out?"
+            # from the open-oriented flag — telling an operator they are locked
+            # in when they are not is the failure this whole change exists to
+            # prevent.
+            status["closes_allowed"] = True
         except ProprApiError as exc:
             status["account_error"] = str(exc)
+            # Account resolution failed, so NEITHER permission can be honoured:
+            # every order path, exits included, calls resolve_account() and will
+            # raise the same error. Say so rather than leaving the flags unset —
+            # an absent orders_allowed reads as False downstream and would let
+            # the page promise exits that cannot actually be placed.
+            status["orders_allowed"] = False
+            status["closes_allowed"] = False
         status["connected"] = True
     except ProprApiError as exc:
         status["connected"] = False

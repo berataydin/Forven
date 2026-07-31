@@ -17,6 +17,7 @@ export interface ProprStatus {
 	attempt_status?: string;
 	account_type?: string | null;
 	orders_allowed?: boolean;
+	closes_allowed?: boolean;
 	account_value?: number | null;
 	account_error?: string;
 }

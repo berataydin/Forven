@@ -4,8 +4,9 @@ Deliberately hidden: every route except GET /api/propr/status returns 404
 while the hidden integration flag (forven.config.propr_enabled) is off, and
 status itself reports only {"enabled": false} in that state — a casual caller
 learns nothing. The flag is env/config-only (FORVEN_PROPR_ENABLED) and is NOT
-in the settings manifest; order placement additionally requires
-FORVEN_ALLOW_PROPR_LIVE (see forven/exchange/propr.py).
+in the settings manifest; OPENING a position additionally requires
+FORVEN_ALLOW_PROPR_LIVE, while closes, protective legs and cancels need only
+the integration flag (PROPR-PERM-2 — see forven/exchange/propr.py).
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -180,8 +181,10 @@ def propr_mirror_tick_now():
 def propr_close_position(body: ClosePositionRequest):
     """Manual reduce-only close of a Propr position from the page.
 
-    Placement is still gated by the adapter's FORVEN_ALLOW_PROPR_LIVE guard —
-    without it this returns the guard's refusal instead of closing.
+    NOT gated by FORVEN_ALLOW_PROPR_LIVE. A close is risk-REDUCING, so it goes
+    through the adapter's reduce lane (PROPR-PERM-2), which asks only for the
+    integration flag — refusing an exit would strand the position this endpoint
+    exists to unwind. Opens are the ones that need the opt-in.
     """
     _require_enabled()
     if not body.confirm:
