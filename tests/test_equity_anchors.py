@@ -648,6 +648,33 @@ def test_margin_gate_fails_closed_on_zero_value_books_off(forven_db, monkeypatch
     assert "Cannot verify exchange margin" in reason
 
 
+@pytest.mark.parametrize("exec_type", ["paper", "paper_challenger", "simulation"])
+def test_rule_0c_never_gates_paper_opens(forven_db, monkeypatch, exec_type):
+    """PAPER-HALT-1: Rule 0c is a real-capital margin gate, so it must be
+    scoped away from paper exactly like the Rule 0 halts. A paper open never
+    reaches the exchange, and every Rule 0c refusal is fail-closed — so
+    leaving paper inside the block lets a real-wallet condition freeze all
+    paper research. Concretely: with books enabled the master perp account
+    legitimately reads 0 (capital lives in the book sub-accounts), which
+    refused EVERY paper open on a live deploy."""
+    _books_live_gate(monkeypatch, acct_val=0.0)
+
+    allowed, _r, reason = risk.can_open(
+        "BTC", "long", f"s-{exec_type}", risk_pct=0.01, execution_type=exec_type
+    )
+    assert allowed is True, reason
+
+
+def test_rule_0c_still_gates_unscoped_opens(forven_db, monkeypatch):
+    """Counterpart to the above: an open with NO execution_type is the legacy
+    live scope and must stay inside Rule 0c."""
+    _books_live_gate(monkeypatch, acct_val=0.0)
+
+    allowed, _r, reason = risk.can_open("BTC", "long", "s-legacy", risk_pct=0.01)
+    assert allowed is False
+    assert "Cannot verify exchange margin" in reason
+
+
 def test_degraded_tick_does_not_reset_breach_streak(forven_db, monkeypatch):
     """HALT-CONFIRM-3: a degraded tick can neither COUNT (HALT-CONFIRM-2) nor
     RESET a live streak — a substituted cache value that masks the breach must

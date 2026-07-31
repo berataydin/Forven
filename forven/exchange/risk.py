@@ -1712,9 +1712,19 @@ def can_open(
         # on a testnet deploy it hit an empty mainnet account, acct_val came back 0,
         # and the guard silently never fired on the network we actually trade.
         # Fail CLOSED in live mode: if we cannot verify margin, do not open.
+        #
+        # PAPER-HALT-1: Rule 0c is a REAL-CAPITAL protection, so it is scoped
+        # to non-paper opens exactly like the Rule 0 halts above. A paper open
+        # never reaches the exchange, so the routed account's margin says
+        # nothing about whether it may proceed — and every refusal in this
+        # block is fail-closed, so leaving paper inside it lets a real-wallet
+        # condition freeze all paper research. That is not hypothetical: on a
+        # live deploy with books ENABLED the master perp account legitimately
+        # reads 0 (the capital sits in the book sub-accounts), and the
+        # non-positive-value refusal below would then refuse EVERY paper open.
         from forven.config import get_execution_mode
         mode = get_execution_mode()
-        if mode == "live":
+        if mode == "live" and _halt_scope not in _PAPER_EXECUTION_TYPES:
             try:
                 from forven.exchange.hyperliquid import (
                     get_account_value,
