@@ -4,8 +4,9 @@ Deliberately hidden: every route except GET /api/propr/status returns 404
 while the hidden integration flag (forven.config.propr_enabled) is off, and
 status itself reports only {"enabled": false} in that state — a casual caller
 learns nothing. The flag is env/config-only (FORVEN_PROPR_ENABLED) and is NOT
-in the settings manifest; order placement additionally requires
-FORVEN_ALLOW_PROPR_LIVE (see forven/exchange/propr.py).
+in the settings manifest; OPENING a position additionally requires
+FORVEN_ALLOW_PROPR_LIVE, while closes, protective legs and cancels need only
+the integration flag (PROPR-PERM-2 — see forven/exchange/propr.py).
 """
 
 from fastapi import APIRouter, Depends, HTTPException

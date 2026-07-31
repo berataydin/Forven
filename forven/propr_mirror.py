@@ -7,10 +7,12 @@ always has, paper trading stays local — the mirror is a read-only OBSERVER of
 the trades table that places its own independently-sized orders on Propr.
 
 Runs as the `forven-propr-mirror` interval job (60s, seeded only while the
-hidden PROPR-1 flag is on). Every placement rides the adapter's execution
-guard, so mirroring works unattended on a verifiable paper/trial account and
-fails closed the moment Propr flips the account to real money (then
-FORVEN_ALLOW_PROPR_LIVE is required).
+hidden PROPR-1 flag is on). Every placement rides the adapter's permission
+guards, so mirroring works unattended on a verifiable paper/trial account and
+its ENTRIES fail closed the moment Propr flips the account to real money (then
+FORVEN_ALLOW_PROPR_LIVE is required). Its EXITS do not: closes, protective legs
+and the post-close cancel take the reduce lane (PROPR-PERM-2), so the mirror can
+always unwind what it opened even after that flip.
 
 Semantics:
 * OPEN mirror — a roster strategy's paper/live trade opens => place a Propr
