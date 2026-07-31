@@ -25,7 +25,7 @@ def _instant_halt_confirms(monkeypatch):
     EQ-DROP-1 exposure bound have their own suite in test_equity_anchors.py."""
     from forven.exchange import risk as _risk
     monkeypatch.setattr(_risk, "_HALT_CONFIRM_MIN_SPACING_SECONDS", 0.0)
-    monkeypatch.setattr(_risk, "_open_live_notional_usd", lambda: float("inf"))
+    monkeypatch.setattr(_risk, "_open_live_notional_usd", lambda anchor_at=None: float("inf"))
 
 
 _GARBAGE = 4.3433112657193625e23  # the actual value from the incident
